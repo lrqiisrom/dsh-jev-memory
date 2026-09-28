@@ -125,3 +125,34 @@ test('screenSentence vetoes secrets before anything else can accept them', () =>
   assert.equal(screenSentence('Authorization: Bearer abcdefghijklmnop').keep, false)
   assert.equal(screenSentence('必须用 pnpm 管理依赖。').keep, true)
 })
+
+// The fourth live mis-write class: sentences that ask *the agent* to explain or do
+// something right now. They are imperative, they often contain 不要, and they were
+// all stored as project constraints.
+test('screenSentence vetoes requests addressed to the agent', () => {
+  for (const sentence of [
+    '先不急着重启，你先说说整体的设计，和你已经测试的结果是什么',
+    '你完整说一下怎么测的',
+    '解释一下这段代码为什么这么写',
+    '告诉我这个文件在哪',
+    '麻烦你先看一下日志再动手',
+  ]) {
+    const decision = screenSentence(sentence)
+    assert.equal(decision.keep, false, sentence)
+    assert.equal(decision.reason, 'task-instruction', sentence)
+  }
+})
+
+test('an explicit request to remember overrides the request screen', () => {
+  assert.deepEqual(screenSentence('帮我记住：不要改动 data/ 目录下的文件。'), { keep: true, reason: null })
+  assert.deepEqual(screenSentence('记住必须用 pnpm 管理依赖。'), { keep: true, reason: null })
+  assert.deepEqual(screenSentence('别忘了端口固定 8000。'), { keep: true, reason: null })
+})
+
+test('a question phrased with 是什么 is still a question', () => {
+  assert.equal(looksInterrogative('重启的命令是什么'), true)
+  assert.equal(looksInterrogative('这个项目有哪些约定'), true)
+  assert.equal(looksInterrogative('入口在哪里'), true)
+  assert.equal(looksInterrogative('入口是 api/main.py。'), false)
+  assert.equal(looksInterrogative('必须用 pnpm 管理依赖。'), false)
+})

@@ -188,6 +188,8 @@ export interface JevClient {
    * restart, and a plugin that cached the answer at mount would defeat that.
    */
   isAvailable(): Promise<boolean>
+  /** readiness plus the layer the key came from (`credentials` / `config` / `env` / `none`). */
+  describe(): Promise<{ ready: boolean; source: string; endpoint: string }>
   endpoint: string
   decide(request: JevDecideRequest): Promise<JevDecideResult>
 }
@@ -250,21 +252,38 @@ export function createJevClient({
    * settings UI should not have to restart the harness for the judge to start
    * working.
    */
-  async function resolveKey(): Promise<string> {
+  async function resolveKey(): Promise<{ key: string; source: string }> {
     if (resolveApiKey) {
       try {
         const fromHost = await resolveApiKey()
-        if (fromHost) return fromHost
+        if (fromHost) return { key: fromHost, source: 'credentials' }
       } catch (error) {
         log('warn', 'credential lookup failed; falling back to config/env', { error: String(error) })
       }
     }
-    return settings.apiKey || env?.[settings.apiKeyEnv] || ''
+    if (settings.apiKey) return { key: settings.apiKey, source: 'config' }
+    const fromEnv = env?.[settings.apiKeyEnv]
+    if (fromEnv) return { key: fromEnv, source: 'env' }
+    return { key: '', source: 'none' }
   }
 
   return {
     async isAvailable(): Promise<boolean> {
-      return Boolean(await resolveKey()) && typeof fetchImpl === 'function'
+      return Boolean((await resolveKey()).key) && typeof fetchImpl === 'function'
+    },
+    /**
+     * Report whether a key is reachable and from which layer.
+     *
+     * Added because its absence cost a full debugging round: a key sat in the
+     * credential store while the startup ledger said only `jevReady: false`, which
+     * could equally have meant "wrong ref name", "service not reachable yet", or
+     * "no key at all". The source name answers that in one field.
+     *
+     * @returns readiness plus the layer the key came from.
+     */
+    async describe(): Promise<{ ready: boolean; source: string; endpoint: string }> {
+      const resolved = await resolveKey()
+      return { ready: Boolean(resolved.key) && typeof fetchImpl === 'function', source: resolved.source, endpoint }
     },
     endpoint,
     /**
@@ -274,7 +293,7 @@ export function createJevClient({
      * @returns judgement rows plus the responding model id.
      */
     async decide(request: JevDecideRequest): Promise<JevDecideResult> {
-      const apiKey = await resolveKey()
+      const apiKey = (await resolveKey()).key
       if (!apiKey) throw new Error('jev is not configured')
       const candidates = (request.candidates ?? []).slice(0, settings.maxCandidates)
       if (candidates.length === 0) return { rows: [], model: null }

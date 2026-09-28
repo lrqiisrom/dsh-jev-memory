@@ -239,6 +239,37 @@ export const TASK_INSTRUCTION_PATTERNS: RegExp[] = [
   /不要(改写|总结|解释|评价|自己组织)/u,
   /^(请)?(先|再|直接)?(你)?(帮我|帮忙)(做|写|看|检查|改)/u,
   /^(先|再|然后|接着)?(看|查|检查|确认|列出|读)(一下|看)?[^。]{0,24}(是否|有没有|有哪些)/u,
+  // Requests for an explanation or an answer, addressed to the agent.
+  //
+  // A live session produced four mis-writes in this class ("你先说说整体的设计",
+  // "完整说一下怎么测的", "不要有一堆你代码里写的专有名词", "先不急着重启"): each is
+  // imperative, several contain 不要, and all of them are about *this
+  // conversation* rather than the project. They are unanchored because the
+  // request verb usually sits mid-sentence after a lead-in clause.
+  /(你|请|麻烦|劳驾)(先|再|直接)?(来)?(说说|说一下|讲一下|讲讲|解释一下|说明一下|描述一下|总结一下|列一下|列出来)/u,
+  /^(你|请|麻烦)?(先|再|直接)?(说|讲|解释|说明|总结|描述|列出|回答|回复)(一下|一遍)/u,
+  /^(告诉|回复|回答|给我|帮我|请你|麻烦你|我要你)/u,
+  /(说一下|说说|讲一下|解释一下|总结一下|列一下)(怎么|如何|为什么|什么|你|我)/u,
+]
+
+/**
+ * Sentences that explicitly ask for something to be remembered.
+ *
+ * They exist so the request screen cannot swallow the strongest write signal a
+ * user has: "帮我记住：data 目录别动" starts with a request verb and would
+ * otherwise be vetoed — the plugin ignoring an explicit instruction in order to
+ * avoid a heuristic mistake.
+ */
+export const REMEMBER_REQUEST_PATTERNS: RegExp[] = [
+  /记住/u,
+  /记一下/u,
+  /记下/u,
+  /记录下来?/u,
+  /记录一下/u,
+  /别忘了/u,
+  /\bremember\b/iu,
+  /\bnote that\b/iu,
+  /\bkeep in mind\b/iu,
 ]
 
 /**
@@ -278,7 +309,12 @@ export const SECRET_PATTERNS: RegExp[] = [
  */
 export function screenSentence(sentence: string): ScreenDecision {
   if (SECRET_PATTERNS.some((pattern) => pattern.test(sentence))) return { keep: false, reason: 'secret' }
-  if (TASK_INSTRUCTION_PATTERNS.some((pattern) => pattern.test(sentence))) return { keep: false, reason: 'task-instruction' }
+  // An explicit "remember this" outranks the request screen: the user is telling
+  // the plugin to write, which is the strongest signal there is.
+  const wantsRemember = REMEMBER_REQUEST_PATTERNS.some((pattern) => pattern.test(sentence))
+  if (!wantsRemember && TASK_INSTRUCTION_PATTERNS.some((pattern) => pattern.test(sentence))) {
+    return { keep: false, reason: 'task-instruction' }
+  }
   if (PAYLOAD_PATTERNS.some((pattern) => pattern.test(sentence))) return { keep: false, reason: 'payload' }
   // Chatter and questions live here rather than in the extractor, so there is one
   // screen entry point: the write-precision harness runs the same screens the

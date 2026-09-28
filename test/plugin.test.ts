@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -28,6 +28,8 @@ interface Captured {
   tools: Map<string, unknown>
   disposers: Array<() => void>
   injected?: string[]
+  /** what the fake credentials service returns, when a test wires one. */
+  credentialValue?: string
 }
 
 /**
@@ -40,16 +42,23 @@ function fakeContext(): { ctx: PluginContext; captured: Captured } {
   const captured: Captured = { contexts: [], listeners: new Map(), tools: new Map(), disposers: [] }
   const ctx: PluginContext = {
     logger: { info: () => {}, warn: () => {} },
+    // Per-name scope, exactly like the real context: the plugin injects both
+    // `systemPrompt` and `credentials`, and a fake that always hands back the same
+    // shape would hide a wiring mistake in either one.
     inject: (names, callback) => {
       captured.injected = names
-      callback({
+      const scope: Parameters<typeof callback>[0] = {
         systemPrompt: {
           context: (definition) => {
             captured.contexts.push(definition)
             return () => {}
           },
         },
-      })
+      }
+      if (names.includes('credentials') && captured.credentialValue !== undefined) {
+        scope.credentials = { resolve: async () => ({ value: captured.credentialValue as string }) }
+      }
+      callback(scope)
     },
     on: (event, handler) => {
       captured.listeners.set(event, handler)
@@ -106,9 +115,14 @@ const TURN_EVENTS: TurnEvent[] = [
 ]
 
 /** Mount the plugin over a temp store and wait until it has loaded. */
-async function mount(overrides: Record<string, unknown> = {}): Promise<{ root: string; captured: Captured }> {
+async function mount(
+  overrides: Record<string, unknown> = {},
+  /** a key the fake credentials service should answer with, when the test wires one. */
+  credentialValue?: string,
+): Promise<{ root: string; captured: Captured }> {
   const root = await mkdtemp(join(tmpdir(), 'dshmem-plugin-'))
   const { ctx, captured } = fakeContext()
+  if (credentialValue !== undefined) captured.credentialValue = credentialValue
   apply(ctx, { root, judge: 'heuristic', ...overrides })
   await new Promise((resolve) => setTimeout(resolve, 50))
   return { root, captured }
@@ -250,4 +264,29 @@ test('a failing hook never propagates out of the turn boundary', async () => {
   await assert.doesNotReject(async () => {
     await handler({ agent: { id: 'broken', session: { seq: 5, header: {}, eventAt: () => { throw new Error('boom') } } }, turn: 1 })
   })
+})
+
+// The bug this covers: the plugin looked the credential service up once during
+// mount, Cordis's `get` refused to return a provider whose fiber was not active
+// yet, and the plugin silently stayed on the heuristic judge forever — visible
+// only as `jevReady: false` with no hint of why.
+test('a credential service that arrives after mount still switches the judge to Jev', async () => {
+  const { root } = await mount({ judge: 'auto' }, 'test-key-from-credentials')
+  const ledger = await readFile(join(root, 'ledger.jsonl'), 'utf8')
+  const start = ledger
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line))
+    .find((entry) => entry.kind === 'start')
+  assert.equal(start.judge, 'jev', 'mode auto with a reachable key configures the Jev judge')
+  assert.deepEqual(start.jev, { ready: true, source: 'credentials', endpoint: 'https://api.typesafe.ai/v1/systemone' })
+  assert.equal(start.credentialRef, 'TYPESAFE_API_KEY')
+})
+
+test('without a credential service the ledger says so instead of staying silent', async () => {
+  const { root } = await mount({ judge: 'auto' })
+  const ledger = await readFile(join(root, 'ledger.jsonl'), 'utf8')
+  const start = JSON.parse(ledger.trim().split('\n')[0])
+  assert.equal(start.jev.ready, false)
+  assert.equal(start.jev.source, 'none')
 })

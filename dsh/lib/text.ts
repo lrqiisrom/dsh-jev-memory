@@ -153,6 +153,13 @@ export function looksInterrogative(sentence: string): boolean {
   const value = normalize(sentence)
   if (!value) return false
   if (/[?？]$/u.test(value)) return true
+  // A request for information phrased as "X 是什么 / 有哪些 / 在哪" is still a
+  // question: "重启的命令是什么" starts with neither a question word nor a particle,
+  // so it used to read as a statement.
+  if (/(是什么|在哪里|在哪|怎么用|怎么回事)[？?]?$/u.test(value)) return true
+  // "有哪些" carries a short object with it ("这个项目有哪些约定"), so it cannot be
+  // anchored as tightly as the others.
+  if (/有哪些[^。！？!?]{0,8}[？?]?$/u.test(value)) return true
   // Chinese questions frequently carry no question mark at all: "…只能用 js 写吗"
   // ends in a particle, and "难道…" is rhetorical. This is not a nicety — the
   // second live run memorized exactly such a sentence as a `constraint`, because

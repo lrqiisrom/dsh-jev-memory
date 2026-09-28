@@ -115,6 +115,7 @@ export interface SystemPromptService {
 /** What `inject(['systemPrompt'], cb)` hands its callback. */
 export interface InjectedScope {
   systemPrompt: SystemPromptService
+  credentials?: CredentialService
 }
 
 /** What a tool's `execute` receives about its caller. */
@@ -443,14 +444,24 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
 
   const store = createMemoryStore({ root: resolveStoreRoot(config.root), log })
   // The bearer token comes from the harness's credential service, not from this
-  // composition file: a secret in a patch layer is a secret in a diff. The service
-  // is optional (`judge: heuristic` needs no key at all), and it is consulted per
-  // call, so a key added later takes effect on the next turn.
-  const credentials = ctx.get?.('credentials') as CredentialService | undefined
+  // composition file: a secret in a patch layer is a secret in a diff.
+  //
+  // Reached *reactively* rather than with a one-shot `ctx.get` at mount, and that
+  // distinction was a real bug: Cordis's `get` returns only providers whose fiber
+  // is already active, so looking it up during `apply()` found nothing, the
+  // plugin cached `undefined`, and it stayed on the heuristic judge forever while
+  // the ledger said only `jevReady: false`. `inject` re-runs when the provider
+  // becomes available; the late `ctx.get` covers a host that never fires it.
+  let credentials: CredentialService | undefined
+  const credentialOf = (): CredentialService | undefined => credentials ?? (ctx.get?.('credentials') as CredentialService | undefined)
+  ctx.inject(['credentials'], (scope) => {
+    credentials = scope.credentials
+  })
+  const credentialRef = config.jev.apiKeyEnv ?? JEV_DEFAULTS.apiKeyEnv
   const jev = createJevClient({
     config: config.jev,
     log,
-    resolveApiKey: async () => (await credentials?.resolve(config.jev.apiKeyEnv ?? JEV_DEFAULTS.apiKeyEnv))?.value,
+    resolveApiKey: async () => (await credentialOf()?.resolve(credentialRef))?.value,
   })
   const judge: Judge = createJudge({ config: { ...config, judgeTimeoutMs: config.judgeTimeoutMs }, jev, log })
   let ready = false
@@ -459,18 +470,19 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     .load()
     .then(async ({ loaded, recovered }) => {
       ready = true
-      const jevReady = await jev.isAvailable()
+      const jevState = await jev.describe()
       log('info', `ready: ${loaded} memories from ${store.root}${recovered ? ' (corrupt document was set aside)' : ''}`, {
-        judge: jevReady ? 'jev' : judge.kind,
+        judge: jevState.ready ? 'jev' : judge.kind,
         types: config.types,
       })
       return store.ledger({
         kind: 'start',
         version,
         judge: judge.kind,
-        // what the judge can actually reach right now, next to what was configured
-        jevReady,
-        credential: credentials ? (config.jev.apiKeyEnv ?? JEV_DEFAULTS.apiKeyEnv) : null,
+        // `source` is the field whose absence cost a debugging round: `ready:false`
+        // alone cannot distinguish a wrong ref name from an unreachable service.
+        jev: jevState,
+        credentialRef,
         model: config.jev.model ?? JEV_DEFAULTS.model,
         loaded,
         recovered,
@@ -606,7 +618,17 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         const judgement = rows.find((row) => row.key === candidate.key)
         const gate = applyGate(judgement, config)
         if (!gate.write || !judgement) {
-          void store.ledger({ kind: 'skip', reason: gate.reason, id: candidate.key, quote: excerpt(candidate.quote, 120) })
+          // `by` on the skip line too: otherwise the ledger shows that something
+          // was refused but not who refused it, and "is Jev actually deciding?"
+          // becomes unanswerable without a second query.
+          void store.ledger({
+            kind: 'skip',
+            reason: gate.reason,
+            id: candidate.key,
+            by: judgement?.by ?? 'none',
+            model,
+            quote: excerpt(candidate.quote, 120),
+          })
           continue
         }
         const now = Date.now()
