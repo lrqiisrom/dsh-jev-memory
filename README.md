@@ -12,11 +12,11 @@ DSH 官方有会话持久化（JSONL）、会话检索（SQLite FTS）、compact
 
 | 环节 | 实现 | 位置 |
 |---|---|---|
-| **写入** | 挂在 `agent/turn-stopping`（serial + awaited，回合收尾前）抽取候选 → 判定 → 过确定性闸门 → 落盘 | `dsh/index.js` |
+| **写入** | 挂在 `agent/turn-stopping`（serial + awaited，回合收尾前）抽取候选 → 判定 → 过确定性闸门 → 落盘 | `dsh/index.ts` |
 | **判定** | 端口式：**Jev**（TypeSafe 判定模型）为首选，**确定性信号**为离线兜底。判定层只出标签与概率，**不生成文本** | `dsh/lib/judge.ts`、`dsh/lib/jev.ts` |
-| **存储** | 本地 `memory.json` + 只追加的 `ledger.jsonl`，原子写、内存索引（注入回调必须同步） | `dsh/lib/store.js` |
+| **存储** | 本地 `memory.json` + 只追加的 `ledger.jsonl`，原子写、内存索引（注入回调必须同步） | `dsh/lib/store.ts` |
 | **召回** | `systemPrompt.context` 每步注入当前工作区的 Top-K，带类型/id/日期标签 | `dsh/lib/recall.ts` |
-| **工具** | `memory_search` / `memory_write` / `memory_forget`，模型可主动查、主动记、主动撤 | `dsh/index.js` |
+| **工具** | `memory_search` / `memory_write` / `memory_forget`，模型可主动查、主动记、主动撤 | `dsh/index.ts` |
 
 三条纪律写进了代码，不是写在文档里：
 
@@ -85,7 +85,7 @@ dsh plugin --profile web add /absolute/path/to/dsh-jev-memory
 1. Jev 若判**存在冲突**（概率 ≥ 0.7）**且这条本身值得记**，先以"待确认"状态落盘（不注入、也不丢）；
 2. 回合结束时**问你一句**——一条问题、三个选项：**用新的覆盖旧的 / 保留旧的那条 / 两条都留着**；
 3. 你的选择决定结果：覆盖 → 旧的标成"已被取代"（留档，不再注入）；保留旧 → 新的丢弃；都留 → 两条都生效；
-4. **没人应答 / 超时（默认 2 分钟）/ 出错** → 保持"待确认"：**宁可少记一条，也不猜你的意思**。
+4. **没人应答 / 超时（默认 10 分钟）/ 出错** → 保持"待确认"：**宁可少记一条，也不猜你的意思**。超时不是终点：记录留在"待确认"，**在你下一次发消息、模型开始干活之前再问一次**（那时的你一定在场），最多重问 3 次——这就是"超时敢设长"之所以安全的原因。
 
 **为什么这和 DSH 原有的 HITL 不冲突**：DSH 有两种跟人打交道的通道——**审批**（沙箱/权限策略发起，"这个危险操作放不放行"）和**提问**（模型发起，"我缺一个信息"）。这里**复用第二种**，只是换成插件的判定规则来发起：不新增 UI、不新增权限模型、不新增打断渠道，问题会出现在你熟悉的那个提问卡片里。唯一的差别是"谁决定要问"。
 
@@ -125,7 +125,7 @@ dsh plugin --profile web add /absolute/path/to/dsh-jev-memory
 
 | 指标 | 怎么算 | 当前 |
 |---|---|---|
-| 写入精确率 / 误记率 | 人工抽查 `memory.json`；或跑 `eval/write-precision.ts` | 启发式 **0.75 / 0.75**，**Jev 1.00 / 0.75**（阈值 0.6） |
+| 写入精确率 / 误记率 | 人工抽查 `memory.json`；或跑 `eval/write-precision.ts`（**20 条标注集**：8 条该记 + 12 条不该记，其中 8 条取自真实误记原句） | 启发式 **0.75 / 0.75**，**Jev 1.00 / 0.75**（阈值 0.6） |
 | **Hit@K** | 对每条标注查询 Q：前 K 条里**只要有 1 条**标注正例即记 1，最终 = 命中查询数 ÷ 查询数 | 待测 |
 | **Recall@K** | 对每条 Q：前 K 条里的正例数 ÷ 该 Q 的**全部正例数**，再取平均 | 待测 |
 | 注入 token 数 | 台账 `kind:"recall"` 的 `tokens` 字段 | 1 条约 60 tokens（历史上 4 条时 289–360） |
@@ -150,7 +150,7 @@ Jev @0.5      precision=0.88 recall=0.88 F1=0.88
 Jev @0.3      precision=0.89 recall=1.00 F1=0.94
 ```
 
-默认取 `0.6` 而不是 F1 更高的 `0.3`：**假阳性比假阴性贵**——一条错记会进入此后每一个会话的提示。两个已知漏判也写在这里：`不要改动 data/ 目录下的任何文件。`（Jev 给 0.51，恰好压线）与 `sqlite 写入失败：EDQUOT...`（给 0.38——只看到一次，无从判断会不会复现；修法是"同签名重复 ≥N 次才落盘"，见 `docs/DESIGN.md` 路线图）。
+默认取 `0.6` 而不是 F1 更高的 `0.3`：**假阳性比假阴性贵**——一条错记会进入此后每一个会话的提示。两个已知漏判也写在这里：`不要改动 data/ 目录下的任何文件。`（Jev 给 0.51，恰好压线）与 `sqlite 写入失败：EDQUOT...`（给 0.38——只看到一次，无从判断会不会复现；这条已由确定性规则补上：同签名重复 ≥ `repeatFailuresToWrite` 次才落盘）。
 
 > **为什么分开写 Hit@K 和 Recall@K**：多正例下两者会分叉（Hit@5=1 时 Recall@5 可能只有 1/3），只写"Top-3 命中"是不可复现的。这个教训来自 `zilliztech/memsearch` 公开的中英检索评测——它同时发布了两套定义，参见 `docs/memsearch-notes.md`。
 >
@@ -161,16 +161,16 @@ Jev @0.3      precision=0.89 recall=1.00 F1=0.94
 ## 明确不做（避免和生态重复）
 
 - **不做 UI / 面板**、不做向量库（类型化 + 少量记录不需要）；
-- **不做**"从反复失败里长规则"（那是 `dsh-jev-forge` 的题目）、**不做** HITL 分诊；
+- **不做**"从反复失败里长规则"（那是 `dsh-jev-forge` 的题目）、**不做**全量写入的人工分诊——只在你和旧记忆真的矛盾时才打扰你（见上一节）；
 - **不碰 `dsh-jev-tools` 已覆盖的四个节点**：工具输出精简、注入筛查、技能推荐、交付闸门；
-- 不与 `AGENTS.md` 争优先级：**人工手写 > 自动记忆**；冲突条目落 `needs-review` 状态，默认不注入。
+- 不与 `AGENTS.md` 争优先级：**人工手写 > 自动记忆**；冲突条目先落 `needs-review` 且默认不注入，再由你决定归属。
 
 ---
 
 ## 测试与验证
 
 ```sh
-node --test test/*.test.ts      # 49 条，全离线，不联网、不启动 harness
+node --test test/*.test.ts      # 80 条，全离线，不联网、不启动 harness
 pnpm run typecheck              # tsc --noEmit，零依赖包也能有真类型检查
 ```
 
@@ -185,8 +185,8 @@ pnpm run typecheck              # tsc --noEmit，零依赖包也能有真类型�
 ## 现状与未验证项（不编造）
 
 - 离线全绿、真实进程内闭环已验证；
-- **Jev 线上路径已用真实 key 跑通**：`POST https://api.typesafe.ai/v1/systemone` → `jev-1.13.0`，一次请求判 16 条、耗时 0.56–0.68s，`docs/jev-api.md` 里的请求/响应结构逐字段对上（含 `answers.<id>.noul / .choice / .score / .confidence`）；
-- **但 GUI 里的 live 进程要重启一次才会用上 Jev**：当前进程跑的是 0.3.0（凭据集成之前），而实测确认**源码改动即使触发重新挂载也仍用 ESM 缓存**（详见下一条）。重启后台账的 `start` 行会多出 `jevReady: true` 与 `credential` 字段；
+- **Jev 线上路径已用真实 key 跑通**：`POST https://api.typesafe.ai/v1/systemone` → `jev-1.13.0`，`docs/jev-api.md` 里的请求/响应结构逐字段对上（含 `answers.<id>.noul / .choice / .score / .confidence`）。**延迟量级 0.56–0.68s，但那是一次判 16 条、把上限临时调到 50 测出来的；默认上限是 6 条**（第 7 条起退回启发式，现在会记 `kind:"degraded"` 并告警）；
+- **live 判定已确认走 Jev**（2026-09-28 重启后核实）：台账 `start` 行写着 `"version":"0.6.0"`、`"jev":{"ready":true,"source":"service:file"}`，且此后的写入/跳过记录都带 `"by":"jev"`、`"model":"jev-1.13.0"`。凭据走两条路（宿主凭据服务优先、直读凭据文档兜底），所以"服务在开机那一瞬还没就绪"不再决定判定方式；
 - 多进程同时写同一个 `memory.json` 是 last-write-wins，单进程是受支持场景（TODO：锁文件）；
 - **代码改动必须重启 harness**：Cordis 的 HMR 能重挂载插件行、重读存储，但 ESM 缓存不会重新求值 `lib/*.ts`。这条是**实测**的，不是推测：一次语义变更触发的重挂载后，`start` 台账仍写着旧 `version`、也没有新字段。`start.version` 就是用来判断"跑的是哪份代码"的；换一个**文件路径**（如 `.js` → `.ts`）会强制换一套模块 URL，那是唯一不用重启的刷新方式；
 - 同机还有一个同类插件 `@zilliz/memsearch-dsh`（见 `docs/memsearch-notes.md`）：它与本插件**正交**，但挂在同一 patch 层，**同 profile 共存未实测**（可能双份注入）。
@@ -201,7 +201,10 @@ dsh/lib/judge.ts      判定端口（Jev / 启发式）+ 确定性写入闸门
 dsh/lib/jev.ts        Jev HTTP 客户端（凭据解析、重试、超时、解析）
 dsh/lib/store.ts      memory.json + ledger.jsonl
 dsh/lib/recall.ts     选哪些记忆、怎么渲染
+dsh/lib/conflict.ts   冲突配对（词重叠）+ 三选项卡片 + 答案映射
+dsh/lib/credentials.ts  直读凭据文档的兜底路径（极小的 refs 段解析器）
 dsh/lib/text.ts       文本工具（分句、估算 token、哈希）
+test/                 80 条离线测试（plugin.test.ts 用假宿主驱动完整闭环）
 eval/write-precision.ts   带标注的写入精确率评测（可对标、可复现）
 tsconfig.json         noEmit + allowImportingTsExtensions（Node 擦除模式可直接跑）
 docs/jev-api.md       Jev 调用契约调研（带出处链接）

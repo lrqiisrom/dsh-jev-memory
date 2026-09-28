@@ -342,6 +342,10 @@ export const name = 'jev-memory'
  * It is written into the store's `start` ledger line so that "is the running
  * process using the code I just edited?" is answerable from the ledger alone —
  * a hot-reloaded module and a cached one otherwise look identical.
+ *
+ * Kept in sync with `package.json` by hand: nothing reads the manifest at
+ * runtime (importing JSON would break the zero-dependency mount), so the two
+ * are a convention rather than a derivation. Bump both together.
  */
 export const version = '0.6.0'
 
