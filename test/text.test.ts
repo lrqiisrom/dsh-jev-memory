@@ -104,8 +104,24 @@ test('screenSentence keeps real constraints that look imperative', () => {
     '必须用 pnpm 管理依赖，这是团队约定。',
     '不要改动 data/ 目录下的任何文件。',
     '这个命令会清空缓存，注意别在生产库上跑。',
-    '我们决定用 SQLite 而不是 Postgres，因为只在自己机器上跑。',
+    '我们决定用 SQLite 而不是 Postgres，只在自己机器上跑。',
   ]) {
     assert.deepEqual(screenSentence(sentence), { keep: true, reason: null }, sentence)
   }
+})
+
+// Not hypothetical: the user pasted a real key inside an ordinary sentence, and
+// that sentence passes every other screen. A memory is injected into every later
+// session, so a secret written once leaks forever.
+test('screenSentence vetoes secrets before anything else can accept them', () => {
+  assert.deepEqual(
+    screenSentence(
+      'TypeSafe key: apikey_0123456789abcdef0123456789abcdef_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    ),
+    { keep: false, reason: 'secret' },
+  )
+  assert.equal(screenSentence('把 token 设置成 sk-abcdefghijklmnopqrstuvwxyz123456').keep, false)
+  assert.equal(screenSentence('password: hunter2hunter2').keep, false)
+  assert.equal(screenSentence('Authorization: Bearer abcdefghijklmnop').keep, false)
+  assert.equal(screenSentence('必须用 pnpm 管理依赖。').keep, true)
 })

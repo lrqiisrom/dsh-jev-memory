@@ -141,6 +141,11 @@ export interface ToolRegistry {
   register<TArgs, TResult>(definition: ToolDefinition<TArgs, TResult>): unknown
 }
 
+/** The credential service, reduced to the one call this plugin makes. */
+export interface CredentialService {
+  resolve(ref: string): Promise<{ value: string } | undefined>
+}
+
 /** The Cordis plugin context, reduced to the members this plugin calls. */
 export interface PluginContext {
   logger?: Logger
@@ -148,6 +153,8 @@ export interface PluginContext {
   on(event: string, handler: (payload: TurnStoppingPayload) => unknown): unknown
   tools: ToolRegistry
   effect(factory: () => () => void): unknown
+  /** optional service lookup; absent members are the caller's problem, not a failure. */
+  get?(name: string): unknown
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +176,8 @@ export interface PluginConfig {
   types: string[]
   judge: string
   minImportance: number
+  /** threshold on the judge's "worth remembering" answer; the heuristic ignores it. */
+  minRemember: number
   reviewOnConflict: boolean
   writeEnabled: boolean
   writeSkipSubagents: boolean
@@ -264,7 +273,7 @@ export const name = 'jev-memory'
  * process using the code I just edited?" is answerable from the ledger alone —
  * a hot-reloaded module and a cached one otherwise look identical.
  */
-export const version = '0.3.0'
+export const version = '0.4.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -281,6 +290,12 @@ export const DEFAULT_CONFIG: PluginConfig = {
   judge: 'auto',
   /** Deterministic write threshold; replaces any "ask the model to decide". */
   minImportance: 0.6,
+  /**
+   * Threshold on the judge's `remember` (Noul) answer — the primary write gate
+   * whenever the judge answered that question. Kept separate from
+   * `minImportance` because they gate different questions; see `applyGate`.
+   */
+  minRemember: 0.6,
   /** A suspected conflict is stored but withheld from recall until a human confirms. */
   reviewOnConflict: true,
   /** Whether turn-end writes happen at all. */
@@ -365,13 +380,14 @@ export function resolveConfig(raw: unknown): { config: PluginConfig; problems: s
     problems.push(`judge: unknown mode "${config.judge}"; using auto`)
     config.judge = 'auto'
   }
-  for (const field of ['minImportance', 'writeTimeoutMs', 'judgeTimeoutMs', 'knownForConflict', 'contextOrder'] as const) {
+  for (const field of ['minImportance', 'minRemember', 'writeTimeoutMs', 'judgeTimeoutMs', 'knownForConflict', 'contextOrder'] as const) {
     if (!Number.isFinite(config[field])) {
       problems.push(`${field}: not a finite number; using the default`)
       config[field] = DEFAULT_CONFIG[field]
     }
   }
   config.minImportance = Math.min(1, Math.max(0, config.minImportance))
+  config.minRemember = Math.min(1, Math.max(0, config.minRemember))
   config.extract = { ...EXTRACT_DEFAULTS, ...((source.extract ?? {}) as Partial<ExtractOptions>) }
   config.recall.quota = { ...DEFAULT_QUOTA, ...((recallSource?.quota ?? {}) as Record<string, number>) }
   return { config, problems }
@@ -426,19 +442,39 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   }
 
   const store = createMemoryStore({ root: resolveStoreRoot(config.root), log })
-  const jev = createJevClient({ config: config.jev, log })
+  // The bearer token comes from the harness's credential service, not from this
+  // composition file: a secret in a patch layer is a secret in a diff. The service
+  // is optional (`judge: heuristic` needs no key at all), and it is consulted per
+  // call, so a key added later takes effect on the next turn.
+  const credentials = ctx.get?.('credentials') as CredentialService | undefined
+  const jev = createJevClient({
+    config: config.jev,
+    log,
+    resolveApiKey: async () => (await credentials?.resolve(config.jev.apiKeyEnv ?? JEV_DEFAULTS.apiKeyEnv))?.value,
+  })
   const judge: Judge = createJudge({ config: { ...config, judgeTimeoutMs: config.judgeTimeoutMs }, jev, log })
   let ready = false
 
   void store
     .load()
-    .then(({ loaded, recovered }) => {
+    .then(async ({ loaded, recovered }) => {
       ready = true
+      const jevReady = await jev.isAvailable()
       log('info', `ready: ${loaded} memories from ${store.root}${recovered ? ' (corrupt document was set aside)' : ''}`, {
-        judge: judge.kind,
+        judge: jevReady ? 'jev' : judge.kind,
         types: config.types,
       })
-      return store.ledger({ kind: 'start', version, judge: judge.kind, model: config.jev.model ?? JEV_DEFAULTS.model, loaded, recovered })
+      return store.ledger({
+        kind: 'start',
+        version,
+        judge: judge.kind,
+        // what the judge can actually reach right now, next to what was configured
+        jevReady,
+        credential: credentials ? (config.jev.apiKeyEnv ?? JEV_DEFAULTS.apiKeyEnv) : null,
+        model: config.jev.model ?? JEV_DEFAULTS.model,
+        loaded,
+        recovered,
+      })
     })
     .catch((error) => log('warn', 'store load failed; memory stays empty this session', { error: String(error) }))
 
@@ -553,7 +589,18 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         .slice(0, config.knownForConflict)
         .map((record) => `[${record.type}] ${record.text}`)
 
-      const { rows, model, degraded } = await judge.judge(fresh, { known, signal })
+      const { rows, model, degraded } = await judge.judge(fresh, { known, signal, project: cwd })
+      // A candidate the judge did not answer is judged heuristically instead. That
+      // is a silent quality drop, so it is recorded rather than left to be inferred
+      // from a `remember=null` row: the harness found it only by inspecting rows
+      // by hand, and the cause was the per-request candidate cap.
+      const unanswered = rows.filter((row) => row.note === 'jev-missing-row').length
+      if (unanswered > 0) {
+        log('warn', `${unanswered} candidate(s) beyond the per-request cap fell back to the heuristic judge`, {
+          cap: config.jev.maxCandidates ?? undefined,
+        })
+        void store.ledger({ kind: 'degraded', reason: 'jev-missing-row', count: unanswered, cwd })
+      }
       let written = 0
       for (const candidate of fresh) {
         const judgement = rows.find((row) => row.key === candidate.key)
@@ -582,6 +629,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           id: candidate.key,
           type: judgement.type,
           importance: judgement.importance,
+          remember: judgement.remember,
           by: judgement.by,
           model,
           conflict: judgement.conflict,
@@ -589,6 +637,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           cwd,
           source: { sessionId: header?.id ?? null, seq: candidate.seq, quote: excerpt(candidate.quote, 160) },
           signals: judgement.signals,
+          note: judgement.note,
         })
         written += 1
       }

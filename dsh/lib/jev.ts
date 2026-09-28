@@ -68,8 +68,15 @@ export const JEV_DEFAULTS: Omit<JevSettings, 'apiKey'> = {
   retryStatuses: [408, 429, 500, 502, 503, 504, 529],
   /** Noul probability above which a candidate is treated as conflicting. */
   conflictThreshold: 0.7,
-  /** Score legend, from least to most important (2–10 levels allowed). */
-  importanceLevels: ['可以忽略', '有点用但不关键', '有用', '重要', '非常关键'],
+  /**
+   * Score legend, least to most important for *future sessions*.
+   *
+   * Every level names the future-session frame, because the generic wording
+   * ("有用 / 重要") let Jev score a project-wide convention 0.28 while it scored a
+   * one-off task instruction 0.73 — it had no way to tell which of the two would
+   * still matter tomorrow.
+   */
+  importanceLevels: ['与未来会话无关', '只对本次任务有用', '对未来会话有点参考', '对未来会话重要', '以后必须遵守或反复用到'],
   /** Only this many candidates are judged per request; the rest stay unjudged. */
   maxCandidates: 6,
   /** Known memories included as conflict context (context rot is real: keep it small). */
@@ -109,6 +116,8 @@ export interface JevDecideRequest {
   types: string[]
   /** known memory texts, for the conflict question. */
   known?: string[]
+  /** the workspace the memories belong to; passed to the model as framing. */
+  project?: string | null
   /** per-call budget. */
   timeoutMs?: number
   /** the turn's abort signal. */
@@ -120,6 +129,8 @@ export interface JevRow {
   key: string
   type: string | null
   importance: number | null
+  /** Noul answer to "is this worth remembering at all"; the write gate reads this. */
+  remember: number | null
   conflict: string
   confidence: number | null
   note?: string | null
@@ -134,20 +145,49 @@ export interface JevDecideResult {
 /** One typed question in the request body. */
 export interface JevQuestion {
   type: string
-  instructions: string
+  /** A string, or the official object form that references named state fields by backticks. */
+  instructions: string | Record<string, unknown>
   criteria: unknown
 }
 
+/**
+ * The framing every question shares.
+ *
+ * Without it Jev judges the sentence in a vacuum and cannot know that "必须用
+ * pnpm" is a project convention rather than generic common knowledge. The
+ * official guidance warns that *irrelevant* state degrades accuracy; this is the
+ * opposite case — the smallest amount of relevant framing.
+ */
+export const MEMORY_CONTEXT =
+  '这是一个 coding agent 的跨会话长期记忆系统。写入的记忆会在以后**全新的会话**里被自动注入系统提示、占用上下文，所以宁缺勿滥。' +
+  '判断的是「用户这句话里有没有**本项目的具体信息**——工具、命令、路径、数值、方案名、约定、踩过的坑、做过的取舍」，' +
+  '而不是「它听起来深不深刻」。像"必须用 pnpm 而不是 npm"这种看着普通、但写明了本项目选型的句子，是**应当**记住的。' +
+  '不该记住的：只对当前这一次任务有意义的操作指令、寒暄、提问、临时状态、与项目无关的闲聊，以及没有任何项目特异性的通用常识。'
+
 /** The JSON request body sent to the endpoint. */
 export interface JevRequestBody {
-  state: { known_memories: string[] }
+  /**
+   * The evaluated content. `memory_system` is the fixed framing (what a memory
+   * is for), `project` is the workspace the memories belong to, `known_memories`
+   * is the conflict-check context. Deliberately nothing else: the official
+   * guidance is that irrelevant state costs accuracy.
+   */
+  state: { memory_system: string; project: string | null; known_memories: string[] }
   model: string
   questions: Record<string, JevQuestion>
 }
 
 /** The live client `createJevClient` returns. */
 export interface JevClient {
-  available: boolean
+  /**
+   * Whether a key is configured *right now*.
+   *
+   * A method rather than a boolean because the credential can appear or change
+   * while the process runs: the harness's credentials service is documented to be
+   * re-read per operation so a changed secret reaches the next operation without a
+   * restart, and a plugin that cached the answer at mount would defeat that.
+   */
+  isAvailable(): Promise<boolean>
   endpoint: string
   decide(request: JevDecideRequest): Promise<JevDecideResult>
 }
@@ -162,6 +202,14 @@ export interface JevClientOptions {
   fetchImpl?: typeof fetch
   /** environment used for key and base-URL lookups. */
   env?: NodeJS.ProcessEnv
+  /**
+   * Resolve the bearer token from the host's credential service.
+   *
+   * Preferred over `config.apiKey` because it keeps the secret out of the
+   * composition file, and over the environment variable because the harness's
+   * credential store is the user-facing place to put one.
+   */
+  resolveApiKey?: () => Promise<string | undefined>
 }
 
 /**
@@ -188,15 +236,36 @@ export function createJevClient({
   log = () => {},
   fetchImpl = globalThis.fetch,
   env = process.env,
+  resolveApiKey,
 }: JevClientOptions = {}): JevClient {
   const settings: JevSettings = { ...JEV_DEFAULTS, ...config }
-  const apiKey = settings.apiKey || env?.[settings.apiKeyEnv] || ''
   const baseUrl = config.baseUrl || env?.[settings.baseUrlEnv] || settings.baseUrl
   const endpoint = new URL(settings.path, baseUrl).href
-  const available = Boolean(apiKey) && typeof fetchImpl === 'function'
+
+  /**
+   * Resolve the bearer token for one call, most specific source first.
+   *
+   * Resolution happens per call rather than at mount: the credential service is
+   * documented to be re-read per operation, and a user who pastes a key into the
+   * settings UI should not have to restart the harness for the judge to start
+   * working.
+   */
+  async function resolveKey(): Promise<string> {
+    if (resolveApiKey) {
+      try {
+        const fromHost = await resolveApiKey()
+        if (fromHost) return fromHost
+      } catch (error) {
+        log('warn', 'credential lookup failed; falling back to config/env', { error: String(error) })
+      }
+    }
+    return settings.apiKey || env?.[settings.apiKeyEnv] || ''
+  }
 
   return {
-    available,
+    async isAvailable(): Promise<boolean> {
+      return Boolean(await resolveKey()) && typeof fetchImpl === 'function'
+    },
     endpoint,
     /**
      * Label and score candidates in one request.
@@ -205,7 +274,8 @@ export function createJevClient({
      * @returns judgement rows plus the responding model id.
      */
     async decide(request: JevDecideRequest): Promise<JevDecideResult> {
-      if (!available) throw new Error('jev is not configured')
+      const apiKey = await resolveKey()
+      if (!apiKey) throw new Error('jev is not configured')
       const candidates = (request.candidates ?? []).slice(0, settings.maxCandidates)
       if (candidates.length === 0) return { rows: [], model: null }
 
@@ -215,6 +285,7 @@ export function createJevClient({
         types: request.types?.length ? request.types : ['constraint', 'pitfall', 'decision'],
         known: (request.known ?? []).slice(0, settings.maxKnown),
         importanceLevels: settings.importanceLevels,
+        project: request.project ?? null,
       })
 
       const response = await postWithRetry({
@@ -259,6 +330,7 @@ export function buildRequestBody({
   types,
   known,
   importanceLevels,
+  project,
 }: {
   model: string
   /** candidates, index-addressed. */
@@ -269,6 +341,8 @@ export function buildRequestBody({
   known: string[]
   /** ordered score legend. */
   importanceLevels: string[]
+  /** the workspace the memories belong to, as framing for the judgement. */
+  project?: string | null
 }): JevRequestBody {
   const questions: Record<string, JevQuestion> = {}
   const choiceCriteria: Record<string, string> = {}
@@ -278,31 +352,51 @@ export function buildRequestBody({
   candidates.forEach((candidate, index) => {
     questions[rememberId(index)] = {
       type: 'noul',
-      instructions: '这条信息是否值得写入长期记忆：它对以后的新会话仍然成立，并且不是一次性的任务指令？',
+      instructions: {
+        context: MEMORY_CONTEXT,
+        candidate: candidate.text,
+        question: '上一条 `candidate` 是否值得写进长期记忆，供以后**新的会话**使用？判断标准：换个会话、换一天，它是否仍然有用，并且是用户对项目的说法或偏好（不是这一次任务的操作指令）。',
+      },
       criteria: {
-        true: `值得记住：${candidate.text}`,
-        false: '不值得：只是一次性任务、寒暄、提问，或对本项目无长期价值',
+        true: '跨会话仍然成立、且对以后有用',
+        false: '只对当前这一次任务有意义，或是寒暄/提问/临时状态',
       },
     }
     questions[typeId(index)] = {
       type: 'choice',
-      instructions: `如果「${candidate.text}」值得长期记住，它属于哪一类？`,
+      instructions: {
+        context: MEMORY_CONTEXT,
+        candidate: candidate.text,
+        question: '如果上一条 `candidate` 值得长期记住，它属于哪一类？',
+      },
       criteria: choiceCriteria,
     }
     questions[importanceId(index)] = {
       type: 'score',
-      instructions: `「${candidate.text}」作为长期记忆的重要性有多高？`,
+      instructions: {
+        context: MEMORY_CONTEXT,
+        candidate: candidate.text,
+        question: '上一条 `candidate` 对**以后的会话**有多重要？注意：项目里通用的常识不算重要，只有本项目的约定、教训、取舍才算。',
+      },
       criteria: importanceLevels,
     }
     questions[conflictId(index)] = {
       type: 'noul',
-      instructions: `「${candidate.text}」是否与 state 中已有的记忆冲突，或被其中某一条取代（同一件事给出不同说法）？没有相关条目时回答 false。`,
+      instructions: {
+        context: MEMORY_CONTEXT,
+        candidate: candidate.text,
+        question: '上一条 `candidate` 是否与 `known_memories` 中的某一条冲突，或已被它取代（同一件事给出不同说法）？没有相关条目时回答 false。',
+      },
       criteria: { true: '冲突或被取代', false: '不冲突' },
     }
   })
 
   return {
-    state: { known_memories: known },
+    state: {
+      memory_system: MEMORY_CONTEXT,
+      project: project ?? null,
+      known_memories: known,
+    },
     model,
     questions,
   }
@@ -355,6 +449,12 @@ export function parseDecisions(
       key: candidate.key,
       type: label && label !== 'none-of-the-above' ? label : candidate.hintedType,
       importance,
+      // The Noul answer to "is this worth remembering at all" travels as its own
+      // field. It used to be folded into `confidence`, which threw the answer away
+      // exactly where it mattered — the write gate was reading a Score instead of
+      // the boolean judgement, and a genuinely good constraint ("必须用 pnpm") scored
+      // 0.28 on the generic importance rubric while a task instruction scored 0.73.
+      remember: typeof rememberNoul === 'number' ? clamp01(rememberNoul) : null,
       conflict: (typeof conflictNoul === 'number' ? conflictNoul : 0) >= options.conflictThreshold ? 'yes' : 'no',
       confidence:
         typeof choiceConfidence === 'number' ? clamp01(choiceConfidence) : typeof scoreConfidence === 'number' ? clamp01(scoreConfidence) : null,

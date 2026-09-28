@@ -25,8 +25,8 @@
  * @module dsh/lib/extract
  */
 
-import { excerpt, looksInterrogative, normalize, splitSentences } from './text.ts'
-import { emphasisWeight, isNoise, matchTypeSignals, screenSentence, signatureOf } from './signals.ts'
+import { excerpt, normalize, splitSentences } from './text.ts'
+import { emphasisWeight, isNoteworthyVeto, matchTypeSignals, screenSentence, signatureOf } from './signals.ts'
 
 /**
  * A loosely typed session-event payload. Only the fields listed here are read
@@ -223,13 +223,12 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
   const out: Candidate[] = []
   for (const sentence of splitSentences(text)) {
     if (sentence.length < config.minChars) continue
-    if (isNoise(sentence)) continue
-    if (looksInterrogative(sentence)) continue
     const screen = screenSentence(sentence)
     if (!screen.keep) {
       // Report the rejection instead of dropping it silently: write precision is
-      // measured from what the screens threw away as much as from what was kept.
-      config.onVeto?.(sentence, screen.reason)
+      // measured from what the screens threw away as much as from what was kept —
+      // but only the rejections that carry information (see isNoteworthyVeto).
+      if (isNoteworthyVeto(screen.reason)) config.onVeto?.(sentence, screen.reason)
       continue
     }
 

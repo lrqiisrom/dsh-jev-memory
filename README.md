@@ -65,11 +65,11 @@ dsh plugin --profile web add /absolute/path/to/dsh-jev-memory
           maxTokens: 600
           quota: { constraint: 4, pitfall: 3, decision: 2 }
         jev:
-          # apiKey: ...          # 或设环境变量 TYPESAFE_API_KEY
-          model: jev-latest      # 台账会记录实际应答的版本号，便于发现别名漂移
+          apiKeyEnv: TYPESAFE_API_KEY   # 从下面三处按序解析，密钥不写在配置里
+          model: jev-latest             # 台账会记录实际应答的版本号，便于发现别名漂移
 ```
 
-没有 Jev key 时 `judge: auto` 自动退回启发式，**插件无需网络即可工作**。
+**密钥放哪**：按序解析 **①** 宿主 `ctx.credentials` 服务的 `apiKeyEnv` 引用（存 `~/.dsh/.credentials.yaml`，权限 0600）→ **②** 配置里的 `apiKey` → **③** 进程环境变量。解析发生在**每次判定时**而不是挂载时，所以运行中新增 key，下一轮就生效、不必重启。没有 key 时 `judge: auto` 自动退回启发式，**插件无需网络即可工作**。
 
 ---
 
@@ -103,11 +103,32 @@ dsh plugin --profile web add /absolute/path/to/dsh-jev-memory
 
 | 指标 | 怎么算 | 当前 |
 |---|---|---|
-| 写入精确率 / 误记率 | 人工抽查 `memory.json`；或看 `kind:"write"` 里 `by:"heuristic"` 的占比 | 两次真实误记后已各有回归测试守（见下） |
+| 写入精确率 / 误记率 | 人工抽查 `memory.json`；或跑 `eval/write-precision.ts` | 启发式 **0.75 / 0.75**，**Jev 1.00 / 0.75**（阈值 0.6） |
 | **Hit@K** | 对每条标注查询 Q：前 K 条里**只要有 1 条**标注正例即记 1，最终 = 命中查询数 ÷ 查询数 | 待测 |
 | **Recall@K** | 对每条 Q：前 K 条里的正例数 ÷ 该 Q 的**全部正例数**，再取平均 | 待测 |
-| 注入 token 数 | 台账 `kind:"recall"` 的 `tokens` 字段（当前按会话内 id 集合去重后记账） | 4 条约 289–360 tokens |
-| 被拦下的候选 | 台账 `kind:"skip"`，含 `reason`（`veto:task-instruction`、`duplicate`、`below-min-importance`、`subagent-session`） | 已可观测 |
+| 注入 token 数 | 台账 `kind:"recall"` 的 `tokens` 字段 | 1 条约 60 tokens（历史上 4 条时 289–360） |
+| 被拦下的候选 | 台账 `kind:"skip"` 的 `reason` | `veto:secret` / `veto:task-instruction` / `veto:payload` / `duplicate` / `subagent-session` / `below-min-remember` / `below-min-importance` / `type-disabled:*` |
+| 判定降级 | 台账 `kind:"degraded"` | `jev-missing-row`（候选超出单次请求上限时静默降级，现在会记账并告警） |
+
+### 写入精确率是怎么量的
+
+`eval/write-precision.ts` 是一套**带标注的候选集**（20 条 = 8 条该记 + 12 条不该记），其中 8 条"不该记"取自真实会话里插件**确实写过**的原句（子代理任务指令、一次性环境失败、用户提问、API key 本身）。
+
+```sh
+TYPESAFE_API_KEY=... node eval/write-precision.ts     # 无 key 时只跑确定性筛查 + 启发式
+```
+
+真实结果（`jev-1.13.0`，16 条候选一次请求，单次判定 0.56–0.68s）：
+
+```
+确定性筛查先行：20 条拦掉 3 条（密钥 + 2 条任务指令），正例 0 损失
+启发式        precision=0.75 recall=0.75 F1=0.75
+Jev @0.6      precision=1.00 recall=0.75 F1=0.86    ← 默认
+Jev @0.5      precision=0.88 recall=0.88 F1=0.88
+Jev @0.3      precision=0.89 recall=1.00 F1=0.94
+```
+
+默认取 `0.6` 而不是 F1 更高的 `0.3`：**假阳性比假阴性贵**——一条错记会进入此后每一个会话的提示。两个已知漏判也写在这里：`不要改动 data/ 目录下的任何文件。`（Jev 给 0.51，恰好压线）与 `sqlite 写入失败：EDQUOT...`（给 0.38——只看到一次，无从判断会不会复现；修法是"同签名重复 ≥N 次才落盘"，见 `docs/DESIGN.md` 路线图）。
 
 > **为什么分开写 Hit@K 和 Recall@K**：多正例下两者会分叉（Hit@5=1 时 Recall@5 可能只有 1/3），只写"Top-3 命中"是不可复现的。这个教训来自 `zilliztech/memsearch` 公开的中英检索评测——它同时发布了两套定义，参见 `docs/memsearch-notes.md`。
 >
@@ -142,22 +163,24 @@ pnpm run typecheck              # tsc --noEmit，零依赖包也能有真类型�
 ## 现状与未验证项（不编造）
 
 - 离线全绿、真实进程内闭环已验证；
-- **Jev 线上路径尚未用真实 key 跑通**：契约按 `docs/jev-api.md`（对官方文档与 SDK 逐条核过）实现，但本机没有 `TYPESAFE_API_KEY`，所以现有全部实测都走的是启发式判定；
+- **Jev 线上路径已用真实 key 跑通**：`POST https://api.typesafe.ai/v1/systemone` → `jev-1.13.0`，一次请求判 16 条、耗时 0.56–0.68s，`docs/jev-api.md` 里的请求/响应结构逐字段对上（含 `answers.<id>.noul / .choice / .score / .confidence`）；
+- **但 GUI 里的 live 进程要重启一次才会用上 Jev**：当前进程跑的是 0.3.0（凭据集成之前），而实测确认**源码改动即使触发重新挂载也仍用 ESM 缓存**（详见下一条）。重启后台账的 `start` 行会多出 `jevReady: true` 与 `credential` 字段；
 - 多进程同时写同一个 `memory.json` 是 last-write-wins，单进程是受支持场景（TODO：锁文件）；
-- **代码改动仍需重启 harness 生效**：Cordis 的 HMR 能重挂载插件行、重读存储，但 ESM 缓存不会重新求值 `lib/*.ts`。`start` 台账里的 `version` 字段就是用来判断"跑的是哪份代码"的（换行名指向新文件可以强制换一套模块 URL，这正是本次从 `.js` 切到 `.ts` 时让修复生效的方式）；
+- **代码改动必须重启 harness**：Cordis 的 HMR 能重挂载插件行、重读存储，但 ESM 缓存不会重新求值 `lib/*.ts`。这条是**实测**的，不是推测：一次语义变更触发的重挂载后，`start` 台账仍写着旧 `version`、也没有新字段。`start.version` 就是用来判断"跑的是哪份代码"的；换一个**文件路径**（如 `.js` → `.ts`）会强制换一套模块 URL，那是唯一不用重启的刷新方式；
 - 同机还有一个同类插件 `@zilliz/memsearch-dsh`（见 `docs/memsearch-notes.md`）：它与本插件**正交**，但挂在同一 patch 层，**同 profile 共存未实测**（可能双份注入）。
 
 ## 目录
 
 ```
 dsh/index.ts          插件入口：钩子、注入点、三个工具，以及本地结构类型
-dsh/lib/signals.ts    确定性信号词表 + 候选筛查
+dsh/lib/signals.ts    确定性信号词表 + 候选筛查（含密钥/任务指令/载荷否决）
 dsh/lib/extract.ts    从回合事件里抽候选
 dsh/lib/judge.ts      判定端口（Jev / 启发式）+ 确定性写入闸门
-dsh/lib/jev.ts        Jev HTTP 客户端（重试、超时、解析）
+dsh/lib/jev.ts        Jev HTTP 客户端（凭据解析、重试、超时、解析）
 dsh/lib/store.ts      memory.json + ledger.jsonl
 dsh/lib/recall.ts     选哪些记忆、怎么渲染
 dsh/lib/text.ts       文本工具（分句、估算 token、哈希）
+eval/write-precision.ts   带标注的写入精确率评测（可对标、可复现）
 tsconfig.json         noEmit + allowImportingTsExtensions（Node 擦除模式可直接跑）
 docs/jev-api.md       Jev 调用契约调研（带出处链接）
 docs/memsearch-notes.md  同类项目 memsearch 的源码级调研与逐项对比

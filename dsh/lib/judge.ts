@@ -42,6 +42,15 @@ export interface Judgement {
   type: string
   /** 0..1. */
   importance: number
+  /**
+   * Noul answer to "is this worth remembering at all", 0..1, or null when the
+   * judge cannot answer it (the heuristic never can).
+   *
+   * This — not `importance` — is what the write gate reads when present. The two
+   * answer different questions: `remember` is "does this belong in long-term
+   * memory", `importance` is "where does it rank once it does".
+   */
+  remember: number | null
   /** whether it contradicts a known memory. */
   conflict: 'yes' | 'no' | 'unknown'
   /** judge-reported confidence, when available. */
@@ -61,9 +70,11 @@ export interface JudgeResult {
   degraded: string | null
 }
 
-/** Extra judge context: known memories for the conflict question, and the turn's signal. */
+/** Extra judge context: known memories for the conflict question, the workspace, and the turn's signal. */
 export interface JudgeContext {
   known?: string[]
+  /** the workspace the candidates came from; forwarded as model framing. */
+  project?: string | null
   signal?: AbortSignal
 }
 
@@ -76,7 +87,8 @@ export interface JudgeConfig {
 
 /** The model port: Jev implements it, tests fake it. */
 export interface JudgeModelPort {
-  available: boolean
+  /** asked per judgement call, so a credential added later takes effect next turn. */
+  isAvailable(): Promise<boolean>
   decide(request: JevDecideRequest): Promise<JevDecideResult | JevRow[]>
 }
 
@@ -92,6 +104,8 @@ export interface Judge {
 export interface GateInput {
   type: string
   importance: number
+  /** the judge's "worth remembering" probability, when it answered that question. */
+  remember?: number | null
   conflict: string
 }
 
@@ -99,6 +113,8 @@ export interface GateInput {
 export interface GateConfig {
   types: string[]
   minImportance: number
+  /** threshold on the judge's "worth remembering" Noul answer. */
+  minRemember: number
   reviewOnConflict: boolean
 }
 
@@ -118,8 +134,25 @@ export interface GateDecision {
  */
 export function createJudge({ config, jev, log = () => {} }: { config: JudgeConfig; jev?: JudgeModelPort; log?: LogSink }): Judge {
   const mode = JUDGE_MODES.includes(config.judge) ? config.judge : 'auto'
-  const useJev = mode === 'jev' || (mode === 'auto' && Boolean(jev?.available))
-  const kind = mode === 'off' ? 'off' : useJev ? 'jev' : 'heuristic'
+  /**
+   * Whether this call should go to the model.
+   *
+   * Asked per call, never cached: the model port answers it by resolving the
+   * credential, and a key added while the harness runs must take effect on the
+   * next turn rather than at the next restart. `kind` stays the *configured*
+   * intent so the startup ledger line still says what was asked for; this
+   * function says what is actually possible right now.
+   */
+  async function jevReady(): Promise<boolean> {
+    if (mode === 'off' || !jev) return false
+    if (mode === 'jev') return true
+    try {
+      return await jev.isAvailable()
+    } catch {
+      return false
+    }
+  }
+  const kind = mode === 'off' ? 'off' : mode === 'heuristic' ? 'heuristic' : 'jev'
 
   return {
     mode,
@@ -137,16 +170,18 @@ export function createJudge({ config, jev, log = () => {} }: { config: JudgeConf
     async judge(candidates, context = {}) {
       if (candidates.length === 0) return { rows: [], model: null, degraded: null }
       if (mode === 'off') return { rows: [], model: null, degraded: 'judge-off' }
-      if (!useJev) return { rows: candidates.map((candidate) => heuristicRow(candidate, config)), model: null, degraded: null }
+      if (!(await jevReady())) {
+        return { rows: candidates.map((candidate) => heuristicRow(candidate, config)), model: null, degraded: null }
+      }
       try {
-        // `useJev` can only be true over a client the caller supplied; the
-        // non-null assertion states that invariant without adding a branch the
-        // original did not have (an absent client threw inside this try and
-        // degraded to the heuristic, which is exactly what still happens).
+        // `jevReady()` can only be true over a client the caller supplied (or an
+        // explicit `judge: 'jev'`); the assertion states that invariant, and an
+        // absent client still throws inside this try and degrades, as before.
         const result = await jev!.decide({
           candidates,
           types: config.types,
           known: context.known ?? [],
+          project: context.project ?? null,
           timeoutMs: config.judgeTimeoutMs,
           signal: context.signal,
         })
@@ -163,6 +198,7 @@ export function createJudge({ config, jev, log = () => {} }: { config: JudgeConf
               key: candidate.key,
               type: typeof rowType === 'string' && types.includes(rowType) ? rowType : candidate.hintedType ?? 'fact',
               importance: clamp01(row.importance ?? candidate.signalScore),
+              remember: typeof row.remember === 'number' && Number.isFinite(row.remember) ? clamp01(row.remember) : null,
               conflict: row.conflict === 'yes' || row.conflict === 'no' ? row.conflict : 'unknown',
               confidence: Number.isFinite(row.confidence) ? clamp01(row.confidence) : null,
               by: 'jev',
@@ -202,6 +238,9 @@ export function heuristicRow(candidate: JevCandidate, config: { types: string[] 
     key: candidate.key,
     type: hinted ?? hintedType ?? 'fact',
     importance: clamp01(candidate.signalScore),
+    // The heuristic has no opinion on "worth remembering at all"; it only scores
+    // how interesting the sentence looked, so the gate falls back to `importance`.
+    remember: null,
     conflict: 'unknown',
     confidence: null,
     by: 'heuristic',
@@ -222,7 +261,19 @@ export function heuristicRow(candidate: JevCandidate, config: { types: string[] 
 export function applyGate(judgement: GateInput | null | undefined, config: GateConfig): GateDecision {
   if (!judgement) return { write: false, reason: 'no-judgement' }
   if (!config.types.includes(judgement.type)) return { write: false, reason: `type-disabled:${judgement.type}` }
-  if (judgement.importance < config.minImportance) return { write: false, reason: 'below-min-importance' }
+
+  // Two questions, two thresholds, in that order: "does this belong in memory"
+  // (the judge's Noul answer) gates the write; "how important is it" (the Score)
+  // only ranks what got in. When the judge cannot answer the first one — the
+  // heuristic never can — the score gate stands in, so behaviour degrades instead
+  // of silently accepting everything.
+  const remember = judgement.remember
+  if (typeof remember === 'number') {
+    if (remember < config.minRemember) return { write: false, reason: 'below-min-remember' }
+  } else if (judgement.importance < config.minImportance) {
+    return { write: false, reason: 'below-min-importance' }
+  }
+
   if (judgement.conflict === 'yes' && config.reviewOnConflict) return { write: true, review: true, reason: 'conflict' }
   return { write: true, reason: 'ok' }
 }

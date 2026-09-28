@@ -113,7 +113,7 @@ test('heuristic judge labels type and importance from signals', () => {
 })
 
 test('the write gate is a deterministic threshold, not a probability rule', () => {
-  const config = { types: ['constraint', 'pitfall', 'decision'], minImportance: 0.6, reviewOnConflict: true }
+  const config = { types: ['constraint', 'pitfall', 'decision'], minImportance: 0.6, minRemember: 0.6, reviewOnConflict: true }
   assert.deepEqual(applyGate({ type: 'constraint', importance: 0.6, conflict: 'no' }, config), { write: true, reason: 'ok' })
   assert.equal(applyGate({ type: 'constraint', importance: 0.59, conflict: 'no' }, config).write, false)
   assert.equal(applyGate({ type: 'fact', importance: 1, conflict: 'no' }, config).reason, 'type-disabled:fact')
@@ -122,11 +122,27 @@ test('the write gate is a deterministic threshold, not a probability rule', () =
   assert.equal(applyGate(null, config).write, false)
 })
 
+// The measured bug this rule fixes: a genuinely useful constraint scored 0.28 on
+// the importance rubric while a task instruction scored 0.73. The judge's
+// "worth remembering" answer now gates the write, and importance only ranks.
+test('the remember answer gates the write, importance only ranks', () => {
+  const config = { types: ['constraint', 'pitfall', 'decision'], minImportance: 0.6, minRemember: 0.6, reviewOnConflict: true }
+  assert.deepEqual(applyGate({ type: 'constraint', importance: 0.2, remember: 0.95, conflict: 'no' }, config), {
+    write: true,
+    reason: 'ok',
+  })
+  assert.deepEqual(applyGate({ type: 'constraint', importance: 0.95, remember: 0.2, conflict: 'no' }, config), {
+    write: false,
+    reason: 'below-min-remember',
+  })
+  assert.equal(applyGate({ type: 'constraint', importance: 0.95, remember: null, conflict: 'no' }, config).write, true)
+})
+
 test('judge with mode off writes nothing and never calls the model', async () => {
   let called = 0
   const judge = createJudge({
     config: { judge: 'off', types: ['constraint'] },
-    jev: { available: true, decide: async () => { called += 1; return { rows: [], model: null } } },
+    jev: { isAvailable: async () => true, decide: async () => { called += 1; return { rows: [], model: null } } },
   })
   assert.equal(judge.kind, 'off')
   const result = await judge.judge([{ key: 'k', hintedType: 'constraint', signalScore: 1, signals: [] }])
@@ -138,7 +154,7 @@ test('judge falls back to the heuristic when the model fails', async () => {
   const warnings: string[] = []
   const judge = createJudge({
     config: { judge: 'jev', types: ['constraint'], judgeTimeoutMs: 10 },
-    jev: { available: true, decide: async () => { throw new Error('timeout') } },
+    jev: { isAvailable: async () => true, decide: async () => { throw new Error('timeout') } },
     log: (level, message) => warnings.push(`${level}:${message}`),
   })
   const { rows, degraded } = await judge.judge([{ key: 'k', hintedType: 'constraint', signalScore: 0.7, signals: [] }])
@@ -152,10 +168,10 @@ test('judge maps model rows onto candidates and rejects types outside the config
   const judge = createJudge({
     config: { judge: 'jev', types: ['constraint', 'pitfall'] },
     jev: {
-      available: true,
+      isAvailable: async () => true,
       decide: async () => ({
         model: 'jev-1.13.0',
-        rows: [{ key: 'k', type: 'fact', importance: 0.95, conflict: 'yes', confidence: 0.8 }],
+        rows: [{ key: 'k', type: 'fact', importance: 0.95, remember: 0.9, conflict: 'yes', confidence: 0.8 }],
       }),
     },
   })

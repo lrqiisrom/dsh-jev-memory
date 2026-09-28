@@ -16,6 +16,8 @@
  * @module dsh/lib/signals
  */
 
+import { looksInterrogative } from './text.ts'
+
 /** One type-signal family: the label it implies, its weight, and its patterns. */
 export interface TypeSignalFamily {
   type: string
@@ -246,6 +248,25 @@ export const TASK_INSTRUCTION_PATTERNS: RegExp[] = [
 export const PAYLOAD_PATTERNS: RegExp[] = [/\{"[^"]+"\s*:/u, /^\s*[[{]/u, /```/u]
 
 /**
+ * Sentences carrying a secret.
+ *
+ * This screen is a hard veto and it runs before anything is judged, because the
+ * failure it prevents is unbounded: a memory is injected into every later
+ * session's prompt, so a key written once leaks forever. The trigger was
+ * concrete rather than hypothetical — the user pasted a TypeSafe API key inside
+ * an otherwise ordinary sentence, and that sentence satisfies every other rule
+ * (long enough, not noise, not a question, no task-instruction shape).
+ */
+export const SECRET_PATTERNS: RegExp[] = [
+  /\bapikey_[A-Za-z0-9_]{16,}/iu,
+  /\b(?:sk|pk|rk|ts|api)[_-][A-Za-z0-9_-]{20,}/iu,
+  /\bAKIA[0-9A-Z]{16}\b/u,
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./u,
+  /\b(?:api[_-]?key|access[_-]?token|secret|password|passwd|bearer)\b\s*[:=]?\s*\S{12,}/iu,
+  /\b[0-9a-f]{48,}\b/iu,
+]
+
+/**
  * Decide whether one sentence may become a memory at all.
  *
  * Returns a reason instead of a boolean so the ledger can record *why* a
@@ -256,9 +277,28 @@ export const PAYLOAD_PATTERNS: RegExp[] = [/\{"[^"]+"\s*:/u, /^\s*[[{]/u, /```/u
  * @returns the screening decision.
  */
 export function screenSentence(sentence: string): ScreenDecision {
+  if (SECRET_PATTERNS.some((pattern) => pattern.test(sentence))) return { keep: false, reason: 'secret' }
   if (TASK_INSTRUCTION_PATTERNS.some((pattern) => pattern.test(sentence))) return { keep: false, reason: 'task-instruction' }
   if (PAYLOAD_PATTERNS.some((pattern) => pattern.test(sentence))) return { keep: false, reason: 'payload' }
+  // Chatter and questions live here rather than in the extractor, so there is one
+  // screen entry point: the write-precision harness runs the same screens the
+  // plugin does, and a sentence cannot be screened in one path but not the other.
+  if (isNoise(sentence)) return { keep: false, reason: 'noise' }
+  if (looksInterrogative(sentence)) return { keep: false, reason: 'question' }
   return { keep: true, reason: null }
+}
+
+/**
+ * The reasons worth a ledger line when a sentence is rejected.
+ *
+ * Chatter and questions are dropped silently: recording every "好的" would bury
+ * the rejections that carry information under the ones that never did.
+ *
+ * @param reason - the reason `screenSentence` returned.
+ * @returns whether the rejection deserves an audit line.
+ */
+export function isNoteworthyVeto(reason: string | null): boolean {
+  return reason === 'secret' || reason === 'task-instruction' || reason === 'payload'
 }
 
 /**
