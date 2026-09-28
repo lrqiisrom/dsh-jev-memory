@@ -45,7 +45,7 @@
     "id": "sha1(签名归一化后的正文)",   // 同时是去重键
     "type": "constraint|pitfall|decision|preference|procedure|rejected|fact",
     "text": "必须用 pnpm 管理依赖。",     // 逐字
-    "cwd": "/Users/rom/Documents/projectSDK",  // null = 全局
+    "cwd": "/Users/rom/Documents/projectSDK/dsh-jev-memory",  // null = 全局
     "importance": 0.9,
     "status": "active|needs-review",     // needs-review = 疑似与旧记忆冲突，默认不注入
     "source": { "sessionId": "…", "seq": 8, "quote": "…", "at": 1790584176299 },
@@ -105,7 +105,7 @@
 ## 6. 实测记录（2026-09-28）
 
 1. 把插件作为一行挂进 `~/.dsh/profiles/web/cordis.patch.yml`（`file:` URL），**正在运行的 GUI 立即挂载**：`~/.dsh/jev-memory/ledger.jsonl` 出现 `{"kind":"start","judge":"heuristic","loaded":0}`。
-2. 用一个 subagent（新会话、同一宿主进程）调用 `memory_write` / `memory_search` → 两条都成功，工作目录 `projectSDK`。
+2. 用一个 subagent（新会话、同一宿主进程）调用 `memory_write` / `memory_search` → 两条都成功，工作目录就是本仓库所在目录。
 3. 下一轮模型请求的运行时上下文里出现注入块：
 
    ```
