@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -56,7 +56,7 @@ function fakeContext(): { ctx: PluginContext; captured: Captured } {
         },
       }
       if (names.includes('credentials') && captured.credentialValue !== undefined) {
-        scope.credentials = { resolve: async () => ({ value: captured.credentialValue as string }) }
+        scope.credentials = { resolve: async () => ({ value: captured.credentialValue as string, source: 'file' }) }
       }
       callback(scope)
     },
@@ -126,6 +126,35 @@ async function mount(
   apply(ctx, { root, judge: 'heuristic', ...overrides })
   await new Promise((resolve) => setTimeout(resolve, 50))
   return { root, captured }
+}
+
+/** The plugin's `start` ledger line, which records what the judge could reach. */
+async function startEntry(root: string): Promise<Record<string, any>> {
+  const ledger = await readFile(join(root, 'ledger.jsonl'), 'utf8')
+  const entries = ledger
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line))
+  return entries.find((entry) => entry.kind === 'start')
+}
+
+/**
+ * Run `fn` with `DSH_HOME` pointed at a fresh temp directory.
+ *
+ * Without this the credential-file path would read the developer's real
+ * `~/.dsh/.credentials.yaml`, so the test would pass or fail depending on the
+ * machine it runs on.
+ */
+async function withTempHome(fn: (home: string) => Promise<void>): Promise<void> {
+  const home = await mkdtemp(join(tmpdir(), 'dshmem-home-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    await fn(home)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
 }
 
 test('resolveConfig keeps the narrow default and reports bad values', () => {
@@ -269,24 +298,35 @@ test('a failing hook never propagates out of the turn boundary', async () => {
 // The bug this covers: the plugin looked the credential service up once during
 // mount, Cordis's `get` refused to return a provider whose fiber was not active
 // yet, and the plugin silently stayed on the heuristic judge forever — visible
-// only as `jevReady: false` with no hint of why.
+// only as `ready: false` with no hint of why.
 test('a credential service that arrives after mount still switches the judge to Jev', async () => {
   const { root } = await mount({ judge: 'auto' }, 'test-key-from-credentials')
-  const ledger = await readFile(join(root, 'ledger.jsonl'), 'utf8')
-  const start = ledger
-    .trim()
-    .split('\n')
-    .map((line) => JSON.parse(line))
-    .find((entry) => entry.kind === 'start')
+  const start = await startEntry(root)
   assert.equal(start.judge, 'jev', 'mode auto with a reachable key configures the Jev judge')
-  assert.deepEqual(start.jev, { ready: true, source: 'credentials', endpoint: 'https://api.typesafe.ai/v1/systemone' })
+  assert.deepEqual(start.jev, { ready: true, source: 'service:file', endpoint: 'https://api.typesafe.ai/v1/systemone' })
   assert.equal(start.credentialRef, 'TYPESAFE_API_KEY')
 })
 
-test('without a credential service the ledger says so instead of staying silent', async () => {
-  const { root } = await mount({ judge: 'auto' })
-  const ledger = await readFile(join(root, 'ledger.jsonl'), 'utf8')
-  const start = JSON.parse(ledger.trim().split('\n')[0])
-  assert.equal(start.jev.ready, false)
-  assert.equal(start.jev.source, 'none')
+test('without any credential source the ledger says so instead of staying silent', async () => {
+  await withTempHome(async (home) => {
+    const { root } = await mount({ judge: 'auto' })
+    const start = await startEntry(root)
+    assert.equal(start.jev.ready, false)
+    assert.equal(start.jev.source, 'none')
+    assert.equal(home.includes('dshmem-home-'), true)
+  })
+})
+
+// Reachability of the service is not something a plugin can assume, so the second
+// path reads the provider's own document. This is the test that would have caught
+// the original failure without a restart: with no service and a document present,
+// the judge must still come up on Jev.
+test('a credential document is read when the service is absent', async () => {
+  await withTempHome(async (home) => {
+    await writeFile(join(home, '.credentials.yaml'), 'version: 1\nrefs:\n  TYPESAFE_API_KEY: key-from-document\n', { mode: 0o600 })
+    const { root } = await mount({ judge: 'auto' })
+    const start = await startEntry(root)
+    assert.equal(start.jev.ready, true)
+    assert.equal(start.jev.source, 'file')
+  })
 })

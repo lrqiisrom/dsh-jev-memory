@@ -209,9 +209,11 @@ export interface JevClientOptions {
    *
    * Preferred over `config.apiKey` because it keeps the secret out of the
    * composition file, and over the environment variable because the harness's
-   * credential store is the user-facing place to put one.
+   * credential store is the user-facing place to put one. A plain string is
+   * labelled `credentials`; returning `{ key, source }` lets the host name the
+   * exact layer it used, which is what makes a failure diagnosable.
    */
-  resolveApiKey?: () => Promise<string | undefined>
+  resolveApiKey?: () => Promise<string | undefined | { key?: string; source: string }>
 }
 
 /**
@@ -256,7 +258,8 @@ export function createJevClient({
     if (resolveApiKey) {
       try {
         const fromHost = await resolveApiKey()
-        if (fromHost) return { key: fromHost, source: 'credentials' }
+        if (typeof fromHost === 'string' && fromHost) return { key: fromHost, source: 'credentials' }
+        if (fromHost && typeof fromHost === 'object' && fromHost.key) return { key: fromHost.key, source: fromHost.source }
       } catch (error) {
         log('warn', 'credential lookup failed; falling back to config/env', { error: String(error) })
       }

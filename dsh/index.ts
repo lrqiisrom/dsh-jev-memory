@@ -41,6 +41,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
+import { createCredentialFileReader } from './lib/credentials.ts'
 import { extractCandidates, EXTRACT_DEFAULTS } from './lib/extract.ts'
 import { applyGate, createJudge, JUDGE_MODES } from './lib/judge.ts'
 import { createJevClient, JEV_DEFAULTS } from './lib/jev.ts'
@@ -144,7 +145,7 @@ export interface ToolRegistry {
 
 /** The credential service, reduced to the one call this plugin makes. */
 export interface CredentialService {
-  resolve(ref: string): Promise<{ value: string } | undefined>
+  resolve(ref: string): Promise<{ value: string; source?: string } | undefined>
 }
 
 /** The Cordis plugin context, reduced to the members this plugin calls. */
@@ -411,8 +412,17 @@ export function resolveStoreRoot(configured: string, env: NodeJS.ProcessEnv = pr
   // (so a blank override can never resolve the store to the current directory).
   const explicit = typeof configured === 'string' ? configured.trim() : ''
   if (explicit) return explicit
-  const home = env?.DSH_HOME?.trim() || join(homedir(), '.dsh')
-  return join(home, 'jev-memory')
+  return join(resolveDshHome(env), 'jev-memory')
+}
+
+/**
+ * Resolve the harness home the way the harness does: `$DSH_HOME`, else `~/.dsh`.
+ *
+ * @param env - environment to read.
+ * @returns the absolute harness home.
+ */
+export function resolveDshHome(env: NodeJS.ProcessEnv = process.env): string {
+  return env?.DSH_HOME?.trim() || join(homedir(), '.dsh')
 }
 
 /**
@@ -443,25 +453,37 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   }
 
   const store = createMemoryStore({ root: resolveStoreRoot(config.root), log })
-  // The bearer token comes from the harness's credential service, not from this
+  // The bearer token comes from the harness's credential store, not from this
   // composition file: a secret in a patch layer is a secret in a diff.
   //
-  // Reached *reactively* rather than with a one-shot `ctx.get` at mount, and that
-  // distinction was a real bug: Cordis's `get` returns only providers whose fiber
-  // is already active, so looking it up during `apply()` found nothing, the
-  // plugin cached `undefined`, and it stayed on the heuristic judge forever while
-  // the ledger said only `jevReady: false`. `inject` re-runs when the provider
-  // becomes available; the late `ctx.get` covers a host that never fires it.
+  // Two paths, because reachability is not something a plugin can assume. The
+  // service is authoritative and tried first, but it is reached through the
+  // Cordis context, and `ctx.get` returns only providers whose fiber is already
+  // active — a plugin that mounts early therefore observes `undefined` (measured:
+  // the startup ledger said `ready:false`, while a probe in the same process
+  // resolved the very same reference successfully moments later). The second path
+  // reads the provider's own document, so a timing difference can no longer
+  // decide whether the model judge is used. The ledger records which one answered.
   let credentials: CredentialService | undefined
   const credentialOf = (): CredentialService | undefined => credentials ?? (ctx.get?.('credentials') as CredentialService | undefined)
   ctx.inject(['credentials'], (scope) => {
     credentials = scope.credentials
   })
   const credentialRef = config.jev.apiKeyEnv ?? JEV_DEFAULTS.apiKeyEnv
+  const credentialFromFile = createCredentialFileReader({ home: resolveDshHome(), ref: credentialRef })
   const jev = createJevClient({
     config: config.jev,
     log,
-    resolveApiKey: async () => (await credentialOf()?.resolve(credentialRef))?.value,
+    resolveApiKey: async () => {
+      try {
+        const resolved = await credentialOf()?.resolve(credentialRef)
+        if (resolved?.value) return { key: resolved.value, source: `service:${resolved.source ?? 'unknown'}` }
+      } catch (error) {
+        log('warn', 'credential service lookup failed; reading the credential document instead', { error: String(error) })
+      }
+      const fromFile = await credentialFromFile()
+      return fromFile ? { key: fromFile, source: 'file' } : undefined
+    },
   })
   const judge: Judge = createJudge({ config: { ...config, judgeTimeoutMs: config.judgeTimeoutMs }, jev, log })
   let ready = false
