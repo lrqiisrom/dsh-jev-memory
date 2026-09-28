@@ -326,7 +326,7 @@ export const name = 'jev-memory'
  * process using the code I just edited?" is answerable from the ledger alone —
  * a hot-reloaded module and a cached one otherwise look identical.
  */
-export const version = '0.4.0'
+export const version = '0.5.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
