@@ -1,0 +1,228 @@
+/**
+ * The judgement layer: turn candidates into labelled, scored memories.
+ *
+ * This is the plugin's only optional model call, and it is a *port*: Jev
+ * (TypeSafe System One, a decision model rather than a generative one) is the
+ * preferred implementation, and a deterministic heuristic is the fallback that
+ * keeps the plugin working — and testable — with no key, no network, and no
+ * latency budget.
+ *
+ * Three disciplines are enforced here rather than left to the caller:
+ *  1. The model never writes. It returns labels and probabilities; the write
+ *     gate is a plain threshold comparison in `applyGate`, owned by code.
+ *  2. Fail-open. Any judge failure degrades to the heuristic (or to "skip this
+ *     turn"), never to a thrown error inside the harness's turn boundary.
+ *  3. The judge cannot invent content. It receives candidate texts and returns
+ *     indices, types, scores, and probabilities — there is no field it could
+ *     put a new sentence into.
+ *
+ * Types: the model port is described structurally, so a test can hand in a
+ * three-line fake without importing anything, and the plugin keeps its
+ * zero-dependency promise. The candidate shape is shared with the transport
+ * (`JevCandidate`) because that is the only place its `text` is read.
+ *
+ * @module dsh/lib/judge
+ */
+
+import { clamp01 } from './store.ts'
+import { MEMORY_TYPES } from './store.ts'
+import type { JevCandidate, JevDecideRequest, JevDecideResult, JevRow } from './jev.ts'
+
+/** Host logger signature, repeated per module so no module imports another for it. */
+export type LogSink = (level: string, message: string, detail?: unknown) => void
+
+/** Supported judge modes; `auto` prefers Jev when a key is configured. */
+export const JUDGE_MODES: string[] = ['auto', 'jev', 'heuristic', 'off']
+
+/** One judgement row: labels and provenance, never content. */
+export interface Judgement {
+  /** the candidate's signature key. */
+  key: string
+  /** the labelled type. */
+  type: string
+  /** 0..1. */
+  importance: number
+  /** whether it contradicts a known memory. */
+  conflict: 'yes' | 'no' | 'unknown'
+  /** judge-reported confidence, when available. */
+  confidence: number | null
+  /** which implementation produced this row. */
+  by: 'jev' | 'heuristic'
+  /** the deterministic signals that matched. */
+  signals: string[]
+  /** free-form judge note for the ledger (never injected). */
+  note: string | null
+}
+
+/** What `judge()` returns: the rows, the model id, and why it degraded. */
+export interface JudgeResult {
+  rows: Judgement[]
+  model: string | null
+  degraded: string | null
+}
+
+/** Extra judge context: known memories for the conflict question, and the turn's signal. */
+export interface JudgeContext {
+  known?: string[]
+  signal?: AbortSignal
+}
+
+/** The resolved config fields the judgement layer reads. */
+export interface JudgeConfig {
+  judge: string
+  types: string[]
+  judgeTimeoutMs?: number
+}
+
+/** The model port: Jev implements it, tests fake it. */
+export interface JudgeModelPort {
+  available: boolean
+  decide(request: JevDecideRequest): Promise<JevDecideResult | JevRow[]>
+}
+
+/** The judge handle the plugin mounts. */
+export interface Judge {
+  mode: string
+  kind: string
+  heuristics(candidates: JevCandidate[]): Judgement[]
+  judge(candidates: JevCandidate[], context?: JudgeContext): Promise<JudgeResult>
+}
+
+/** The judgement fields the write gate reads. */
+export interface GateInput {
+  type: string
+  importance: number
+  conflict: string
+}
+
+/** The config fields the write gate reads. */
+export interface GateConfig {
+  types: string[]
+  minImportance: number
+  reviewOnConflict: boolean
+}
+
+/** The write gate's decision, and why. */
+export interface GateDecision {
+  write: boolean
+  /** present and true only for a suspected conflict with review enabled. */
+  review?: boolean
+  reason: string
+}
+
+/**
+ * Build the plugin's judge over the configured mode.
+ *
+ * @param options - wiring: the resolved config, the Jev client, and a logger.
+ * @returns the judge.
+ */
+export function createJudge({ config, jev, log = () => {} }: { config: JudgeConfig; jev?: JudgeModelPort; log?: LogSink }): Judge {
+  const mode = JUDGE_MODES.includes(config.judge) ? config.judge : 'auto'
+  const useJev = mode === 'jev' || (mode === 'auto' && Boolean(jev?.available))
+  const kind = mode === 'off' ? 'off' : useJev ? 'jev' : 'heuristic'
+
+  return {
+    mode,
+    kind,
+    heuristics: (candidates) => candidates.map((candidate) => heuristicRow(candidate, config)),
+    /**
+     * Label every candidate. Never throws: on a Jev failure the same candidates
+     * are re-labelled heuristically, and the returned `degraded` marker lets the
+     * ledger record why.
+     *
+     * @param candidates - extracted candidates.
+     * @param context - extra judge context (known memories for conflict checks).
+     * @returns judgements and provenance.
+     */
+    async judge(candidates, context = {}) {
+      if (candidates.length === 0) return { rows: [], model: null, degraded: null }
+      if (mode === 'off') return { rows: [], model: null, degraded: 'judge-off' }
+      if (!useJev) return { rows: candidates.map((candidate) => heuristicRow(candidate, config)), model: null, degraded: null }
+      try {
+        // `useJev` can only be true over a client the caller supplied; the
+        // non-null assertion states that invariant without adding a branch the
+        // original did not have (an absent client threw inside this try and
+        // degraded to the heuristic, which is exactly what still happens).
+        const result = await jev!.decide({
+          candidates,
+          types: config.types,
+          known: context.known ?? [],
+          timeoutMs: config.judgeTimeoutMs,
+          signal: context.signal,
+        })
+        const rows: JevRow[] = Array.isArray(result) ? result : result?.rows ?? []
+        const model = Array.isArray(result) ? null : result?.model ?? null
+        const byKey = new Map(rows.map((row): [string, JevRow] => [row.key, row]))
+        const types = config.types.length > 0 ? config.types : MEMORY_TYPES
+        return {
+          rows: candidates.map((candidate): Judgement => {
+            const row = byKey.get(candidate.key)
+            if (!row) return heuristicRow(candidate, config, 'jev-missing-row')
+            const rowType = row.type
+            return {
+              key: candidate.key,
+              type: typeof rowType === 'string' && types.includes(rowType) ? rowType : candidate.hintedType ?? 'fact',
+              importance: clamp01(row.importance ?? candidate.signalScore),
+              conflict: row.conflict === 'yes' || row.conflict === 'no' ? row.conflict : 'unknown',
+              confidence: Number.isFinite(row.confidence) ? clamp01(row.confidence) : null,
+              by: 'jev',
+              signals: candidate.signals,
+              note: typeof row.note === 'string' ? row.note.slice(0, 200) : null,
+            }
+          }),
+          model,
+          degraded: null,
+        }
+      } catch (error) {
+        log('warn', 'jev judgement failed; falling back to the heuristic judge', { error: String(error) })
+        return {
+          rows: candidates.map((candidate) => heuristicRow(candidate, config, 'jev-failed')),
+          model: null,
+          degraded: 'jev-failed',
+        }
+      }
+    },
+  }
+}
+
+/**
+ * The offline judge: type from deterministic signals, importance from the
+ * extraction score, conflict unknown.
+ *
+ * @param candidate - one extracted candidate.
+ * @param config - resolved plugin config.
+ * @param note - why the heuristic ran (ledger only).
+ * @returns the judgement row.
+ */
+export function heuristicRow(candidate: JevCandidate, config: { types: string[] }, note: string | null = null): Judgement {
+  const types = config.types.length > 0 ? config.types : MEMORY_TYPES
+  const hintedType = candidate.hintedType
+  const hinted = hintedType && types.includes(hintedType) ? hintedType : null
+  return {
+    key: candidate.key,
+    type: hinted ?? hintedType ?? 'fact',
+    importance: clamp01(candidate.signalScore),
+    conflict: 'unknown',
+    confidence: null,
+    by: 'heuristic',
+    signals: candidate.signals,
+    note,
+  }
+}
+
+/**
+ * The write gate. Deliberately a pure function so the policy is testable
+ * without a store or a clock, and deliberately not a function of Jev's
+ * probability beyond ranking: the threshold is configuration a human owns.
+ *
+ * @param judgement - one judgement row.
+ * @param config - resolved plugin config.
+ * @returns the decision and why.
+ */
+export function applyGate(judgement: GateInput | null | undefined, config: GateConfig): GateDecision {
+  if (!judgement) return { write: false, reason: 'no-judgement' }
+  if (!config.types.includes(judgement.type)) return { write: false, reason: `type-disabled:${judgement.type}` }
+  if (judgement.importance < config.minImportance) return { write: false, reason: 'below-min-importance' }
+  if (judgement.conflict === 'yes' && config.reviewOnConflict) return { write: true, review: true, reason: 'conflict' }
+  return { write: true, reason: 'ok' }
+}

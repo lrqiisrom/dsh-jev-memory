@@ -1,14 +1,28 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { applyGate, createJudge, heuristicRow } from '../dsh/lib/judge.js'
-import { inScope, renderRecall, searchMemories, selectMemories } from '../dsh/lib/recall.js'
+import { applyGate, createJudge, heuristicRow } from '../dsh/lib/judge.ts'
+import { inScope, renderRecall, searchMemories, selectMemories } from '../dsh/lib/recall.ts'
 
 const DAY = 86_400_000
 const NOW = 1_700_000_000_000
 
 /** Build a record with a type, importance and age. */
-function memory({ id, type = 'constraint', importance = 0.9, ageDays = 0, cwd = '/work/a', status = 'active' }) {
+function memory({
+  id,
+  type = 'constraint',
+  importance = 0.9,
+  ageDays = 0,
+  cwd = '/work/a',
+  status = 'active',
+}: {
+  id: string
+  type?: string
+  importance?: number
+  ageDays?: number
+  cwd?: string | null
+  status?: string
+}) {
   return {
     id,
     type,
@@ -121,7 +135,7 @@ test('judge with mode off writes nothing and never calls the model', async () =>
 })
 
 test('judge falls back to the heuristic when the model fails', async () => {
-  const warnings = []
+  const warnings: string[] = []
   const judge = createJudge({
     config: { judge: 'jev', types: ['constraint'], judgeTimeoutMs: 10 },
     jev: { available: true, decide: async () => { throw new Error('timeout') } },

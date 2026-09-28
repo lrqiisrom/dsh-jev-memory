@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { extractCandidates } from '../dsh/lib/extract.js'
+import { extractCandidates } from '../dsh/lib/extract.ts'
+import type { TurnEvent } from '../dsh/lib/extract.ts'
 
 /** One synthetic turn: a human message, a tool call, and its failed result. */
-function turnEvents() {
+function turnEvents(): TurnEvent[] {
   return [
     { seq: 0, type: 'turn/start', data: { turn: 1 } },
     {
@@ -36,7 +37,7 @@ test('extractCandidates keeps statements and drops questions, noise and short li
 })
 
 test('extractCandidates ignores plugin and model messages', () => {
-  const events = [
+  const events: TurnEvent[] = [
     {
       seq: 1,
       type: 'user/message',
@@ -55,7 +56,7 @@ test('extractCandidates turns a failed tool result into a pitfall signature', ()
 })
 
 test('extractCandidates ranks constraints above neutral statements', () => {
-  const events = [
+  const events: TurnEvent[] = [
     {
       seq: 1,
       type: 'user/message',
@@ -79,7 +80,7 @@ test('extractCandidates caps how much one turn can offer', () => {
     '这个服务的端口固定为 8000。',
     '禁止在测试里访问真实网络。',
   ].join('')
-  const events = [
+  const events: TurnEvent[] = [
     { seq: 1, type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: sentences }] } },
   ]
   assert.equal(extractCandidates(events, { maxPerMessage: 5, maxPerTurn: 3 }).length, 3)
@@ -87,7 +88,7 @@ test('extractCandidates caps how much one turn can offer', () => {
 })
 
 test('extractCandidates dedups identical candidates inside one turn', () => {
-  const events = [
+  const events: TurnEvent[] = [
     { seq: 1, type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '必须用 pnpm 管理依赖。必须用 pnpm 管理依赖。' }] } },
   ]
   const candidates = extractCandidates(events)

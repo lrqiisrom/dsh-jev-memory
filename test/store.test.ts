@@ -4,10 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { createMemoryStore, normalizeRecord } from '../dsh/lib/store.js'
+import { createMemoryStore, normalizeRecord } from '../dsh/lib/store.ts'
+import type { MemoryRecord } from '../dsh/lib/store.ts'
 
 /** Build a minimal record for store tests. */
-function record(overrides = {}) {
+function record(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
   return {
     id: 'k1',
     type: 'constraint',
@@ -35,7 +36,7 @@ test('store persists records and reloads them', async () => {
 
   const reopened = createMemoryStore({ root, now: () => 1_700_000_000_000 })
   assert.equal((await reopened.load()).loaded, 1)
-  assert.equal(reopened.get('k1').text, '必须用 pnpm。')
+  assert.equal(reopened.get('k1')!.text, '必须用 pnpm。')
   assert.equal(reopened.has('k1'), true)
 })
 
@@ -47,7 +48,7 @@ test('store replaces a re-stated memory without losing its recall history', asyn
   store.noteRecalled(['k1'])
   await store.put(record({ importance: 1, createdAt: 999, updatedAt: 999 }))
 
-  const kept = store.get('k1')
+  const kept = store.get('k1')!
   assert.equal(kept.createdAt, 1_700_000_000_000, 'first sighting wins as the origin')
   assert.equal(kept.recalls, 1, 'recall counter survives a restatement')
   assert.equal(kept.importance, 1)
@@ -68,7 +69,10 @@ test('store writes an append-only ledger', async () => {
   await store.load()
   await store.ledger({ kind: 'write', id: 'k1' })
   await store.ledger({ kind: 'forget', id: 'k1' })
-  const lines = (await readFile(join(root, 'ledger.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+  const lines = (await readFile(join(root, 'ledger.jsonl'), 'utf8'))
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line) as { t: number; kind: string })
   assert.equal(lines.length, 2)
   assert.equal(lines[0].t, 7)
   assert.equal(lines[1].kind, 'forget')
@@ -91,7 +95,7 @@ test('store removes records and reports stats', async () => {
 })
 
 test('normalizeRecord tolerates a hand-edited file', () => {
-  const normalized = normalizeRecord({ text: '  手工改的  ', type: 'nonsense' }, 100)
+  const normalized = normalizeRecord({ text: '  手工改的  ', type: 'nonsense' }, 100)!
   assert.equal(normalized.text, '手工改的')
   assert.equal(normalized.type, 'fact', 'unknown types degrade instead of discarding the memory')
   assert.equal(normalized.status, 'active')

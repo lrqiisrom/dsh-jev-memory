@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { blocksToText, clip, estimateTokens, hashText, looksInterrogative, normalize, splitSentences } from '../dsh/lib/text.js'
-import { isNoise, matchTypeSignals, screenSentence, signatureOf } from '../dsh/lib/signals.js'
+import { blocksToText, clip, estimateTokens, hashText, looksInterrogative, normalize, splitSentences } from '../dsh/lib/text.ts'
+import { isNoise, matchTypeSignals, screenSentence, signatureOf } from '../dsh/lib/signals.ts'
 
 test('blocksToText keeps only text blocks', () => {
   const content = [
@@ -35,6 +35,21 @@ test('looksInterrogative separates questions from statements', () => {
   assert.equal(looksInterrogative('为什么必须用 pnpm？'), true)
   assert.equal(looksInterrogative('必须用 pnpm。'), false)
   assert.equal(looksInterrogative('why must we use pnpm'), true)
+})
+
+// The second live false positive: a question with no question mark, starting with
+// a URL, was stored as a `constraint`.
+test('looksInterrogative catches Chinese questions without a question mark', () => {
+  assert.equal(looksInterrogative('这个 dsh 的插件难道只能用 js 写吗'), true)
+  assert.equal(
+    looksInterrogative('https://github.com/zilliztech/memsearch 参考这个吧 我看这个插件的语言都是 python 多一点，这个 dsh 的插件难道只能用 js 写吗'),
+    true,
+  )
+  assert.equal(looksInterrogative('必须用 pnpm 吗'), true)
+  assert.equal(looksInterrogative('这个方案是不是更好'), true)
+  assert.equal(looksInterrogative('我们是不是该换个思路'), true)
+  assert.equal(looksInterrogative('必须用 pnpm 管理依赖，这是团队约定。'), false)
+  assert.equal(looksInterrogative('不要改动 data/ 目录下的任何文件。'), false)
 })
 
 test('estimateTokens over-counts CJK and never returns zero for text', () => {

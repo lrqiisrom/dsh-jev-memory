@@ -6,6 +6,13 @@
  * always be traced back to a verbatim quote in a session log. Judgement may
  * label a sentence, never paraphrase it — that is what keeps "记错" auditable.
  *
+ * Types: the parameters that begin life as untyped data (a `Message['content']`
+ * value, a field read back from a hand-edited JSON document) are declared
+ * `unknown` rather than `any`, matching what the implementations already do —
+ * every one of them starts by coercing its input with `String(value ?? '')`.
+ * Nothing here imports a type from the harness: the plugin is zero-dependency
+ * on purpose, so a host-shaped value is described structurally where it is read.
+ *
  * @module dsh/lib/text
  */
 
@@ -21,15 +28,15 @@ export const DEFAULT_MAX_MEMORY_CHARS = 240
  * purpose — a memory should never be built out of the model's private
  * reasoning, which is neither user intent nor a durable fact.
  *
- * @param {unknown} content - a `Message['content']` value (or anything else).
- * @returns {string} the concatenated text blocks, newline separated.
+ * @param content - a `Message['content']` value (or anything else).
+ * @returns the concatenated text blocks, newline separated.
  */
-export function blocksToText(content) {
+export function blocksToText(content: unknown): string {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return ''
-  const parts = []
-  for (const block of content) {
-    if (block && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string') {
+  const parts: string[] = []
+  for (const block of content as unknown[]) {
+    if (block && typeof block === 'object' && 'type' in block && block.type === 'text' && 'text' in block && typeof block.text === 'string') {
       parts.push(block.text)
     }
   }
@@ -39,10 +46,10 @@ export function blocksToText(content) {
 /**
  * Collapse whitespace so two spellings of the same sentence hash identically.
  *
- * @param {string} text - raw text.
- * @returns {string} single-spaced, trimmed text.
+ * @param text - raw text.
+ * @returns single-spaced, trimmed text.
  */
-export function normalize(text) {
+export function normalize(text: unknown): string {
   return String(text ?? '')
     .replace(/\s+/gu, ' ')
     .trim()
@@ -51,11 +58,11 @@ export function normalize(text) {
 /**
  * Clip on a grapheme-safe boundary, appending an ellipsis when shortened.
  *
- * @param {string} text - normalized text.
- * @param {number} max - maximum characters, excluding the ellipsis.
- * @returns {string} the clipped text.
+ * @param text - normalized text.
+ * @param max - maximum characters, excluding the ellipsis.
+ * @returns the clipped text.
  */
-export function clip(text, max = DEFAULT_MAX_MEMORY_CHARS) {
+export function clip(text: unknown, max: number = DEFAULT_MAX_MEMORY_CHARS): string {
   const value = normalize(text)
   if (value.length <= max) return value
   return `${value.slice(0, Math.max(1, max - 1)).trimEnd()}…`
@@ -66,10 +73,10 @@ export function clip(text, max = DEFAULT_MAX_MEMORY_CHARS) {
  *
  * Case is folded because "必须用 pnpm" and "必须用 PNPM" are the same memory.
  *
- * @param {string} text - normalized or raw text.
- * @returns {string} 12 lowercase hex characters.
+ * @param text - normalized or raw text.
+ * @returns 12 lowercase hex characters.
  */
-export function hashText(text) {
+export function hashText(text: unknown): string {
   return createHash('sha1').update(normalize(text).toLowerCase()).digest('hex').slice(0, 12)
 }
 
@@ -83,12 +90,12 @@ export function hashText(text) {
  * follow it, so `main.py`, `v1.2` and `node_modules/x.d.ts` survive intact —
  * those are exactly the tokens a memory usually has to preserve verbatim.
  *
- * @param {string} text - raw message text.
- * @returns {string[]} trimmed, non-empty sentences.
+ * @param text - raw message text.
+ * @returns trimmed, non-empty sentences.
  */
-export function splitSentences(text) {
+export function splitSentences(text: unknown): string[] {
   const raw = String(text ?? '').replace(/\r\n?/gu, '\n')
-  const out = []
+  const out: string[] = []
   let buffer = ''
   for (let index = 0; index < raw.length; index += 1) {
     const char = raw[index]
@@ -116,10 +123,10 @@ export function splitSentences(text) {
  * needs to be conservative and stable. CJK is ~1 token per character, latin
  * ~1 token per 4 characters; this estimator deliberately over-counts CJK.
  *
- * @param {string} text - the text to estimate.
- * @returns {number} an upper-bound token estimate.
+ * @param text - the text to estimate.
+ * @returns an upper-bound token estimate.
  */
-export function estimateTokens(text) {
+export function estimateTokens(text: unknown): number {
   const value = String(text ?? '')
   let cjk = 0
   for (const char of value) {
@@ -139,13 +146,19 @@ export function estimateTokens(text) {
  * would inject the user's open question into a later session as if it were
  * settled fact.
  *
- * @param {string} sentence - a normalized sentence.
- * @returns {boolean} whether it looks interrogative.
+ * @param sentence - a normalized sentence.
+ * @returns whether it looks interrogative.
  */
-export function looksInterrogative(sentence) {
+export function looksInterrogative(sentence: string): boolean {
   const value = normalize(sentence)
   if (!value) return false
   if (/[?？]$/u.test(value)) return true
+  // Chinese questions frequently carry no question mark at all: "…只能用 js 写吗"
+  // ends in a particle, and "难道…" is rhetorical. This is not a nicety — the
+  // second live run memorized exactly such a sentence as a `constraint`, because
+  // the sentence began with a URL and ended in 吗.
+  if (/[吗嗎呢]$/u.test(value)) return true
+  if (/难道|岂不|是不是|要不要|有没有/u.test(value)) return true
   return /^(什么|怎么|如何|为什么|哪|谁|何时|多少|是否|能不能|可不可以|有没有|why|what|how|which|who|when|where|is |are |can |could |should |do |does |did )/iu.test(
     value,
   )
@@ -154,11 +167,11 @@ export function looksInterrogative(sentence) {
 /**
  * Truncate for ledger/log lines without breaking the surrounding JSON.
  *
- * @param {string} text - any text.
- * @param {number} max - maximum characters to keep.
- * @returns {string} a single-line excerpt.
+ * @param text - any text.
+ * @param max - maximum characters to keep.
+ * @returns a single-line excerpt.
  */
-export function excerpt(text, max = 160) {
+export function excerpt(text: unknown, max: number = 160): string {
   const value = normalize(text)
   return value.length <= max ? value : `${value.slice(0, max)}…`
 }

@@ -2,6 +2,9 @@ node_modules/
 *.log
 .DS_Store
 
+# pnpm's content-addressable store, created inside the project by `pnpm add`
+.pnpm-store/
+
 # local scratch: dev profiles, extracted transcripts, measurement output
 .scratch/
 .dshdev/

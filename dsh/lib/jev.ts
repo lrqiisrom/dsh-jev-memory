@@ -22,13 +22,40 @@
  *  - the responding model id is returned so the ledger records which version
  *    actually judged, making alias drift visible instead of silent.
  *
+ * Types: the request/answer vocabulary is declared here because it is this
+ * module's own wire contract, and the whole plugin is zero-dependency — the
+ * harness type for `fetch` is the platform's, not an installed package. The
+ * parsed response body is `unknown` and is read through `asRecord`, so no
+ * field of a model answer is trusted just because it typechecks.
+ *
  * @module dsh/lib/jev
  */
 
-import { clamp01 } from './store.js'
+import { clamp01 } from './store.ts'
+
+/** Host logger signature, repeated per module so no module imports another for it. */
+export type LogSink = (level: string, message: string, detail?: unknown) => void
+
+/** Transport and vocabulary settings; every one is overridable from plugin config. */
+export interface JevSettings {
+  baseUrl: string
+  path: string
+  apiKeyEnv: string
+  baseUrlEnv: string
+  /** Literal bearer token; takes precedence over the environment variable. */
+  apiKey?: string
+  model: string
+  timeoutMs: number
+  maxRetries: number
+  retryStatuses: number[]
+  conflictThreshold: number
+  importanceLevels: string[]
+  maxCandidates: number
+  maxKnown: number
+}
 
 /** Transport and vocabulary defaults; every one is overridable from plugin config. */
-export const JEV_DEFAULTS = {
+export const JEV_DEFAULTS: Omit<JevSettings, 'apiKey'> = {
   baseUrl: 'https://api.typesafe.ai',
   path: '/v1/systemone',
   apiKeyEnv: 'TYPESAFE_API_KEY',
@@ -50,7 +77,7 @@ export const JEV_DEFAULTS = {
 }
 
 /** Type definitions handed to the Choice question as its criteria. */
-export const TYPE_CRITERIA = {
+export const TYPE_CRITERIA: Record<string, string> = {
   constraint: '硬约束：以后也必须遵守的规则、约定、禁止事项',
   pitfall: '踩过的坑：曾导致失败、报错、返工的具体教训',
   decision: '已定的决策及其原因：选型、方案取舍',
@@ -61,17 +88,108 @@ export const TYPE_CRITERIA = {
 }
 
 /**
+ * One candidate as the model port sees it.
+ *
+ * `text` is optional only so the judgement layer's unit tests can build a
+ * candidate without it: the heuristic judge never reads it, and the Jev request
+ * body embeds it when a model actually judges.
+ */
+export interface JevCandidate {
+  key: string
+  text?: string
+  hintedType: string | null
+  signalScore: number
+  signals: string[]
+}
+
+/** Judge input, as the judgement layer hands it to the client. */
+export interface JevDecideRequest {
+  candidates: JevCandidate[]
+  /** enabled types (the Choice labels). */
+  types: string[]
+  /** known memory texts, for the conflict question. */
+  known?: string[]
+  /** per-call budget. */
+  timeoutMs?: number
+  /** the turn's abort signal. */
+  signal?: AbortSignal
+}
+
+/** One answer row, before the judgement layer maps it onto a candidate. */
+export interface JevRow {
+  key: string
+  type: string | null
+  importance: number | null
+  conflict: string
+  confidence: number | null
+  note?: string | null
+}
+
+/** What the model port answers: one row per answered candidate, plus the model id. */
+export interface JevDecideResult {
+  rows: JevRow[]
+  model: string | null
+}
+
+/** One typed question in the request body. */
+export interface JevQuestion {
+  type: string
+  instructions: string
+  criteria: unknown
+}
+
+/** The JSON request body sent to the endpoint. */
+export interface JevRequestBody {
+  state: { known_memories: string[] }
+  model: string
+  questions: Record<string, JevQuestion>
+}
+
+/** The live client `createJevClient` returns. */
+export interface JevClient {
+  available: boolean
+  endpoint: string
+  decide(request: JevDecideRequest): Promise<JevDecideResult>
+}
+
+/** Wiring for {@link createJevClient}. */
+export interface JevClientOptions {
+  /** the `jev` config block. */
+  config?: Partial<JevSettings>
+  /** host logger. */
+  log?: LogSink
+  /** fetch implementation, injectable for tests. */
+  fetchImpl?: typeof fetch
+  /** environment used for key and base-URL lookups. */
+  env?: NodeJS.ProcessEnv
+}
+
+/**
+ * Read a value as a property bag, or `null` when it cannot be one.
+ *
+ * Local to this module on purpose: the parsed response body is untrusted data,
+ * and this is the one narrowing primitive used to read it without `any`.
+ *
+ * @param value - any value.
+ * @returns the value as a record, or null.
+ */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : null
+}
+
+/**
  * Create the Jev client.
  *
- * @param {object} options - wiring.
- * @param {object} options.config - the `jev` config block.
- * @param {(level: string, message: string, detail?: unknown) => void} [options.log] - host logger.
- * @param {typeof fetch} [options.fetchImpl] - fetch implementation, injectable for tests.
- * @param {NodeJS.ProcessEnv} [options.env] - environment used for key and base-URL lookups.
- * @returns {{available: boolean, endpoint: string, decide: (request: object) => Promise<{rows: any[], model: string|null}>}} the client.
+ * @param options - wiring.
+ * @returns the client.
  */
-export function createJevClient({ config = {}, log = () => {}, fetchImpl = globalThis.fetch, env = process.env } = {}) {
-  const settings = { ...JEV_DEFAULTS, ...config }
+export function createJevClient({
+  config = {},
+  log = () => {},
+  fetchImpl = globalThis.fetch,
+  env = process.env,
+}: JevClientOptions = {}): JevClient {
+  const settings: JevSettings = { ...JEV_DEFAULTS, ...config }
   const apiKey = settings.apiKey || env?.[settings.apiKeyEnv] || ''
   const baseUrl = config.baseUrl || env?.[settings.baseUrlEnv] || settings.baseUrl
   const endpoint = new URL(settings.path, baseUrl).href
@@ -83,15 +201,10 @@ export function createJevClient({ config = {}, log = () => {}, fetchImpl = globa
     /**
      * Label and score candidates in one request.
      *
-     * @param {object} request - judge input.
-     * @param {Array<{key: string, text: string, hintedType: string|null}>} request.candidates - candidates.
-     * @param {string[]} request.types - enabled types (the Choice labels).
-     * @param {string[]} [request.known] - known memory texts, for the conflict question.
-     * @param {number} [request.timeoutMs] - per-call budget.
-     * @param {AbortSignal} [request.signal] - the turn's abort signal.
-     * @returns {Promise<{rows: any[], model: string|null}>} judgement rows plus the responding model id.
+     * @param request - judge input.
+     * @returns judgement rows plus the responding model id.
      */
-    async decide(request) {
+    async decide(request: JevDecideRequest): Promise<JevDecideResult> {
       if (!available) throw new Error('jev is not configured')
       const candidates = (request.candidates ?? []).slice(0, settings.maxCandidates)
       if (candidates.length === 0) return { rows: [], model: null }
@@ -108,7 +221,7 @@ export function createJevClient({ config = {}, log = () => {}, fetchImpl = globa
         url: endpoint,
         apiKey,
         body,
-        timeoutMs: Number.isFinite(request.timeoutMs) ? request.timeoutMs : settings.timeoutMs,
+        timeoutMs: typeof request.timeoutMs === 'number' && Number.isFinite(request.timeoutMs) ? request.timeoutMs : settings.timeoutMs,
         maxRetries: settings.maxRetries,
         retryStatuses: settings.retryStatuses,
         fetchImpl,
@@ -116,12 +229,13 @@ export function createJevClient({ config = {}, log = () => {}, fetchImpl = globa
         log,
       })
 
+      const json = asRecord(response.json)
       return {
         rows: parseDecisions(response.json, candidates, {
           conflictThreshold: settings.conflictThreshold,
           importanceLevels: settings.importanceLevels.length,
         }),
-        model: typeof response.json?.model === 'string' ? response.json.model : null,
+        model: typeof json?.model === 'string' ? json.model : null,
       }
     },
   }
@@ -136,18 +250,28 @@ export function createJevClient({ config = {}, log = () => {}, fetchImpl = globa
  * needs and nothing else — the official guidance is that irrelevant state
  * degrades accuracy.
  *
- * @param {object} input - request content.
- * @param {string} input.model - model id or alias.
- * @param {Array<{text: string}>} input.candidates - candidates, index-addressed.
- * @param {string[]} input.types - enabled type labels.
- * @param {string[]} input.known - known memory texts.
- * @param {string[]} input.importanceLevels - ordered score legend.
- * @returns {object} the JSON request body.
+ * @param input - request content.
+ * @returns the JSON request body.
  */
-export function buildRequestBody({ model, candidates, types, known, importanceLevels }) {
-  /** @type {Record<string, object>} */
-  const questions = {}
-  const choiceCriteria = {}
+export function buildRequestBody({
+  model,
+  candidates,
+  types,
+  known,
+  importanceLevels,
+}: {
+  model: string
+  /** candidates, index-addressed. */
+  candidates: JevCandidate[]
+  /** enabled type labels. */
+  types: string[]
+  /** known memory texts. */
+  known: string[]
+  /** ordered score legend. */
+  importanceLevels: string[]
+}): JevRequestBody {
+  const questions: Record<string, JevQuestion> = {}
+  const choiceCriteria: Record<string, string> = {}
   for (const type of types) choiceCriteria[type] = TYPE_CRITERIA[type] ?? type
   choiceCriteria['none-of-the-above'] = '以上都不合适，或这条信息本身不值得记住'
 
@@ -192,32 +316,48 @@ export function buildRequestBody({ model, candidates, types, known, importanceLe
  * throws on a missing field, because a partially answered response is still
  * useful and failing the whole turn's write would be worse.
  *
- * @param {any} response - parsed response body.
- * @param {Array<{key: string, hintedType: string|null}>} candidates - the candidates that were sent.
- * @param {{conflictThreshold: number, importanceLevels: number}} options - mapping constants.
- * @returns {Array<object>} one row per answered candidate.
+ * @param response - parsed response body.
+ * @param candidates - the candidates that were sent.
+ * @param options - mapping constants.
+ * @returns one row per answered candidate.
  */
-export function parseDecisions(response, candidates, options) {
-  const answers = response?.answers && typeof response.answers === 'object' ? response.answers : {}
-  const rows = []
+export function parseDecisions(
+  response: unknown,
+  candidates: JevCandidate[],
+  options: { conflictThreshold: number; importanceLevels: number },
+): JevRow[] {
+  const answers = asRecord(asRecord(response)?.answers) ?? {}
+  const rows: JevRow[] = []
   for (let index = 0; index < candidates.length; index += 1) {
     const candidate = candidates[index]
-    const remember = answers[rememberId(index)]
-    const choice = answers[typeId(index)]
-    const score = answers[importanceId(index)]
-    const conflict = answers[conflictId(index)]
-    if (!remember && !choice && !score) continue
+    const rememberAnswer = answers[rememberId(index)]
+    const choiceAnswer = answers[typeId(index)]
+    const scoreAnswer = answers[importanceId(index)]
+    const conflictAnswer = answers[conflictId(index)]
+    if (!rememberAnswer && !choiceAnswer && !scoreAnswer) continue
 
-    const label = typeof choice?.choice === 'string' ? choice.choice : null
+    const remember = asRecord(rememberAnswer)
+    const choice = asRecord(choiceAnswer)
+    const score = asRecord(scoreAnswer)
+    const conflict = asRecord(conflictAnswer)
+
+    const choiceValue = choice?.choice
+    const label = typeof choiceValue === 'string' ? choiceValue : null
     const scoreValue = typeof score?.score === 'number' ? score.score : null
-    const importance = scoreValue === null ? (typeof remember?.noul === 'number' ? clamp01(remember.noul) : null) : scoreToUnit(scoreValue, options.importanceLevels)
+    const rememberNoul = remember?.noul
+    const importance =
+      scoreValue === null ? (typeof rememberNoul === 'number' ? clamp01(rememberNoul) : null) : scoreToUnit(scoreValue, options.importanceLevels)
+    const conflictNoul = conflict?.noul
+    const choiceConfidence = choice?.confidence
+    const scoreConfidence = score?.confidence
 
     rows.push({
       key: candidate.key,
       type: label && label !== 'none-of-the-above' ? label : candidate.hintedType,
       importance,
-      conflict: (typeof conflict?.noul === 'number' ? conflict.noul : 0) >= options.conflictThreshold ? 'yes' : 'no',
-      confidence: typeof choice?.confidence === 'number' ? clamp01(choice.confidence) : typeof score?.confidence === 'number' ? clamp01(score.confidence) : null,
+      conflict: (typeof conflictNoul === 'number' ? conflictNoul : 0) >= options.conflictThreshold ? 'yes' : 'no',
+      confidence:
+        typeof choiceConfidence === 'number' ? clamp01(choiceConfidence) : typeof scoreConfidence === 'number' ? clamp01(scoreConfidence) : null,
       note: null,
     })
   }
@@ -231,13 +371,20 @@ export function parseDecisions(response, candidates, options) {
  * is a linear map over `levels - 1` rather than a lookup — and it is arithmetic
  * the plugin performs, never a number the model is asked to interpolate.
  *
- * @param {number} score - the expected score.
- * @param {number} levels - the number of legend entries.
- * @returns {number} importance in 0..1.
+ * @param score - the expected score.
+ * @param levels - the number of legend entries.
+ * @returns importance in 0..1.
  */
-export function scoreToUnit(score, levels) {
+export function scoreToUnit(score: number, levels: number): number {
   const span = Math.max(1, levels - 1)
   return clamp01(score / span)
+}
+
+/** The parsed HTTP response, before it is interpreted. */
+export interface JevHttpResult {
+  json: unknown
+  requestId: string | null
+  attempts: number
 }
 
 /**
@@ -248,22 +395,42 @@ export function scoreToUnit(score, levels) {
  * close. Retries therefore share the caller's budget instead of extending it,
  * which is the opposite of the SDK default (10s per attempt, no total budget).
  *
- * @param {object} request - transport input.
- * @param {string} request.url - absolute endpoint.
- * @param {string} request.apiKey - bearer token.
- * @param {unknown} request.body - JSON-serializable request body.
- * @param {number} request.timeoutMs - total budget in milliseconds.
- * @param {number} request.maxRetries - retries after the first attempt.
- * @param {number[]} request.retryStatuses - statuses worth retrying.
- * @param {typeof fetch} request.fetchImpl - fetch implementation.
- * @param {AbortSignal} [request.signal] - outer abort signal.
- * @param {(level: string, message: string, detail?: unknown) => void} request.log - host logger.
- * @returns {Promise<{json: any, requestId: string|null, attempts: number}>} the parsed response.
+ * @param request - transport input.
+ * @returns the parsed response.
  */
-export async function postWithRetry({ url, apiKey, body, timeoutMs, maxRetries, retryStatuses, fetchImpl, signal, log }) {
+export async function postWithRetry({
+  url,
+  apiKey,
+  body,
+  timeoutMs,
+  maxRetries,
+  retryStatuses,
+  fetchImpl,
+  signal,
+  log,
+}: {
+  /** absolute endpoint. */
+  url: string
+  /** bearer token. */
+  apiKey: string
+  /** JSON-serializable request body. */
+  body: unknown
+  /** total budget in milliseconds. */
+  timeoutMs: number
+  /** retries after the first attempt. */
+  maxRetries: number
+  /** statuses worth retrying. */
+  retryStatuses: number[]
+  /** fetch implementation. */
+  fetchImpl: typeof fetch
+  /** outer abort signal. */
+  signal?: AbortSignal
+  /** host logger. */
+  log: LogSink
+}): Promise<JevHttpResult> {
   const deadline = Date.now() + timeoutMs
   let attempt = 0
-  let lastError
+  let lastError: unknown
 
   while (attempt <= maxRetries) {
     attempt += 1
@@ -303,18 +470,18 @@ export async function postWithRetry({ url, apiKey, body, timeoutMs, maxRetries, 
 }
 
 /**
- * @param {number} ms - milliseconds to wait.
- * @returns {Promise<void>} resolves after the delay.
+ * @param ms - milliseconds to wait.
+ * @returns resolves after the delay.
  */
-function sleep(ms) {
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)))
 }
 
-/** @param {number} index - candidate index. @returns {string} question key. */
-export const rememberId = (index) => `remember:${index}`
-/** @param {number} index - candidate index. @returns {string} question key. */
-export const typeId = (index) => `type:${index}`
-/** @param {number} index - candidate index. @returns {string} question key. */
-export const importanceId = (index) => `importance:${index}`
-/** @param {number} index - candidate index. @returns {string} question key. */
-export const conflictId = (index) => `conflict:${index}`
+/** @param index - candidate index. @returns question key. */
+export const rememberId = (index: number): string => `remember:${index}`
+/** @param index - candidate index. @returns question key. */
+export const typeId = (index: number): string => `type:${index}`
+/** @param index - candidate index. @returns question key. */
+export const importanceId = (index: number): string => `importance:${index}`
+/** @param index - candidate index. @returns question key. */
+export const conflictId = (index: number): string => `conflict:${index}`

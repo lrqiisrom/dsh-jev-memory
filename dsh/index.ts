@@ -22,19 +22,237 @@
  * nothing that overlaps what `dsh-jev-tools` already covers (tool-output
  * trimming, injection screening, skill recommendation, delivery gates).
  *
+ * Types, and why `ctx` is a local structural interface instead of an imported
+ * one: this package declares no `dependencies` at all, so `@deepseek-ai/*` is
+ * not installed and must not be imported — a workspace copy has to mount with
+ * `--patch` and no install step, which is the same reason the plugin does not
+ * use `ctx.storageDomain` (see lib/store.ts). Importing the harness's own
+ * `Context` type would also make this file fail to resolve outside a full DSH
+ * checkout. The interfaces below therefore name only the surface this plugin
+ * actually touches — `logger`, `on`, `inject`, `tools.register`, `effect`, and
+ * the session accessors on an assembly context — and they double as the contract
+ * the plugin's own fake-context test mounts against. Everything that crosses the
+ * boundary as untyped data (the composition row's `config`, a tool's arguments,
+ * a session's event payloads) is `unknown` and is narrowed at its use site.
+ *
  * @module dsh-jev-memory
  */
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-import { extractCandidates, EXTRACT_DEFAULTS } from './lib/extract.js'
-import { applyGate, createJudge, JUDGE_MODES } from './lib/judge.js'
-import { createJevClient, JEV_DEFAULTS } from './lib/jev.js'
-import { DEFAULT_QUOTA, inScope, renderRecall, searchMemories, selectMemories } from './lib/recall.js'
-import { signatureOf } from './lib/signals.js'
-import { createMemoryStore, MEMORY_TYPES } from './lib/store.js'
-import { estimateTokens, excerpt } from './lib/text.js'
+import { extractCandidates, EXTRACT_DEFAULTS } from './lib/extract.ts'
+import { applyGate, createJudge, JUDGE_MODES } from './lib/judge.ts'
+import { createJevClient, JEV_DEFAULTS } from './lib/jev.ts'
+import { DEFAULT_QUOTA, inScope, renderRecall, searchMemories, selectMemories } from './lib/recall.ts'
+import { signatureOf } from './lib/signals.ts'
+import { createMemoryStore, MEMORY_TYPES } from './lib/store.ts'
+import { estimateTokens, excerpt } from './lib/text.ts'
+import type { Candidate, ExtractOptions, TurnEvent } from './lib/extract.ts'
+import type { Judge } from './lib/judge.ts'
+import type { JevSettings } from './lib/jev.ts'
+
+// ---------------------------------------------------------------------------
+// The host surface this plugin uses, described structurally.
+// ---------------------------------------------------------------------------
+
+/** A host logger: one method per level; only `info`/`warn` are used here. */
+export interface Logger {
+  info?(message: string, detail?: unknown): void
+  warn?(message: string, detail?: unknown): void
+  error?(message: string, detail?: unknown): void
+  [level: string]: ((message: string, detail?: unknown) => void) | undefined
+}
+
+/** The logger-shaped callback every lib module accepts. */
+export type LogSink = (level: string, message: string, detail?: unknown) => void
+
+/** The session header fields this plugin reads. */
+export interface SessionHeader {
+  id?: string
+  cwd?: string | null
+  delegationDepth?: number
+  [key: string]: unknown
+}
+
+/** A live session, as far as this plugin touches it. */
+export interface SessionLike {
+  seq?: number
+  header?: SessionHeader | null
+  eventAt?: (seq: number) => TurnEvent | null | undefined
+}
+
+/** The agent handle carried by assembly contexts and turn-stopping payloads. */
+export interface AgentLike {
+  id?: string
+  session?: SessionLike | null
+}
+
+/** The payload of `agent/turn-stopping`. */
+export interface TurnStoppingPayload {
+  agent?: AgentLike | null
+  turn?: number
+  signal?: AbortSignal
+}
+
+/** What the prompt assembler passes to a context callback (synchronously). */
+export interface AssembleContext {
+  agent?: AgentLike | null
+}
+
+/** A `systemPrompt.context` definition. */
+export interface PromptContextDefinition {
+  name: string
+  order: number
+  text: (context: AssembleContext) => string
+}
+
+/** The `systemPrompt` service, reduced to the one method used here. */
+export interface SystemPromptService {
+  context(definition: PromptContextDefinition): unknown
+}
+
+/** What `inject(['systemPrompt'], cb)` hands its callback. */
+export interface InjectedScope {
+  systemPrompt: SystemPromptService
+}
+
+/** What a tool's `execute` receives about its caller. */
+export interface ToolExecContext {
+  agent?: AgentLike | null
+}
+
+/** A tool definition, as `tools.register` receives it. */
+export interface ToolDefinition<TArgs = unknown, TResult = unknown> {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+  output: {
+    schema: Record<string, unknown>
+    render: (args: unknown, value: TResult) => Array<{ type: string; text: string }>
+  }
+  timeoutMs: number
+  isConcurrencySafe: () => boolean
+  execute: (args: TArgs, exec?: ToolExecContext) => Promise<TResult>
+}
+
+/** The tool registry service, reduced to `register`. */
+export interface ToolRegistry {
+  register<TArgs, TResult>(definition: ToolDefinition<TArgs, TResult>): unknown
+}
+
+/** The Cordis plugin context, reduced to the members this plugin calls. */
+export interface PluginContext {
+  logger?: Logger
+  inject(names: string[], callback: (scope: InjectedScope) => void): unknown
+  on(event: string, handler: (payload: TurnStoppingPayload) => unknown): unknown
+  tools: ToolRegistry
+  effect(factory: () => () => void): unknown
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+/** Recall (injection) settings. */
+export interface RecallConfig {
+  enabled: boolean
+  skipSubagents: boolean
+  quota: Record<string, number>
+  maxTokens: number
+}
+
+/** The fully resolved plugin config: every field present and validated. */
+export interface PluginConfig {
+  enabled: boolean
+  root: string
+  types: string[]
+  judge: string
+  minImportance: number
+  reviewOnConflict: boolean
+  writeEnabled: boolean
+  writeSkipSubagents: boolean
+  writeTimeoutMs: number
+  judgeTimeoutMs: number
+  knownForConflict: number
+  extract: Partial<ExtractOptions>
+  recall: RecallConfig
+  contextOrder: number
+  tools: boolean
+  jev: Partial<JevSettings>
+}
+
+/** One match in a `memory_search` result. */
+export interface MemorySearchMatch {
+  id: string
+  type: string
+  text: string
+  importance: number
+  createdAt: number
+  status: string
+}
+
+/** The `memory_search` result. */
+export interface MemorySearchResult {
+  query: string
+  matches: MemorySearchMatch[]
+  total: number
+}
+
+/** The `memory_write` result. */
+export interface MemoryWriteResult {
+  id: string
+  stored: boolean
+  replaced: boolean
+}
+
+/** The `memory_forget` result. */
+export interface MemoryForgetResult {
+  removed: string[]
+  count: number
+}
+
+/** Arguments of `memory_search`, as the harness validates them. */
+export interface SearchArgs {
+  query?: string
+  type?: string
+  limit?: number
+}
+
+/** Arguments of `memory_write`, as the harness validates them. */
+export interface WriteArgs {
+  text?: string
+  type?: string
+  importance?: number
+}
+
+/** Arguments of `memory_forget`, as the harness validates them. */
+export interface ForgetArgs {
+  id?: string
+  query?: string
+}
+
+/** What the turn-end hook reports back to the ledger/log line. */
+interface TurnWriteOutcome {
+  written: number
+  candidates: number
+  duplicates?: number
+  model?: string | null
+  degraded?: string | null
+}
+
+/**
+ * Read a value as a property bag, or `null` when it cannot be one.
+ *
+ * Local to this module on purpose: it is the one narrowing primitive used to
+ * read untyped user input (a composition row's `config`) without `any`.
+ *
+ * @param value - any value.
+ * @returns the value as a record, or null.
+ */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : null
+}
 
 /** Plugin id; must match the `id` used by the composition row. */
 export const name = 'jev-memory'
@@ -46,13 +264,13 @@ export const name = 'jev-memory'
  * process using the code I just edited?" is answerable from the ledger alone —
  * a hot-reloaded module and a cached one otherwise look identical.
  */
-export const version = '0.2.0'
+export const version = '0.3.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
 
 /** Plugin defaults; every field is overridable from the composition row's `config`. */
-export const DEFAULT_CONFIG = {
+export const DEFAULT_CONFIG: PluginConfig = {
   /** Master switch. */
   enabled: true,
   /** Store directory; empty means `$DSH_HOME/jev-memory`. */
@@ -111,18 +329,35 @@ export const DEFAULT_CONFIG = {
  * the caller rather than throwing, because a bad memory config must not stop the
  * harness from booting.
  *
- * @param {unknown} raw - the composition row's `config` value.
- * @returns {{config: typeof DEFAULT_CONFIG, problems: string[]}} resolved config and validation complaints.
+ * The composition row's value is untyped user input, so this is the one place
+ * where a narrowing assertion is unavoidable; everything the plugin later
+ * depends on is either validated here (types, judge mode, the numeric budgets)
+ * or read defensively at its use site.
+ *
+ * @param raw - the composition row's `config` value.
+ * @returns resolved config and validation complaints.
  */
-export function resolveConfig(raw) {
-  const source = raw && typeof raw === 'object' ? raw : {}
-  const problems = []
-  const config = { ...DEFAULT_CONFIG, ...source, recall: { ...DEFAULT_CONFIG.recall, ...(source.recall ?? {}) }, jev: { ...source.jev } }
+export function resolveConfig(raw: unknown): { config: PluginConfig; problems: string[] } {
+  const source: Record<string, unknown> = asRecord(raw) ?? {}
+  const recallSource = asRecord(source.recall)
+  const problems: string[] = []
+  // Every spread below is asserted rather than narrowed, because the original
+  // contract is "whatever the row says wins" and object spread is deliberately
+  // literal about it (a string block spreads into its character indices, an
+  // absent one into nothing). Narrowing first would quietly change what a
+  // malformed row resolves to.
+  const config: PluginConfig = {
+    ...DEFAULT_CONFIG,
+    ...(source as Partial<PluginConfig>),
+    recall: { ...DEFAULT_CONFIG.recall, ...((source.recall ?? {}) as Partial<RecallConfig>) },
+    jev: { ...((source.jev ?? {}) as Partial<JevSettings>) },
+  }
 
   if (!Array.isArray(source.types)) config.types = [...DEFAULT_CONFIG.types]
   else {
-    const requested = source.types.filter((type) => MEMORY_TYPES.includes(type))
-    if (requested.length !== source.types.length) problems.push('types: unknown type names were dropped')
+    const declared: unknown[] = source.types
+    const requested = declared.filter((type): type is string => typeof type === 'string' && MEMORY_TYPES.includes(type))
+    if (requested.length !== declared.length) problems.push('types: unknown type names were dropped')
     config.types = requested.length > 0 ? requested : [...DEFAULT_CONFIG.types]
   }
 
@@ -130,15 +365,15 @@ export function resolveConfig(raw) {
     problems.push(`judge: unknown mode "${config.judge}"; using auto`)
     config.judge = 'auto'
   }
-  for (const field of ['minImportance', 'writeTimeoutMs', 'judgeTimeoutMs', 'knownForConflict', 'contextOrder']) {
+  for (const field of ['minImportance', 'writeTimeoutMs', 'judgeTimeoutMs', 'knownForConflict', 'contextOrder'] as const) {
     if (!Number.isFinite(config[field])) {
       problems.push(`${field}: not a finite number; using the default`)
       config[field] = DEFAULT_CONFIG[field]
     }
   }
   config.minImportance = Math.min(1, Math.max(0, config.minImportance))
-  config.extract = { ...EXTRACT_DEFAULTS, ...(source.extract ?? {}) }
-  config.recall.quota = { ...DEFAULT_QUOTA, ...(source.recall?.quota ?? {}) }
+  config.extract = { ...EXTRACT_DEFAULTS, ...((source.extract ?? {}) as Partial<ExtractOptions>) }
+  config.recall.quota = { ...DEFAULT_QUOTA, ...((recallSource?.quota ?? {}) as Record<string, number>) }
   return { config, problems }
 }
 
@@ -150,11 +385,11 @@ export function resolveConfig(raw) {
  * importing it would make this plugin non-zero-dependency, and the resolution
  * rule is three lines. Kept in one place so the tradeoff stays visible.
  *
- * @param {string} configured - the configured root, possibly empty.
- * @param {NodeJS.ProcessEnv} [env] - environment to read.
- * @returns {string} an absolute store root.
+ * @param configured - the configured root, possibly empty.
+ * @param env - environment to read.
+ * @returns an absolute store root.
  */
-export function resolveStoreRoot(configured, env = process.env) {
+export function resolveStoreRoot(configured: string, env: NodeJS.ProcessEnv = process.env): string {
   // A blank value is unset, mirroring how the harness treats an empty DSH_HOME
   // (so a blank override can never resolve the store to the current directory).
   const explicit = typeof configured === 'string' ? configured.trim() : ''
@@ -166,16 +401,19 @@ export function resolveStoreRoot(configured, env = process.env) {
 /**
  * Mount the plugin.
  *
- * @param {any} ctx - the Cordis plugin context.
- * @param {unknown} rawConfig - the composition row's `config`.
- * @returns {void}
+ * @param ctx - the Cordis plugin context.
+ * @param rawConfig - the composition row's `config`.
+ * @returns nothing.
  */
-export function apply(ctx, rawConfig = {}) {
+export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   const { config, problems } = resolveConfig(rawConfig)
-  const log = (level, message, detail) => {
-    const sink = ctx.logger?.[level] ?? ctx.logger?.info
+  const log: LogSink = (level, message, detail) => {
+    const logger = ctx.logger
+    const sink = logger?.[level] ?? logger?.info
     try {
-      sink?.call(ctx.logger, detail === undefined ? `jev-memory: ${message}` : `jev-memory: ${message} ${JSON.stringify(detail)}`)
+      if (logger !== undefined && sink !== undefined) {
+        sink.call(logger, detail === undefined ? `jev-memory: ${message}` : `jev-memory: ${message} ${JSON.stringify(detail)}`)
+      }
     } catch {
       /* logging must never be the reason a turn fails */
     }
@@ -189,7 +427,7 @@ export function apply(ctx, rawConfig = {}) {
 
   const store = createMemoryStore({ root: resolveStoreRoot(config.root), log })
   const jev = createJevClient({ config: config.jev, log })
-  const judge = createJudge({ config: { ...config, judgeTimeoutMs: config.judgeTimeoutMs }, jev, log })
+  const judge: Judge = createJudge({ config: { ...config, judgeTimeoutMs: config.judgeTimeoutMs }, jev, log })
   let ready = false
 
   void store
@@ -217,10 +455,10 @@ export function apply(ctx, rawConfig = {}) {
   // why the store keeps its whole index in memory: recall is a pure function of
   // that index plus the clock.
   // ---------------------------------------------------------------------------
-  /** @type {Map<string, string>} last injected id-set per session, to avoid ledger spam. */
-  const lastRecall = new Map()
+  /** last injected id-set per session, to avoid ledger spam. */
+  const lastRecall = new Map<string, string>()
 
-  const recallText = (assembleCtx) => {
+  const recallText = (assembleCtx: AssembleContext): string => {
     if (!ready || !config.recall.enabled) return ''
     try {
       const agent = assembleCtx?.agent
@@ -288,7 +526,7 @@ export function apply(ctx, rawConfig = {}) {
     }
 
     /** Read the turn's events, judge the candidates, and persist what passes the gate. */
-    async function handleTurn() {
+    async function handleTurn(): Promise<TurnWriteOutcome> {
       const session = agent?.session
       const events = collectTurnEvents(session)
       const candidates = extractCandidates(events, {
@@ -297,7 +535,7 @@ export function apply(ctx, rawConfig = {}) {
       })
       if (candidates.length === 0) return { written: 0, candidates: 0 }
 
-      const fresh = []
+      const fresh: Candidate[] = []
       for (const candidate of candidates) {
         if (store.has(candidate.key)) {
           void store.ledger({ kind: 'skip', reason: 'duplicate', id: candidate.key, quote: candidate.quote })
@@ -320,7 +558,7 @@ export function apply(ctx, rawConfig = {}) {
       for (const candidate of fresh) {
         const judgement = rows.find((row) => row.key === candidate.key)
         const gate = applyGate(judgement, config)
-        if (!gate.write) {
+        if (!gate.write || !judgement) {
           void store.ledger({ kind: 'skip', reason: gate.reason, id: candidate.key, quote: excerpt(candidate.quote, 120) })
           continue
         }
@@ -363,10 +601,10 @@ export function apply(ctx, rawConfig = {}) {
   // ---------------------------------------------------------------------------
   if (!config.tools) return
 
-  /** @returns {string|null} the calling agent's working directory. */
-  const cwdOf = (exec) => exec?.agent?.session?.header?.cwd ?? null
+  /** the calling agent's working directory. */
+  const cwdOf = (exec: ToolExecContext | undefined): string | null => exec?.agent?.session?.header?.cwd ?? null
 
-  ctx.tools.register({
+  ctx.tools.register<SearchArgs, MemorySearchResult>({
     name: 'memory_search',
     description:
       '在长期记忆里查找已经记住的硬约束、踩过的坑、已定决策。想确认“之前是不是定过什么约定”时用它，不要靠猜。只返回当前工作区范围内的记忆。',
@@ -406,12 +644,12 @@ export function apply(ctx, rawConfig = {}) {
         required: ['query', 'matches', 'total'],
         additionalProperties: false,
       },
-      render: (_args, value) => [{ type: 'text', text: renderSearchResult(value) }],
+      render: (_args: unknown, value: MemorySearchResult) => [{ type: 'text', text: renderSearchResult(value) }],
     },
     timeoutMs: 5000,
     isConcurrencySafe: () => true,
-    execute: async (args, exec) => {
-      const { query, type, limit } = /** @type {any} */ (args) ?? {}
+    execute: async (args: SearchArgs, exec?: ToolExecContext): Promise<MemorySearchResult> => {
+      const { query, type, limit } = args ?? {}
       const hits = searchMemories(store.all(), String(query ?? ''), { cwd: cwdOf(exec), limit: limit ?? 20 })
         .filter((hit) => (type ? hit.record.type === type : true))
         .map((hit) => ({
@@ -426,7 +664,7 @@ export function apply(ctx, rawConfig = {}) {
     },
   })
 
-  ctx.tools.register({
+  ctx.tools.register<WriteArgs, MemoryWriteResult>({
     name: 'memory_write',
     description:
       '把一条值得跨会话记住的信息写进长期记忆（硬约束、踩过的坑、已定决策）。只在用户明确要求记住、或当场确认了某条结论时使用；不要用它记录一次性任务细节。',
@@ -451,14 +689,14 @@ export function apply(ctx, rawConfig = {}) {
         required: ['id', 'stored', 'replaced'],
         additionalProperties: false,
       },
-      render: (_args, value) => [
+      render: (_args: unknown, value: MemoryWriteResult) => [
         { type: 'text', text: value?.stored ? `已写入长期记忆 (${value.id})${value.replaced ? '，覆盖了同内容的旧条目' : ''}` : '未写入' },
       ],
     },
     timeoutMs: 5000,
     isConcurrencySafe: () => false,
-    execute: async (args, exec) => {
-      const { text, type, importance } = /** @type {any} */ (args) ?? {}
+    execute: async (args: WriteArgs, exec?: ToolExecContext): Promise<MemoryWriteResult> => {
+      const { text, type, importance } = args ?? {}
       const normalized = String(text ?? '').trim()
       if (!normalized) return { id: '', stored: false, replaced: false }
       const id = signatureOf(normalized)
@@ -467,10 +705,10 @@ export function apply(ctx, rawConfig = {}) {
       const cwd = cwdOf(exec)
       await store.put({
         id,
-        type: MEMORY_TYPES.includes(type) ? type : 'fact',
+        type: type && MEMORY_TYPES.includes(type) ? type : 'fact',
         text: normalized.slice(0, 400),
         cwd,
-        importance: Number.isFinite(importance) ? Math.min(1, Math.max(0, importance)) : 0.8,
+        importance: typeof importance === 'number' && Number.isFinite(importance) ? Math.min(1, Math.max(0, importance)) : 0.8,
         status: 'active',
         source: { sessionId: exec?.agent?.id ?? null, seq: null, quote: normalized.slice(0, 200), at: now },
         createdAt: now,
@@ -484,7 +722,7 @@ export function apply(ctx, rawConfig = {}) {
     },
   })
 
-  ctx.tools.register({
+  ctx.tools.register<ForgetArgs, MemoryForgetResult>({
     name: 'memory_forget',
     description:
       '撤销长期记忆：按 id 删除一条，或按关键词删除一批。用于修正记错的条目，或用户明确说“别再记着这个”。',
@@ -506,17 +744,16 @@ export function apply(ctx, rawConfig = {}) {
         required: ['removed', 'count'],
         additionalProperties: false,
       },
-      render: (_args, value) =>
+      render: (_args: unknown, value: MemoryForgetResult) =>
         value?.count
           ? [{ type: 'text', text: `已撤销 ${value.count} 条记忆：\n${value.removed.map((id) => `- ${id}`).join('\n')}` }]
           : [{ type: 'text', text: '没有匹配到可撤销的记忆。' }],
     },
     timeoutMs: 5000,
     isConcurrencySafe: () => false,
-    execute: async (args) => {
-      const { id, query } = /** @type {any} */ (args) ?? {}
-      /** @type {string[]} */
-      let removed = []
+    execute: async (args: ForgetArgs): Promise<MemoryForgetResult> => {
+      const { id, query } = args ?? {}
+      let removed: string[] = []
       if (typeof id === 'string' && id) {
         removed = (await store.remove(id)) ? [id] : []
       } else if (typeof query === 'string' && query) {
@@ -532,10 +769,10 @@ export function apply(ctx, rawConfig = {}) {
 /**
  * Render a search result for the model.
  *
- * @param {any} value - the tool's structured result.
- * @returns {string} human/model-readable text.
+ * @param value - the tool's structured result.
+ * @returns human/model-readable text.
  */
-function renderSearchResult(value) {
+function renderSearchResult(value: MemorySearchResult): string {
   const matches = value?.matches ?? []
   if (matches.length === 0) return `长期记忆里没有匹配「${value?.query ?? ''}」的条目（共 ${value?.total ?? 0} 条记忆）。`
   const lines = matches.map((match) => `- [${match.type}] ${match.text} (${match.id}, ${new Date(match.createdAt).toISOString().slice(0, 10)})`)
@@ -549,13 +786,15 @@ function renderSearchResult(value) {
  * fold the harness itself uses — so the hook never needs the projection cache
  * or a second subscription keeping a buffer alive.
  *
- * @param {any} session - the live session.
- * @returns {Array<{seq: number, type: string, data: any}>} events, oldest first.
+ * @param session - the live session.
+ * @returns events, oldest first.
  */
-export function collectTurnEvents(session) {
-  if (!session || !Number.isFinite(session.seq)) return []
-  const events = []
-  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+export function collectTurnEvents(session: SessionLike | null | undefined): TurnEvent[] {
+  if (!session) return []
+  const lastSeq = session.seq
+  if (typeof lastSeq !== 'number' || !Number.isFinite(lastSeq)) return []
+  const events: TurnEvent[] = []
+  for (let seq = lastSeq - 1; seq >= 0; seq -= 1) {
     const event = session.eventAt?.(seq)
     if (!event) continue
     if (event.type === 'turn/start') break
@@ -571,12 +810,12 @@ export function collectTurnEvents(session) {
  * handling — but the hook stops waiting, which is what keeps a slow judge out
  * of the user's critical path.
  *
- * @param {Promise<any>} promise - the work to bound.
- * @param {number} ms - the budget.
- * @returns {Promise<any>} the work's result, or a rejection on timeout.
+ * @param promise - the work to bound.
+ * @param ms - the budget.
+ * @returns the work's result, or a rejection on timeout.
  */
-export function withDeadline(promise, ms) {
-  return new Promise((resolve, reject) => {
+export function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`memory write exceeded ${ms}ms`)), ms)
     promise.then(
       (value) => {

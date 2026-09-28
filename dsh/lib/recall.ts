@@ -6,38 +6,86 @@
  * that is important stays in even when a model would have dropped it, and a
  * memory that is not in the configured types never appears at all.
  *
+ * Types: this module never touches the disk and never sees a host object, so it
+ * describes a record by the few fields it reads (`RecallableRecord`) instead of
+ * importing `MemoryRecord`. That keeps the ranking functions usable — and
+ * testable — with hand-built records, and keeps the plugin zero-dependency.
+ *
  * @module dsh/lib/recall
  */
 
-import { estimateTokens } from './text.js'
+import { estimateTokens } from './text.ts'
 
 /** Default per-type quota; the sum is the effective injection ceiling. */
-export const DEFAULT_QUOTA = { constraint: 4, pitfall: 3, decision: 2 }
+export const DEFAULT_QUOTA: Record<string, number> = { constraint: 4, pitfall: 3, decision: 2 }
 
 /** Age is a tie-breaker, not a filter: a 300-day-old constraint still beats a fresh fact. */
 const HALF_LIFE_DAYS = 180
 
-/**
- * @typedef {object} RecalledMemory
- * @property {import('./store.js').MemoryRecord} record - the chosen record.
- * @property {number} score - deterministic ranking score.
- * @property {number} ageDays - age in days at recall time.
- */
+/** The fields selection, rendering and search read off a stored memory. */
+export interface RecallableRecord {
+  id: string
+  type: string
+  text: string
+  cwd: string | null
+  importance: number
+  status: string
+  createdAt: number
+}
+
+/** The one field the workspace-scope rule reads. */
+export interface ScopeRecord {
+  cwd?: string | null
+}
+
+/** One chosen memory: the record plus why it ranked where it did. */
+export interface RecalledMemory {
+  /** the chosen record. */
+  record: RecallableRecord
+  /** deterministic ranking score. */
+  score: number
+  /** age in days at recall time. */
+  ageDays: number
+}
+
+/** Selection inputs; `cwd` and `types` are required, the rest have defaults. */
+export interface RecallOptions {
+  /** the session's working directory. */
+  cwd: string | null
+  /** enabled types. */
+  types: string[]
+  /** per-type ceiling. */
+  quota?: Record<string, number>
+  /** total injection budget. */
+  maxTokens?: number
+  /** clock. */
+  now?: number
+  /** whether suspected conflicts may enter. */
+  includeNeedsReview?: boolean
+}
+
+/** Ranking options for the on-demand search tool. */
+export interface SearchOptions {
+  /** session working directory. */
+  cwd?: string | null
+  /** maximum results. */
+  limit?: number
+}
+
+/** One ranked search match. */
+export interface SearchHit {
+  record: RecallableRecord
+  score: number
+}
 
 /**
  * Choose the memories a session should see.
  *
- * @param {import('./store.js').MemoryRecord[]} records - every live record.
- * @param {object} options - selection inputs.
- * @param {string|null} options.cwd - the session's working directory.
- * @param {string[]} options.types - enabled types.
- * @param {Record<string, number>} [options.quota] - per-type ceiling.
- * @param {number} [options.maxTokens] - total injection budget.
- * @param {number} [options.now] - clock.
- * @param {boolean} [options.includeNeedsReview] - whether suspected conflicts may enter.
- * @returns {RecalledMemory[]} the chosen memories, highest score first.
+ * @param records - every live record.
+ * @param options - selection inputs.
+ * @returns the chosen memories, highest score first.
  */
-export function selectMemories(records, options) {
+export function selectMemories(records: RecallableRecord[], options: RecallOptions): RecalledMemory[] {
   const {
     cwd,
     types,
@@ -47,7 +95,7 @@ export function selectMemories(records, options) {
     includeNeedsReview = false,
   } = options
 
-  const eligible = []
+  const eligible: RecalledMemory[] = []
   for (const record of records) {
     if (!types.includes(record.type)) continue
     if (record.status !== 'active' && !(includeNeedsReview && record.status === 'needs-review')) continue
@@ -62,8 +110,8 @@ export function selectMemories(records, options) {
 
   eligible.sort((a, b) => b.score - a.score || b.record.createdAt - a.record.createdAt)
 
-  const perType = new Map()
-  const chosen = []
+  const perType = new Map<string, number>()
+  const chosen: RecalledMemory[] = []
   let tokens = 0
   for (const entry of eligible) {
     const used = perType.get(entry.record.type) ?? 0
@@ -88,12 +136,11 @@ export function selectMemories(records, options) {
  * it. The trailing note tells the model how to retract one, because a memory
  * the user cannot get rid of is worse than no memory.
  *
- * @param {RecalledMemory[]} chosen - selection output.
- * @param {object} [options] - rendering options.
- * @param {boolean} [options.includeHelp] - append the retraction hint.
- * @returns {string} the prompt context text, or ''.
+ * @param chosen - selection output.
+ * @param options - rendering options.
+ * @returns the prompt context text, or ''.
  */
-export function renderRecall(chosen, options = {}) {
+export function renderRecall(chosen: readonly RecalledMemory[] | null | undefined, options: { includeHelp?: boolean } = {}): string {
   if (!chosen || chosen.length === 0) return ''
   const lines = chosen.map((entry) => renderLine(entry))
   const header = '## 长期记忆（自动积累，按会话工作区召回）'
@@ -104,10 +151,10 @@ export function renderRecall(chosen, options = {}) {
 /**
  * One injected line: `- [type] text (id, date)`.
  *
- * @param {RecalledMemory} entry - one selection entry.
- * @returns {string} the rendered line.
+ * @param entry - one selection entry.
+ * @returns the rendered line.
  */
-export function renderLine(entry) {
+export function renderLine(entry: RecalledMemory): string {
   const date = new Date(entry.record.createdAt).toISOString().slice(0, 10)
   return `- [${entry.record.type}] ${entry.record.text} (${entry.record.id}, ${date})`
 }
@@ -118,11 +165,11 @@ export function renderLine(entry) {
  * would inject one project's conventions into another project's session, so it
  * is excluded by default rather than merged.
  *
- * @param {import('./store.js').MemoryRecord} record - the record.
- * @param {string|null} cwd - the session's working directory.
- * @returns {boolean} whether the record is in scope.
+ * @param record - the record.
+ * @param cwd - the session's working directory.
+ * @returns whether the record is in scope.
  */
-export function inScope(record, cwd) {
+export function inScope(record: ScopeRecord, cwd: string | null): boolean {
   if (record.cwd === null || record.cwd === undefined) return true
   if (!cwd) return false
   return record.cwd === cwd
@@ -134,18 +181,16 @@ export function inScope(record, cwd) {
  * be — the tool exists so a model can check its own long-term memory on demand,
  * and the store is small enough that exact matching is honest and fast.
  *
- * @param {import('./store.js').MemoryRecord[]} records - candidate records.
- * @param {string} query - the search text.
- * @param {object} [options] - search options.
- * @param {string|null} [options.cwd] - session working directory.
- * @param {number} [options.limit] - maximum results.
- * @returns {Array<{record: import('./store.js').MemoryRecord, score: number}>} ranked matches.
+ * @param records - candidate records.
+ * @param query - the search text.
+ * @param options - search options.
+ * @returns ranked matches.
  */
-export function searchMemories(records, query, options = {}) {
+export function searchMemories(records: RecallableRecord[], query: string, options: SearchOptions = {}): SearchHit[] {
   const { cwd = null, limit = 20 } = options
   const needle = String(query ?? '').trim().toLowerCase()
   const tokens = needle.split(/[\s,，。、;；]+/u).filter((token) => token.length >= 2)
-  const matches = []
+  const matches: SearchHit[] = []
   for (const record of records) {
     if (!inScope(record, cwd)) continue
     const haystack = `${record.text} ${record.type}`.toLowerCase()

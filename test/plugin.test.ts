@@ -4,7 +4,31 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { apply, collectTurnEvents, resolveConfig, resolveStoreRoot, withDeadline } from '../dsh/index.js'
+import { apply, collectTurnEvents, resolveConfig, resolveStoreRoot, withDeadline } from '../dsh/index.ts'
+import type {
+  ForgetArgs,
+  MemoryForgetResult,
+  MemorySearchResult,
+  MemoryWriteResult,
+  PluginContext,
+  PromptContextDefinition,
+  SearchArgs,
+  SessionLike,
+  ToolDefinition,
+  TurnStoppingPayload,
+  WriteArgs,
+} from '../dsh/index.ts'
+import type { TurnEvent } from '../dsh/lib/extract.ts'
+
+/** What the fake context recorded, so a test can drive the plugin's hooks by hand. */
+interface Captured {
+  contexts: PromptContextDefinition[]
+  listeners: Map<string, (payload: TurnStoppingPayload) => unknown>
+  /** Registered definitions, kept as `unknown`: each test picks the one it drives. */
+  tools: Map<string, unknown>
+  disposers: Array<() => void>
+  injected?: string[]
+}
 
 /**
  * A minimal Cordis context: enough surface for the plugin to mount and for the
@@ -12,10 +36,9 @@ import { apply, collectTurnEvents, resolveConfig, resolveStoreRoot, withDeadline
  * is what keeps this test offline and deterministic — the harness itself is
  * exercised by the separate end-to-end run documented in README.md.
  */
-function fakeContext() {
-  /** @type {any} */
-  const captured = { contexts: [], listeners: new Map(), tools: new Map(), disposers: [] }
-  const ctx = {
+function fakeContext(): { ctx: PluginContext; captured: Captured } {
+  const captured: Captured = { contexts: [], listeners: new Map(), tools: new Map(), disposers: [] }
+  const ctx: PluginContext = {
     logger: { info: () => {}, warn: () => {} },
     inject: (names, callback) => {
       captured.injected = names
@@ -33,7 +56,7 @@ function fakeContext() {
       return () => {}
     },
     tools: {
-      register: (definition) => {
+      register: <TArgs, TResult>(definition: ToolDefinition<TArgs, TResult>) => {
         captured.tools.set(definition.name, definition)
         return () => {}
       },
@@ -46,8 +69,22 @@ function fakeContext() {
   return { ctx, captured }
 }
 
+/** The handler the plugin registered for one event. */
+function listenerFor(captured: Captured, event: string): (payload: TurnStoppingPayload) => unknown {
+  const handler = captured.listeners.get(event)
+  if (!handler) throw new Error(`no listener was registered for ${event}`)
+  return handler
+}
+
+/** The tool definition the plugin registered under one name, with its real contract. */
+function toolFor<TArgs, TResult>(captured: Captured, name: string): ToolDefinition<TArgs, TResult> {
+  const definition = captured.tools.get(name)
+  if (!definition) throw new Error(`tool ${name} was not registered`)
+  return definition as ToolDefinition<TArgs, TResult>
+}
+
 /** A session whose log holds exactly the events given, indexed by seq. */
-function fakeSession({ id = 's1', cwd = '/work/a', events }) {
+function fakeSession({ id = 's1', cwd = '/work/a', events }: { id?: string; cwd?: string; events: TurnEvent[] }): SessionLike {
   return {
     seq: events.length,
     header: { id, cwd, delegationDepth: 0 },
@@ -55,7 +92,7 @@ function fakeSession({ id = 's1', cwd = '/work/a', events }) {
   }
 }
 
-const TURN_EVENTS = [
+const TURN_EVENTS: TurnEvent[] = [
   { type: 'turn/start', data: { turn: 1 } },
   {
     type: 'user/message',
@@ -69,7 +106,7 @@ const TURN_EVENTS = [
 ]
 
 /** Mount the plugin over a temp store and wait until it has loaded. */
-async function mount(overrides = {}) {
+async function mount(overrides: Record<string, unknown> = {}): Promise<{ root: string; captured: Captured }> {
   const root = await mkdtemp(join(tmpdir(), 'dshmem-plugin-'))
   const { ctx, captured } = fakeContext()
   apply(ctx, { root, judge: 'heuristic', ...overrides })
@@ -118,7 +155,7 @@ test('a turn writes a memory, a later session recalls it, and it can be forgotte
   const session = fakeSession({ events: TURN_EVENTS })
   assert.equal(captured.contexts[0].text({ agent: { session } }), '')
 
-  await captured.listeners.get('agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
 
   const injected = captured.contexts[0].text({ agent: { session } })
   assert.match(injected, /## 长期记忆/)
@@ -131,16 +168,16 @@ test('a turn writes a memory, a later session recalls it, and it can be forgotte
 
   // A subagent inherits the parent's context and must not pay for it twice.
   const sub = fakeSession({ id: 's3', events: TURN_EVENTS })
-  sub.header.delegationDepth = 1
+  sub.header!.delegationDepth = 1
   assert.equal(captured.contexts[0].text({ agent: { session: sub } }), '')
 
   // The tools see the same store.
-  const search = captured.tools.get('memory_search')
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
   const found = await search.execute({ query: 'pnpm' }, { agent: { session } })
   assert.equal(found.matches.length, 1)
   assert.match(search.output.render({ query: 'pnpm' }, found)[0].text, /必须用 pnpm/)
 
-  const forget = captured.tools.get('memory_forget')
+  const forget = toolFor<ForgetArgs, MemoryForgetResult>(captured, 'memory_forget')
   const removed = await forget.execute({ id: found.matches[0].id }, { agent: { session } })
   assert.deepEqual(removed, { removed: [found.matches[0].id], count: 1 })
   assert.equal(captured.contexts[0].text({ agent: { session } }), '')
@@ -148,11 +185,11 @@ test('a turn writes a memory, a later session recalls it, and it can be forgotte
 
 test('a repeated statement is not written twice', async () => {
   const { captured } = await mount()
-  const handler = captured.listeners.get('agent/turn-stopping')
+  const handler = listenerFor(captured, 'agent/turn-stopping')
   const session = fakeSession({ events: TURN_EVENTS })
   await handler({ agent: { id: 's1', session }, turn: 1, signal: undefined })
   await handler({ agent: { id: 's1', session }, turn: 2, signal: undefined })
-  const search = captured.tools.get('memory_search')
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
   const found = await search.execute({ query: 'pnpm' }, { agent: { session } })
   assert.equal(found.matches.length, 1)
   assert.equal(found.total, 1)
@@ -160,7 +197,7 @@ test('a repeated statement is not written twice', async () => {
 
 test('memory_write and the injection agree on the same record', async () => {
   const { captured } = await mount()
-  const write = captured.tools.get('memory_write')
+  const write = toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write')
   const written = await write.execute({ text: '不要改动 data/ 目录下的文件。', type: 'constraint' })
   assert.equal(written.stored, true)
   assert.equal(written.replaced, false)
@@ -181,15 +218,15 @@ test('a disabled plugin registers nothing', () => {
 test('a delegated child session never teaches the store', async () => {
   const { captured } = await mount()
   const session = fakeSession({ id: 'child', events: TURN_EVENTS })
-  session.header.delegationDepth = 1
-  await captured.listeners.get('agent/turn-stopping')({ agent: { id: 'child', session }, turn: 1, signal: undefined })
-  const search = captured.tools.get('memory_search')
+  session.header!.delegationDepth = 1
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 'child', session }, turn: 1, signal: undefined })
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
   assert.equal((await search.execute({ query: 'pnpm' }, { agent: { session } })).matches.length, 0)
 })
 
 test('a task instruction is never written even from a root session', async () => {
   const { captured } = await mount()
-  const events = [
+  const events: TurnEvent[] = [
     { type: 'turn/start', data: { turn: 1 } },
     {
       type: 'user/message',
@@ -201,14 +238,16 @@ test('a task instruction is never written even from a root session', async () =>
     },
   ]
   const session = fakeSession({ id: 'root', events })
-  await captured.listeners.get('agent/turn-stopping')({ agent: { id: 'root', session }, turn: 1, signal: undefined })
-  const search = captured.tools.get('memory_search')
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 'root', session }, turn: 1, signal: undefined })
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
   assert.equal((await search.execute({ query: '步骤' }, { agent: { session } })).matches.length, 0)
   assert.equal((await search.execute({ query: 'Java' }, { agent: { session } })).matches.length, 0)
 })
 
 test('a failing hook never propagates out of the turn boundary', async () => {
   const { captured } = await mount()
-  const handler = captured.listeners.get('agent/turn-stopping')
-  await assert.doesNotReject(handler({ agent: { id: 'broken', session: { seq: 5, header: {}, eventAt: () => { throw new Error('boom') } } }, turn: 1 }))
+  const handler = listenerFor(captured, 'agent/turn-stopping')
+  await assert.doesNotReject(async () => {
+    await handler({ agent: { id: 'broken', session: { seq: 5, header: {}, eventAt: () => { throw new Error('boom') } } }, turn: 1 })
+  })
 })

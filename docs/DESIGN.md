@@ -118,16 +118,55 @@
 6. 修复：`writeSkipSubagents` + `screenSentence`（任务指令/载荷筛查），回归测试直接用这 3 句原文。
 7. 清理：备份 `memory.json` 后删掉 5 条非人工记录（清理过程中另一个 subagent 又贡献了 2 条，正好再次证明问题真实），台账追加 `kind:"forget","by":"manual-cleanup"`；随后注入块只剩正确的那条。
 
+### 第二次误记（同一天，同类问题）
+
+用户在中文里提问——句子以 URL 开头、以「吗」结尾、**没有问号**——被记成了一条 `constraint`。
+
+修法：`looksInterrogative()` 补上中文的真实书写习惯——句尾语气词（吗/嗎/呢）与「难道 / 是不是 / 要不要 / 有没有」都算疑问；回归测试直接用那句真实提问。
+
+两次误记的教训是同一条：**"这句是不是疑问句 / 是不是任务指令"必须由确定性规则回答，而且规则必须按中文实际写法来写**，不能按英文标点习惯推。
+
+### TypeScript 迁移（同日，行为不变）
+
+`dsh/**` 与 `test/**` 全部从 JS+JSDoc 迁到 TS，`version` 升到 `0.3.0`。
+
+验证方式（三层，缺一层都不算过）：
+
+1. 迁移前的 49 条离线测试全绿；
+2. `tsc --noEmit` 零错误（`strict` + `verbatimModuleSyntax` + `allowImportingTsExtensions`）；
+3. **差分比对**：把旧 `.js` 与新 `.ts` 并排跑，对 `resolveConfig` 全输入矩阵、各模块全部导出、store 生命周期与损坏文档恢复、judge 各失败分支、Jev 的重试/超时/非 JSON 响应、以及用假 ctx 挂载后驱动钩子与三个工具的完整链路，逐值比对 **602 项全部一致**（唯一差异是预期的 version）。
+
+差分测试抓到的两处"看着该改、其实会改变行为"的地方，都保留了原语义并留了注释：`resolveConfig` 的对象 spread 对**畸形配置**的字面展开语义；`normalizeRecord` 对 `sessionId`/`judge.kind` 等字段**原样透传而不做 typeof 归一化**（手改过的 `memory.json` 里数字型 sessionId 原本会原样保留）。这条经验值得记住：**"顺手把它规范化一下"就是一次静默的行为变更**。
+
+另外，`package.json` 的 `exports["."]` 也随之指向 `./dsh/index.ts`——因为 `cordis.patch.yml` 里用的是裸包名 `dsh-jev-memory`，走的正是 exports。
+
 ### 运行时坑（都在源码里留了注释）
 
-- **Cordis HMR 能重挂载插件行，但不能让 ESM 重新求值 `lib/*.js`**：改 `cordis.patch.yml` 的注释不改变解析后的 patch 列表（`entry.update` 等价 → 不重挂）；改成语义变更（例如给行加 `config`）会重挂，但入口模块从 ESM 缓存返回，仍是旧代码。所以 `start` 台账里带 `version`，用来判断"跑的是哪份代码"。**改了 `lib/` 要重启进程。**
+- **Cordis HMR 能重挂载插件行，但不能让 ESM 重新求值 `lib/*.ts`**：改 `cordis.patch.yml` 的注释不改变解析后的 patch 列表（`entry.update` 等价 → 不重挂）；改成语义变更（例如给行加 `config`）会重挂，但入口模块从 ESM 缓存返回，仍是旧代码。所以 `start` 台账里带 `version`，用来判断"跑的是哪份代码"。**换一个行名指向新文件路径，可以强制换一整套模块 URL**——这正是从 `.js` 迁到 `.ts` 时让修复代码真正上线的办法；否则要重启进程。
 - 子代理的 user 消息不是人类的话（本插件最重要的一条领域知识）；
 - 钩子在用户关键路径上：任何异常都必须被吞掉，且必须有 deadline。
+
+## 6.5 语言选择：TS 在插件层，Python 只在引擎层
+
+结论先写在这里，理由是可验证的：
+
+- **插件那一层必须是 ESM 模块**。加载器对每一行做 `await import(new URL(name, baseUrl).href)`（`cordis-plugin-loader` 的 `import()`），契约是 `export const name/inject` + `apply(ctx, config)`。所以 composition 行不可能是 `.py`、也不能是 `.ts` 之外的别的东西——**但可以是 `.ts`**。
+- **TypeScript 现在零成本**：Node 22.23 默认开启类型擦除（`process.features.typescript === 'strip'`）。实测：`.mjs` 里 `import('./probe.ts')` 成功、`node --test .scratch/probe.test.ts` 通过。因此插件可以直接以 `file:.../dsh/index.ts` 挂进 profile，**不需要构建步骤，也就保住了"零依赖、零安装"的性质**。代价是只能用可擦除语法（无 enum / namespace / 参数属性 / 装饰器），纯类型导入必须 `import type`。
+- **Python 不当插件语言，但当引擎语言**。最有说服力的证据来自 memsearch 自己：它是 Python 为主的项目（879KB Python vs 81KB TS），可它的 **DSH 插件是纯 ESM JS、明确"no build step"**，Python 只活在子进程 CLI 后面（`docs/memsearch-notes.md` §多语言/工程栈事实）。代价也写在它身上：Python 3.10+、milvus-lite、558MB ONNX 模型、**每次检索 fork 一个 CLI 进程**——它的 issue 里孤儿进程与 Windows 兼容问题正来源于此。
+- 所以分界线是**位置**而不是语言强弱：钩子（`agent/turn-stopping`）与注入（`systemPrompt.context` 是同步回调）在用户关键路径上，必须进程内；只有"语义检索 / embedding / rerank / 评测统计"才值得跨进程，而且**必须是常驻 sidecar，不能每次 fork**。
 
 ## 7. 下一步（按价值排序）
 
 1. **用真实 Jev key 跑一遍线上路径**，把这批启发式判定换成 Jev 判定，量一次 before/after 的写入精确率；
-2. 冲突处理闭环：`needs-review` 目前只是不注入，应该用一次 `ask_user` 问"这条要不要覆盖旧的"（这才是 triage 的核心，也是把它做成 HITL 的入口）；
-3. `memory_search` 的语义召回：现在是子串 + 词重叠，够用但会漏改写；如要做，同样走 Jev 排序而不是引向量库；
-4. 存储换到官方 `storageDomain`（如果愿意接受 zod 依赖），拿到 `domain/changed` 事件与并发保护；
-5. 客户端半（`dsh/client.js`）：一个只读的台账面板，给人看"它记住了什么、从哪来、被召回几次"。
+2. **冲突处理闭环**：`needs-review` 目前只是不注入，应该用一次 `ask_user` 问"这条要不要覆盖旧的"（这才是 triage 的核心，也是把它做成 HITL 的入口）；
+3. **补齐指标 harness**：`Hit@3` / `Recall@3` 两套定义（见 README）+ 人工标 50 条查询；同时把"注入内容与当前 query 无关时不重复注入"的**抑制次数**记进台账，用真实长会话数据决定是否从"每步注入"改成更省的策略——memsearch 选了"仅 step 1 注入、无命中零成本"，我们不照抄，但要拿数据说话；
+4. **工具失败的重复计数门槛**：同签名（工具 + 错误码）出现 ≥N 次才落盘。现在一次性的环境失败（沙箱拒绝、重定向被拦）也会被记成"长期的坑"，价值很低；
+5. **召回/检索失败也进台账**：现在只有 `logger.warn`，而 memsearch 的 issue 表明"静默失败"是最难查的一类问题；
+6. 只读导出 `memory.md`（从 `memory.json` 生成、不反向解析），拿到人可读的收益而不承担双写 bug 面；
+7. 存储换到官方 `storageDomain`（如果愿意接受 zod 依赖），拿到 `domain/changed` 事件与并发保护；
+8. 客户端半（`dsh/client.js`）：一个只读的台账面板，给人看"它记住了什么、从哪来、被召回几次"。
+
+### 生态定位（2026-09-28 核实）
+
+`zilliztech/memsearch` 已经**原生支持 DSH**（`plugins/dsh/`，npm `@zilliz/memsearch-dsh`，同一个 patch 层、同样的 `agent/pre-step` 注入点）。所以"官方没有 memory 包"仍然成立，但生态里的位置已经有人占了。它和我们是**正交而非替代**：它解决"记得多"（每回合全量落盘、LLM 摘要、Milvus 语义检索），我们解决"记得准"（写入门槛、类型、冲突、逐条可审计、可撤销）。它的设计里**没有** type / importance / conflict / 召回计数 / 台账——不是没做，是它明确把"写入不判定"当卖点。细节见 `docs/memsearch-notes.md`。
+
