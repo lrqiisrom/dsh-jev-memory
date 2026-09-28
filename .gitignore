@@ -1,0 +1,7 @@
+node_modules/
+*.log
+.DS_Store
+
+# local scratch: dev profiles, extracted transcripts, measurement output
+.scratch/
+.dshdev/

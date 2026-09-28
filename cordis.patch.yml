@@ -1,0 +1,9 @@
+# dsh bundle layer: mount the typed long-term memory plugin.
+#
+# `name` is resolved with `new URL(name, baseUrl)` by the Cordis loader, so a
+# bare package name and a relative/file URL both work — that is what lets the
+# development copy mount straight from the workspace with `--patch` before it
+# is ever installed into a profile.
+- insert:
+    - id: jev-memory
+      name: 'dsh-jev-memory'
