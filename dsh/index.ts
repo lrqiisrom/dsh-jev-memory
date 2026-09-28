@@ -42,8 +42,9 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import { createCredentialFileReader } from './lib/credentials.ts'
+import { buildConflictQuestion, choiceFromAnswer, findConflictPartner, type ConflictPair } from './lib/conflict.ts'
 import { extractCandidates, EXTRACT_DEFAULTS } from './lib/extract.ts'
-import { applyGate, createJudge, JUDGE_MODES } from './lib/judge.ts'
+import { applyGate, createJudge, JUDGE_MODES, type Judgement } from './lib/judge.ts'
 import { createJevClient, JEV_DEFAULTS } from './lib/jev.ts'
 import { DEFAULT_QUOTA, inScope, renderRecall, searchMemories, selectMemories } from './lib/recall.ts'
 import { signatureOf } from './lib/signals.ts'
@@ -117,6 +118,7 @@ export interface SystemPromptService {
 export interface InjectedScope {
   systemPrompt: SystemPromptService
   credentials?: CredentialService
+  userQuestions?: UserQuestionsService
 }
 
 /** What a tool's `execute` receives about its caller. */
@@ -146,6 +148,40 @@ export interface ToolRegistry {
 /** The credential service, reduced to the one call this plugin makes. */
 export interface CredentialService {
   resolve(ref: string): Promise<{ value: string; source?: string } | undefined>
+}
+
+/** One question item, as the harness's ask service accepts it. */
+export interface AskQuestionItem {
+  id: string
+  header?: string
+  question: string
+  detail?: string
+  options?: Array<{ label: string; description?: string }>
+  multiSelect?: boolean
+}
+
+/** One answer item, as the harness's ask service returns it. */
+export interface AskAnswerItem {
+  id: string
+  selected: string[]
+  custom?: string
+}
+
+/**
+ * The harness's ask-the-human service, reduced to the one call this plugin makes.
+ *
+ * Reusing it — rather than inventing a notification path — is the whole reason
+ * this feature cannot conflict with the harness's existing human interaction:
+ * approvals stay approvals, model questions stay model questions, and this is
+ * simply one more *producer* of questions on the same channel and the same UI.
+ *
+ * The service's documented constraint is load-bearing here: with an `agent`, only
+ * the exact live runtime root can be asked — an owned child has no answerer and
+ * would block forever — so the caller passes the agent and treats every refusal
+ * as "unanswered".
+ */
+export interface UserQuestionsService {
+  ask(request: { questions: AskQuestionItem[]; agent?: unknown; signal?: AbortSignal }): Promise<{ answers?: AskAnswerItem[] }>
 }
 
 /** The Cordis plugin context, reduced to the members this plugin calls. */
@@ -181,6 +217,12 @@ export interface PluginConfig {
   /** threshold on the judge's "worth remembering" answer; the heuristic ignores it. */
   minRemember: number
   reviewOnConflict: boolean
+  /** whether a suspected conflict is put to the human instead of only being withheld. */
+  askOnConflict: boolean
+  /** how long to wait for that answer before leaving the record in `needs-review`. */
+  askOnConflictTimeoutMs: number
+  /** how many times a tool failure must repeat before it is worth remembering at all. */
+  repeatFailuresToWrite: number
   writeEnabled: boolean
   writeSkipSubagents: boolean
   writeTimeoutMs: number
@@ -250,6 +292,15 @@ interface TurnWriteOutcome {
   duplicates?: number
   model?: string | null
   degraded?: string | null
+  /** conflicts the judge raised, paired with the record they contradict. */
+  pendingConflicts?: PendingConflict[]
+}
+
+/** One suspected contradiction, waiting for a human's answer. */
+interface PendingConflict {
+  candidate: Candidate
+  judgement: Judgement
+  pair: ConflictPair
 }
 
 /**
@@ -300,6 +351,33 @@ export const DEFAULT_CONFIG: PluginConfig = {
   minRemember: 0.6,
   /** A suspected conflict is stored but withheld from recall until a human confirms. */
   reviewOnConflict: true,
+  /**
+   * Put a suspected conflict to the human.
+   *
+   * The whole point of the judgement layer is to avoid writing something wrong;
+   * discovering a contradiction and then silently swallowing it would leave the
+   * user with a memory that answers "I don't know" forever. Asking is the only
+   * honest resolution, and the answer is the ground truth that measures how good
+   * the judge's conflict calls are.
+   */
+  askOnConflict: true,
+  /**
+   * Budget for that answer, in milliseconds.
+   *
+   * Two minutes: long enough that a present user is never cut off, short enough
+   * that a session whose user walked away resumes instead of hanging forever.
+   * On expiry the record simply stays `needs-review` — withheld, not lost.
+   */
+  askOnConflictTimeoutMs: 120_000,
+  /**
+   * How many times a tool failure must be seen before it counts as a pitfall.
+   *
+   * A one-off environment failure (a sandbox denial, a blocked redirect) is not a
+   * durable lesson; a failure that keeps happening is. Without this rule the
+   * heuristic judge records every transient error as a `pitfall`, which is what
+   * the first live runs did.
+   */
+  repeatFailuresToWrite: 2,
   /** Whether turn-end writes happen at all. */
   writeEnabled: true,
   /**
@@ -382,7 +460,16 @@ export function resolveConfig(raw: unknown): { config: PluginConfig; problems: s
     problems.push(`judge: unknown mode "${config.judge}"; using auto`)
     config.judge = 'auto'
   }
-  for (const field of ['minImportance', 'minRemember', 'writeTimeoutMs', 'judgeTimeoutMs', 'knownForConflict', 'contextOrder'] as const) {
+  for (const field of [
+    'minImportance',
+    'minRemember',
+    'writeTimeoutMs',
+    'judgeTimeoutMs',
+    'knownForConflict',
+    'contextOrder',
+    'askOnConflictTimeoutMs',
+    'repeatFailuresToWrite',
+  ] as const) {
     if (!Number.isFinite(config[field])) {
       problems.push(`${field}: not a finite number; using the default`)
       config[field] = DEFAULT_CONFIG[field]
@@ -468,6 +555,14 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   const credentialOf = (): CredentialService | undefined => credentials ?? (ctx.get?.('credentials') as CredentialService | undefined)
   ctx.inject(['credentials'], (scope) => {
     credentials = scope.credentials
+  })
+  // Same reactive pattern, same reason: the ask service is what turns a suspected
+  // conflict into a question instead of a silent withholding.
+  let userQuestions: UserQuestionsService | undefined
+  const userQuestionsOf = (): UserQuestionsService | undefined =>
+    userQuestions ?? (ctx.get?.('userQuestions') as UserQuestionsService | undefined)
+  ctx.inject(['userQuestions'], (scope) => {
+    userQuestions = scope.userQuestions
   })
   const credentialRef = config.jev.apiKeyEnv ?? JEV_DEFAULTS.apiKeyEnv
   const credentialFromFile = createCredentialFileReader({ home: resolveDshHome(), ref: credentialRef })
@@ -573,12 +668,15 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   })
 
   // ---------------------------------------------------------------------------
-  // Write: judge and persist candidates from the turn that just closed.
+  // Write: judge and persist candidates from the turn that just closed, then put
+  // any suspected contradiction to the human.
   //
-  // `agent/turn-stopping` is serial and awaited before the boundary commits,
-  // which is what makes a durable write possible at all — but it also means a
-  // slow judge would sit in the user's critical path. Hence: a hard deadline, a
-  // fail-open catch, and an abort signal borrowed from the turn.
+  // Two phases with separate budgets, because they are different kinds of work.
+  // The first — extract, judge, gate, persist — is bounded by `writeTimeoutMs`,
+  // since `agent/turn-stopping` is serial and awaited before the boundary commits
+  // and a slow judge would sit in the user's critical path. The second involves a
+  // person and is therefore slow on purpose: it gets its own budget, and on
+  // expiry the record simply stays withheld rather than being guessed at.
   // ---------------------------------------------------------------------------
   ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => {
     if (!config.writeEnabled || !ready) return
@@ -587,12 +685,26 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       void store.ledger({ kind: 'skip', reason: 'subagent-session', sessionId: turnHeader?.id ?? null, turn })
       return
     }
+
+    let pending: PendingConflict[] = []
     try {
       const outcome = await withDeadline(handleTurn(), config.writeTimeoutMs)
+      pending = outcome?.pendingConflicts ?? []
       if (outcome?.written) log('info', `remembered ${outcome.written} item(s) from turn ${turn}`, { model: outcome.model })
     } catch (error) {
       log('warn', `turn-end write skipped (fail-open): ${String(error)}`)
       void store.ledger({ kind: 'hook-error', turn, error: String(error) })
+    }
+
+    // One question per turn, and only the first: two questions in a row is an
+    // interrogation, not a memory system.
+    if (pending.length > 0 && config.askOnConflict) {
+      try {
+        await withDeadline(askAboutConflict(pending[0], agent, signal), config.askOnConflictTimeoutMs)
+      } catch (error) {
+        log('warn', `conflict question left unanswered (fail-open): ${String(error)}`)
+        void store.ledger({ kind: 'conflict-resolved', id: pending[0].candidate.key, choice: 'unanswered', error: String(error) })
+      }
     }
 
     /** Read the turn's events, judge the candidates, and persist what passes the gate. */
@@ -610,6 +722,26 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         if (store.has(candidate.key)) {
           void store.ledger({ kind: 'skip', reason: 'duplicate', id: candidate.key, quote: candidate.quote })
           continue
+        }
+        // A tool failure is only a *pitfall* once it repeats. One sandbox denial is
+        // an event; the same denial three times is a lesson. Observations are
+        // counted in the ledger, so the rule survives a restart — and the line is
+        // written even when the candidate is dropped, which is what makes the
+        // count grow.
+        if (candidate.kind === 'tool-failure') {
+          const seen = store.observedCount(candidate.key)
+          store.noteObserved(candidate.key)
+          void store.ledger({ kind: 'observed', id: candidate.key, tool: candidate.tool, quote: excerpt(candidate.quote, 120) })
+          if (seen + 1 < config.repeatFailuresToWrite) {
+            void store.ledger({
+              kind: 'skip',
+              reason: 'failure-not-repeated',
+              id: candidate.key,
+              seen: seen + 1,
+              quote: excerpt(candidate.quote, 120),
+            })
+            continue
+          }
         }
         fresh.push(candidate)
       }
@@ -636,6 +768,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         void store.ledger({ kind: 'degraded', reason: 'jev-missing-row', count: unanswered, cwd })
       }
       let written = 0
+      const pendingConflicts: PendingConflict[] = []
       for (const candidate of fresh) {
         const judgement = rows.find((row) => row.key === candidate.key)
         const gate = applyGate(judgement, config)
@@ -652,6 +785,17 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
             quote: excerpt(candidate.quote, 120),
           })
           continue
+        }
+        // A suspected conflict is written first, in `needs-review`, and only then
+        // taken to the human. Writing first means an unanswered question leaves the
+        // system exactly where it is today — the record exists, and it is withheld
+        // from recall — instead of losing what the user said.
+        if (gate.review && config.askOnConflict && pendingConflicts.length === 0) {
+          const partner = findConflictPartner(
+            candidate.text,
+            store.all().filter((record) => record.status === 'active' && inScope(record, cwd)),
+          )
+          if (partner) pendingConflicts.push({ candidate, judgement, pair: partner })
         }
         const now = Date.now()
         await store.put({
@@ -685,7 +829,67 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         })
         written += 1
       }
-      return { written, candidates: candidates.length, duplicates: candidates.length - fresh.length, model, degraded }
+      return { written, candidates: candidates.length, duplicates: candidates.length - fresh.length, model, degraded, pendingConflicts }
+    }
+
+    /**
+     * Put one suspected contradiction to the human and apply the answer.
+     *
+     * Everything here is written to the ledger *before* the outcome is known, so
+     * the audit trail shows the question even when nobody answers — that record is
+     * what makes "how often was the judge right about conflicts?" answerable.
+     *
+     * @param pending - the contradiction to ask about.
+     * @param owner - the live agent the question belongs to.
+     * @param abort - the turn's abort signal.
+     * @returns nothing.
+     */
+    async function askAboutConflict(pending: PendingConflict, owner: AgentLike | null | undefined, abort: AbortSignal | undefined): Promise<void> {
+      const incoming = pending.candidate.key
+      const existing = pending.pair.existing.id
+      const service = userQuestionsOf()
+      void store.ledger({
+        kind: 'conflict-ask',
+        id: incoming,
+        with: existing,
+        score: Number(pending.pair.score.toFixed(3)),
+        shared: pending.pair.shared.slice(0, 8),
+        by: pending.judgement.by,
+      })
+      if (service === undefined) {
+        void store.ledger({ kind: 'conflict-resolved', id: incoming, with: existing, choice: 'unanswered', reason: 'no-answerer' })
+        return
+      }
+
+      const question = buildConflictQuestion(pending.pair, incoming)
+      log('info', `asking which side of a suspected conflict wins (${incoming} vs ${existing})`)
+      const answer = await service.ask({ questions: [question], agent: owner, signal: abort })
+      const choice = choiceFromAnswer(answer?.answers?.[0])
+      if (choice === null) {
+        void store.ledger({ kind: 'conflict-resolved', id: incoming, with: existing, choice: 'unanswered', reason: 'no-selection' })
+        return
+      }
+
+      if (choice === 'keep-old') {
+        await store.remove(incoming)
+        void store.ledger({ kind: 'conflict-resolved', id: incoming, with: existing, choice })
+        log('info', 'conflict resolved: kept the earlier memory, dropped the new one')
+        return
+      }
+
+      // `superseded` rather than deleted: the old record stays auditable, and a
+      // human who changes their mind can see what the previous statement was.
+      if (choice === 'replace') await store.remove(existing)
+      const record = store.get(incoming)
+      if (record) await store.put({ ...record, status: 'active', updatedAt: Date.now() })
+      void store.ledger({
+        kind: 'conflict-resolved',
+        id: incoming,
+        with: existing,
+        choice,
+        superseded: choice === 'replace' ? existing : null,
+      })
+      log('info', `conflict resolved by the user: ${choice}`)
     }
   })
 

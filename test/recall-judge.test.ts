@@ -150,6 +150,28 @@ test('judge with mode off writes nothing and never calls the model', async () =>
   assert.equal(called, 0)
 })
 
+// A configured mode is not a preference to be second-guessed. Dropping this rule
+// while making availability dynamic caused an "offline" run to make a real network
+// call — caught by a plugin test that expected the heuristic to write a memory and
+// instead saw the model refuse it.
+test('an explicit heuristic mode never consults the model, even with a key available', async () => {
+  let called = 0
+  const judge = createJudge({
+    config: { judge: 'heuristic', types: ['constraint'] },
+    jev: {
+      isAvailable: async () => true,
+      decide: async () => {
+        called += 1
+        return { rows: [], model: null }
+      },
+    },
+  })
+  assert.equal(judge.kind, 'heuristic')
+  const { rows } = await judge.judge([{ key: 'k', hintedType: 'constraint', signalScore: 0.7, signals: [] }])
+  assert.equal(rows[0].by, 'heuristic')
+  assert.equal(called, 0)
+})
+
 test('judge falls back to the heuristic when the model fails', async () => {
   const warnings: string[] = []
   const judge = createJudge({

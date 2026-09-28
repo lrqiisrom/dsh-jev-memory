@@ -77,8 +77,11 @@ export interface MemoryRecord {
   cwd: string | null
   /** 0..1, produced by the judgement layer. */
   importance: number
-  /** `needs-review` = suspected conflict. */
-  status: 'active' | 'needs-review'
+  /**
+   * `needs-review` = suspected conflict, withheld from recall;
+   * `superseded` = a human chose to replace it, kept for audit but never injected.
+   */
+  status: 'active' | 'needs-review' | 'superseded'
   /** provenance: session, seq, quote, when. */
   source: MemorySource
   /** epoch ms. */
@@ -101,6 +104,8 @@ export interface StoreStats {
   total: number
   byType: Record<string, number>
   needsReview: number
+  /** records a human chose to replace; kept for audit, never injected. */
+  superseded: number
   recalls: number
 }
 
@@ -128,6 +133,20 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 /**
+ * Coerce a stored status into the current vocabulary.
+ *
+ * An unknown or missing value becomes `active`, matching the tolerant reading
+ * the rest of `normalizeRecord` uses: a hand-edited document loses a state flag
+ * rather than a memory.
+ *
+ * @param value - the stored status.
+ * @returns one of the three known statuses.
+ */
+function normalizeStatus(value: unknown): MemoryRecord['status'] {
+  return value === 'needs-review' || value === 'superseded' ? value : 'active'
+}
+
+/**
  * Create a store rooted at `root`. Nothing touches the disk until {@link MemoryStore.load}.
  *
  * @param options - store options.
@@ -146,6 +165,16 @@ export class MemoryStore {
   #records = new Map<string, MemoryRecord>()
   /** serializes every disk mutation. */
   #chain: Promise<void> = Promise.resolve()
+  /**
+   * How many times each candidate signature has been observed, derived from the
+   * ledger at load time and incremented as the plugin sees more.
+   *
+   * Derived from the ledger on purpose: "have I seen this failure before?" needs
+   * to survive restarts, and the ledger already records every observation with
+   * its signature id. Counting there costs no new schema and adds no second
+   * source of truth that could disagree with the audit trail.
+   */
+  #observed = new Map<string, number>()
   #loaded = false
   #flushCount = 0
 
@@ -201,7 +230,61 @@ export class MemoryStore {
       }
     }
     this.#loaded = true
+    await this.#loadObservedCounts()
     return { loaded: this.#records.size, recovered }
+  }
+
+  /**
+   * Rebuild the observation counts from the ledger.
+   *
+   * Failure here is harmless — the counts start empty and rebuild as the plugin
+   * works — so it never propagates: a plugin that cannot count is still a plugin
+   * that remembers.
+   *
+   * @returns nothing.
+   */
+  async #loadObservedCounts(): Promise<void> {
+    try {
+      const raw = await readFile(this.#ledgerFile(), 'utf8')
+      for (const line of raw.split('\n')) {
+        if (line === '') continue
+        try {
+          const entry: unknown = JSON.parse(line)
+          const parsed = asRecord(entry)
+          // Only the explicit `observed` lines count. Counting every line that
+          // happens to carry an id would double-count one sighting — the hook logs
+          // the observation and then the judgement outcome for the same signature —
+          // and "seen twice" would quietly become "seen once".
+          if (parsed?.kind !== 'observed') continue
+          const id = parsed.id
+          if (typeof id === 'string' && id !== '') this.#observed.set(id, (this.#observed.get(id) ?? 0) + 1)
+        } catch {
+          /* one unreadable line must not lose the rest of the counts */
+        }
+      }
+    } catch {
+      /* no ledger yet, or unreadable: counts start empty */
+    }
+  }
+
+  /**
+   * How many times this signature was seen before now.
+   *
+   * @param id - the candidate signature.
+   * @returns the recorded observation count, or 0.
+   */
+  observedCount(id: string): number {
+    return this.#observed.get(id) ?? 0
+  }
+
+  /**
+   * Record one observation, so a later occurrence can tell it is a repeat.
+   *
+   * @param id - the candidate signature.
+   * @returns nothing.
+   */
+  noteObserved(id: string): void {
+    this.#observed.set(id, (this.#observed.get(id) ?? 0) + 1)
   }
 
   /** @returns every live record, newest first. */
@@ -318,13 +401,15 @@ export class MemoryStore {
   stats(): StoreStats {
     const byType: Record<string, number> = {}
     let needsReview = 0
+    let superseded = 0
     let recalls = 0
     for (const record of this.#records.values()) {
       byType[record.type] = (byType[record.type] ?? 0) + 1
       if (record.status === 'needs-review') needsReview += 1
+      if (record.status === 'superseded') superseded += 1
       recalls += record.recalls
     }
-    return { total: this.#records.size, byType, needsReview, recalls }
+    return { total: this.#records.size, byType, needsReview, superseded, recalls }
   }
 
   /**
@@ -412,7 +497,7 @@ export function normalizeRecord(record: unknown, now: number): MemoryRecord | nu
     text,
     cwd: typeof source.cwd === 'string' && source.cwd ? source.cwd : null,
     importance: clamp01(source.importance),
-    status: source.status === 'needs-review' ? 'needs-review' : 'active',
+    status: normalizeStatus(source.status),
     source: {
       sessionId: (sessionId ?? null) as string | null,
       seq: Number.isFinite(provenance?.seq) ? Number(provenance?.seq) : null,

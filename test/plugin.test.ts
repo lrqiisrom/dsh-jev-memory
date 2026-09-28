@@ -6,6 +6,7 @@ import { test } from 'node:test'
 
 import { apply, collectTurnEvents, resolveConfig, resolveStoreRoot, withDeadline } from '../dsh/index.ts'
 import type {
+  AskQuestionItem,
   ForgetArgs,
   MemoryForgetResult,
   MemorySearchResult,
@@ -18,6 +19,7 @@ import type {
   TurnStoppingPayload,
   WriteArgs,
 } from '../dsh/index.ts'
+import { CONFLICT_CHOICES } from '../dsh/lib/conflict.ts'
 import type { TurnEvent } from '../dsh/lib/extract.ts'
 
 /** What the fake context recorded, so a test can drive the plugin's hooks by hand. */
@@ -30,6 +32,10 @@ interface Captured {
   injected?: string[]
   /** what the fake credentials service returns, when a test wires one. */
   credentialValue?: string
+  /** questions the plugin put to the human, in order. */
+  asked: Array<{ questions: AskQuestionItem[]; agent?: unknown }>
+  /** labels the fake human replies with, when a test wires an answerer. */
+  askAnswer?: string[]
 }
 
 /**
@@ -39,7 +45,7 @@ interface Captured {
  * exercised by the separate end-to-end run documented in README.md.
  */
 function fakeContext(): { ctx: PluginContext; captured: Captured } {
-  const captured: Captured = { contexts: [], listeners: new Map(), tools: new Map(), disposers: [] }
+  const captured: Captured = { contexts: [], listeners: new Map(), tools: new Map(), disposers: [], asked: [] }
   const ctx: PluginContext = {
     logger: { info: () => {}, warn: () => {} },
     // Per-name scope, exactly like the real context: the plugin injects both
@@ -57,6 +63,14 @@ function fakeContext(): { ctx: PluginContext; captured: Captured } {
       }
       if (names.includes('credentials') && captured.credentialValue !== undefined) {
         scope.credentials = { resolve: async () => ({ value: captured.credentialValue as string, source: 'file' }) }
+      }
+      if (names.includes('userQuestions') && captured.askAnswer !== undefined) {
+        scope.userQuestions = {
+          ask: async (request) => {
+            captured.asked.push({ questions: request.questions, agent: request.agent })
+            return { answers: [{ id: request.questions[0]?.id ?? 'q', selected: captured.askAnswer as string[] }] }
+          },
+        }
       }
       callback(scope)
     },
@@ -119,10 +133,13 @@ async function mount(
   overrides: Record<string, unknown> = {},
   /** a key the fake credentials service should answer with, when the test wires one. */
   credentialValue?: string,
+  /** runs after the fake context exists but before `apply`, to wire fakes. */
+  setup?: (captured: Captured) => void,
 ): Promise<{ root: string; captured: Captured }> {
   const root = await mkdtemp(join(tmpdir(), 'dshmem-plugin-'))
   const { ctx, captured } = fakeContext()
   if (credentialValue !== undefined) captured.credentialValue = credentialValue
+  setup?.(captured)
   apply(ctx, { root, judge: 'heuristic', ...overrides })
   await new Promise((resolve) => setTimeout(resolve, 50))
   return { root, captured }
@@ -130,6 +147,7 @@ async function mount(
 
 /** The plugin's `start` ledger line, which records what the judge could reach. */
 async function startEntry(root: string): Promise<Record<string, any>> {
+  await settle()
   const ledger = await readFile(join(root, 'ledger.jsonl'), 'utf8')
   const entries = ledger
     .trim()
@@ -329,4 +347,178 @@ test('a credential document is read when the service is absent', async () => {
     assert.equal(start.jev.ready, true)
     assert.equal(start.jev.source, 'file')
   })
+})
+
+/**
+ * Wait for the plugin's fire-and-forget ledger appends to land.
+ *
+ * Audit writes are deliberately not awaited inside the hook — a turn must never
+ * block on bookkeeping — so a test that reads the ledger has to let the queue
+ * drain first.
+ */
+async function settle(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 50))
+}
+
+/** A canned Jev answer: worth remembering, a constraint, and a suspected conflict. */
+function jevConflictResponse(): Response {
+  return new Response(
+    JSON.stringify({
+      model: 'jev-1.13.0',
+      answers: {
+        'remember:0': { type: 'noul', noul: 0.9 },
+        'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
+        'importance:0': { type: 'score', score: 3, legend: {}, confidence: 0.9 },
+        'conflict:0': { type: 'noul', noul: 0.95 },
+      },
+    }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  )
+}
+
+const CONFLICTING_TURN: TurnEvent[] = [
+  { type: 'turn/start', data: { turn: 1 } },
+  {
+    type: 'user/message',
+    data: {
+      role: 'user',
+      source: { kind: 'user' },
+      content: [{ type: 'text', text: '不要改动 data/ 目录下的任何文件。' }],
+    },
+  },
+  { type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [] } } },
+]
+
+/**
+ * The whole human-in-the-loop path, driven end to end: the judge raises a
+ * conflict, the plugin asks, the answer decides which memory survives.
+ *
+ * The network is stubbed rather than avoided because this is precisely the wiring
+ * that unit tests cannot reach — the pairing, the question, the answer mapping and
+ * the store mutation all have to agree with each other.
+ */
+test('a suspected conflict is put to the human and the answer decides', async () => {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = (async () => jevConflictResponse()) as unknown as typeof fetch
+  try {
+    const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } }, undefined, (c) => {
+      c.askAnswer = [CONFLICT_CHOICES.replace]
+    })
+    const session = fakeSession({ events: [] })
+
+    // Something the user said earlier, which the new sentence contradicts.
+    const write = toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write')
+    const seeded = await write.execute({ text: '可以随便改 data/ 目录下的文件', type: 'constraint' }, { agent: { session } })
+    assert.equal(seeded.stored, true)
+
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: CONFLICTING_TURN }) },
+      turn: 1,
+      signal: undefined,
+    })
+
+    assert.equal(captured.asked.length, 1, 'the plugin must ask exactly once')
+    const question = captured.asked[0].questions[0]
+    assert.match(question.detail ?? '', /不要改动 data\/ 目录下的任何文件/)
+    assert.match(question.detail ?? '', /可以随便改 data\/ 目录下的文件/)
+    assert.equal(captured.asked[0].agent !== undefined, true, 'the question must carry the live agent')
+
+    const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+    const found = await search.execute({ query: 'data' }, { agent: { session } })
+    assert.equal(found.matches.length, 1, 'the replaced memory must be gone')
+    assert.match(found.matches[0].text, /不要改动/)
+
+    await settle()
+    const ledger = await readFile(join(root, 'ledger.jsonl'), 'utf8')
+    assert.match(ledger, /"kind":"conflict-ask"/)
+    assert.match(ledger, /"kind":"conflict-resolved".*"choice":"replace"/)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test('keeping the older memory drops the new one instead', async () => {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = (async () => jevConflictResponse()) as unknown as typeof fetch
+  try {
+    const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } }, undefined, (c) => {
+      c.askAnswer = [CONFLICT_CHOICES['keep-old']]
+    })
+    const session = fakeSession({ events: [] })
+    await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+      { text: '可以随便改 data/ 目录下的文件', type: 'constraint' },
+      { agent: { session } },
+    )
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: CONFLICTING_TURN }) },
+      turn: 1,
+      signal: undefined,
+    })
+
+    const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+    const found = await search.execute({ query: 'data' }, { agent: { session } })
+    assert.equal(found.matches.length, 1)
+    assert.match(found.matches[0].text, /可以随便改/)
+    await settle()
+    assert.match(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /"choice":"keep-old"/)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+// Without an answerer the record must stay withheld rather than be guessed at:
+// the fail-open direction is "keep less", never "assume".
+test('an unanswered conflict leaves the new memory withheld', async () => {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = (async () => jevConflictResponse()) as unknown as typeof fetch
+  try {
+    const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } })
+    const session = fakeSession({ events: [] })
+    await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+      { text: '可以随便改 data/ 目录下的文件', type: 'constraint' },
+      { agent: { session } },
+    )
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: CONFLICTING_TURN }) },
+      turn: 1,
+      signal: undefined,
+    })
+
+    assert.equal(captured.asked.length, 0)
+    // The withheld record is not injected, so only the earlier memory is visible.
+    const injected = captured.contexts[0].text({ agent: { session } })
+    assert.match(injected, /可以随便改/)
+    assert.doesNotMatch(injected, /不要改动/)
+    await settle()
+    assert.match(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /"choice":"unanswered"/)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test('a one-off tool failure is not remembered, a repeated one is', async () => {
+  const { captured } = await mount()
+  const session = fakeSession({ events: [] })
+  const failure = (seq: number): TurnEvent[] => [
+    { type: 'turn/start', data: { turn: seq } },
+    { type: 'tool/call', data: { callId: `c${seq}`, name: 'bash', arguments: '{}' } },
+    {
+      type: 'tool/result',
+      data: {
+        message: {
+          role: 'tool',
+          source: { kind: 'tool', callId: `c${seq}` },
+          content: [{ type: 'text', text: 'EPERM: /etc/hosts blocked', isError: true }],
+        },
+      },
+    },
+  ]
+  const handler = listenerFor(captured, 'agent/turn-stopping')
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+
+  await handler({ agent: { id: 's1', session: fakeSession({ events: failure(1) }) }, turn: 1, signal: undefined })
+  assert.equal((await search.execute({ query: 'EPERM' }, { agent: { session } })).matches.length, 0, 'the first sighting is dropped')
+
+  await handler({ agent: { id: 's1', session: fakeSession({ events: failure(2) }) }, turn: 2, signal: undefined })
+  assert.equal((await search.execute({ query: 'EPERM' }, { agent: { session } })).matches.length, 1, 'the repeat is remembered')
 })

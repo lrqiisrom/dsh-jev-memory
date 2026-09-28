@@ -84,14 +84,41 @@ test('store removes records and reports stats', async () => {
   await store.load()
   await store.put(record({ id: 'a' }))
   await store.put(record({ id: 'b', type: 'pitfall', status: 'needs-review' }))
-  assert.deepEqual(store.stats(), { total: 2, byType: { constraint: 1, pitfall: 1 }, needsReview: 1, recalls: 0 })
+  await store.put(record({ id: 'c', type: 'decision', status: 'superseded' }))
+  assert.deepEqual(store.stats(), {
+    total: 3,
+    byType: { constraint: 1, pitfall: 1, decision: 1 },
+    needsReview: 1,
+    superseded: 1,
+    recalls: 0,
+  })
   assert.equal(await store.remove('a'), true)
   assert.equal(await store.remove('a'), false)
-  assert.equal(store.stats().total, 1)
+  assert.equal(store.stats().total, 2)
 
-  const removed = await store.removeWhere((entry) => entry.type === 'pitfall')
-  assert.equal(removed.length, 1)
+  const removed = await store.removeWhere((entry) => entry.status !== 'active')
+  assert.equal(removed.length, 2)
   assert.equal(store.stats().total, 0)
+})
+
+// "Have I seen this failure before?" has to survive a restart, and the answer is
+// derived from the ledger rather than a second store of its own — one source of
+// truth, and no new schema to keep in sync with the audit trail.
+test('observation counts are derived from the ledger and survive a reload', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dshmem-'))
+  const store = createMemoryStore({ root, now: () => 1 })
+  await store.load()
+  assert.equal(store.observedCount('sig'), 0)
+  store.noteObserved('sig')
+  await store.ledger({ kind: 'observed', id: 'sig' })
+  // A judgement outcome for the same signature must not be counted twice.
+  await store.ledger({ kind: 'skip', reason: 'below-min-remember', id: 'sig' })
+  await store.flush()
+
+  const reopened = createMemoryStore({ root, now: () => 1 })
+  await reopened.load()
+  assert.equal(reopened.observedCount('sig'), 1)
+  assert.equal(reopened.observedCount('other'), 0)
 })
 
 test('normalizeRecord tolerates a hand-edited file', () => {

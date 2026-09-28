@@ -145,6 +145,12 @@ export function createJudge({ config, jev, log = () => {} }: { config: JudgeConf
    */
   async function jevReady(): Promise<boolean> {
     if (mode === 'off' || !jev) return false
+    // An explicit mode is not a preference to be second-guessed: `heuristic` means
+    // heuristic even when a key is sitting right there. Only `auto` consults the
+    // port. (Dropping this branch was a real bug: the plugin called the model while
+    // configured for the offline judge, which a test caught as an unexpected
+    // network round trip inside an "offline" run.)
+    if (mode === 'heuristic') return false
     if (mode === 'jev') return true
     try {
       return await jev.isAvailable()
