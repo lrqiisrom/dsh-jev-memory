@@ -61,7 +61,8 @@ dsh plugin --profile web add /absolute/path/to/dsh-jev-memory
         minImportance: 0.6                       # 确定性写入阈值
         minRemember: 0.6                         # Jev 的"值得记吗"阈值
         askOnConflict: true                      # 发现矛盾时问你一句（HITL）
-        askOnConflictTimeoutMs: 120000           # 等你回答的预算，超时先压着不注入
+        askOnConflictTimeoutMs: 600000           # 等你回答的预算（10 分钟）
+        askOnConflictMaxAttempts: 3              # 超时后在下一次对话开始前重问，最多几次
         repeatFailuresToWrite: 2                 # 同一个错重复几次才算"坑"
         writeSkipSubagents: true                 # 见下方"实测发现"
         writeTimeoutMs: 2500                     # 回合收尾的写入预算，超时放弃

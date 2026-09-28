@@ -36,6 +36,8 @@ interface Captured {
   asked: Array<{ questions: AskQuestionItem[]; agent?: unknown }>
   /** labels the fake human replies with, when a test wires an answerer. */
   askAnswer?: string[]
+  /** one entry per question, for tests that need the first answer to be missing. */
+  askAnswers?: string[][]
 }
 
 /**
@@ -64,18 +66,23 @@ function fakeContext(): { ctx: PluginContext; captured: Captured } {
       if (names.includes('credentials') && captured.credentialValue !== undefined) {
         scope.credentials = { resolve: async () => ({ value: captured.credentialValue as string, source: 'file' }) }
       }
-      if (names.includes('userQuestions') && captured.askAnswer !== undefined) {
+      if (names.includes('userQuestions') && (captured.askAnswer !== undefined || captured.askAnswers !== undefined)) {
         scope.userQuestions = {
           ask: async (request) => {
             captured.asked.push({ questions: request.questions, agent: request.agent })
-            return { answers: [{ id: request.questions[0]?.id ?? 'q', selected: captured.askAnswer as string[] }] }
+            const selected = captured.askAnswers?.shift() ?? captured.askAnswer ?? []
+            // An empty selection is how the harness reports "nobody answered": the
+            // plugin must read that as unanswered, not as "keep both".
+            return { answers: selected.length > 0 ? [{ id: request.questions[0]?.id ?? 'q', selected }] : [] }
           },
         }
       }
       callback(scope)
     },
     on: (event, handler) => {
-      captured.listeners.set(event, handler)
+      // Stored with the same two-parameter shape the plugin registers: a waterfall
+      // listener needs `next`, and dropping it here would hide that contract.
+      captured.listeners.set(event, (payload) => handler(payload, async () => undefined))
       return () => {}
     },
     tools: {
@@ -360,6 +367,27 @@ async function settle(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 50))
 }
 
+/**
+ * A network stub for the two requests the plugin makes about a conflict.
+ *
+ * The second one is the *pairing* request: answering it with the first request's
+ * shape (as a naive stub does) is exactly how this test caught that pairing now
+ * costs a round trip — the plugin got no partner, said nothing, and the question
+ * never appeared.
+ */
+function jevStub(): typeof fetch {
+  return (async (_url: string, init?: { body?: unknown }) => {
+    const body = JSON.parse(String(init?.body ?? '{}'))
+    if (body?.questions?.partner) {
+      return new Response(
+        JSON.stringify({ model: 'jev-1.13.0', answers: { partner: { type: 'choice', choice: 'm0', confidence: 0.9 } } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    return jevConflictResponse()
+  }) as unknown as typeof fetch
+}
+
 /** A canned Jev answer: worth remembering, a constraint, and a suspected conflict. */
 function jevConflictResponse(): Response {
   return new Response(
@@ -399,7 +427,7 @@ const CONFLICTING_TURN: TurnEvent[] = [
  */
 test('a suspected conflict is put to the human and the answer decides', async () => {
   const realFetch = globalThis.fetch
-  globalThis.fetch = (async () => jevConflictResponse()) as unknown as typeof fetch
+  globalThis.fetch = jevStub()
   try {
     const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } }, undefined, (c) => {
       c.askAnswer = [CONFLICT_CHOICES.replace]
@@ -432,6 +460,7 @@ test('a suspected conflict is put to the human and the answer decides', async ()
     const ledger = await readFile(join(root, 'ledger.jsonl'), 'utf8')
     assert.match(ledger, /"kind":"conflict-ask"/)
     assert.match(ledger, /"kind":"conflict-resolved".*"choice":"replace"/)
+    assert.match(ledger, /"kind":"conflict-ask".*"via":"jev"/)
   } finally {
     globalThis.fetch = realFetch
   }
@@ -439,7 +468,7 @@ test('a suspected conflict is put to the human and the answer decides', async ()
 
 test('keeping the older memory drops the new one instead', async () => {
   const realFetch = globalThis.fetch
-  globalThis.fetch = (async () => jevConflictResponse()) as unknown as typeof fetch
+  globalThis.fetch = jevStub()
   try {
     const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } }, undefined, (c) => {
       c.askAnswer = [CONFLICT_CHOICES['keep-old']]
@@ -470,7 +499,7 @@ test('keeping the older memory drops the new one instead', async () => {
 // the fail-open direction is "keep less", never "assume".
 test('an unanswered conflict leaves the new memory withheld', async () => {
   const realFetch = globalThis.fetch
-  globalThis.fetch = (async () => jevConflictResponse()) as unknown as typeof fetch
+  globalThis.fetch = jevStub()
   try {
     const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } })
     const session = fakeSession({ events: [] })
@@ -521,4 +550,117 @@ test('a one-off tool failure is not remembered, a repeated one is', async () => 
 
   await handler({ agent: { id: 's1', session: fakeSession({ events: failure(2) }) }, turn: 2, signal: undefined })
   assert.equal((await search.execute({ query: 'EPERM' }, { agent: { session } })).matches.length, 1, 'the repeat is remembered')
+})
+
+// The timeout is large on purpose, and a missed question is resumed rather than
+// lost: the next turn's first step re-asks it, when the user is present by
+// definition. Bounded, so an ignored question eventually stops asking.
+test('an unanswered conflict is re-asked at the start of the next turn', async () => {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = jevStub()
+  try {
+    const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } }, undefined, (c) => {
+      // first question gets no answer; the retry gets one
+      c.askAnswers = [[], [CONFLICT_CHOICES.replace]]
+    })
+    const session = fakeSession({ events: [] })
+    await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+      { text: '可以随便改 data/ 目录下的文件', type: 'constraint' },
+      { agent: { session } },
+    )
+    const startTurn: TurnStoppingPayload = { agent: { session: fakeSession({ events: CONFLICTING_TURN }) }, turn: 1, signal: undefined }
+    await listenerFor(captured, 'agent/turn-stopping')(startTurn)
+    assert.equal(captured.asked.length, 1, 'asked once at turn end')
+
+    // Still withheld: nothing was decided yet.
+    const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+    assert.equal((await search.execute({ query: 'data' }, { agent: { session } })).matches.length, 2)
+
+    const preStep = listenerFor(captured, 'agent/pre-step')
+    await preStep({ agent: { session }, step: 1, signal: undefined })
+    assert.equal(captured.asked.length, 2, 'the next turn resumes the question')
+
+    await settle()
+    const found = await search.execute({ query: 'data' }, { agent: { session } })
+    assert.equal(found.matches.length, 1, 'the resumed answer resolved it')
+    assert.match(found.matches[0].text, /不要改动/)
+    assert.match(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /"attempt":2/)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test('a conflict nobody can be paired with is recorded instead of vanishing', async () => {
+  const realFetch = globalThis.fetch
+  // The judge raises a conflict, then explicitly names no partner.
+  globalThis.fetch = (async (_url: string, init?: { body?: unknown }) => {
+    const body = JSON.parse(String(init?.body ?? '{}'))
+    if (body?.questions?.partner) {
+      return new Response(
+        JSON.stringify({ model: 'jev-1.13.0', answers: { partner: { type: 'choice', choice: 'none-of-the-above', confidence: 0.9 } } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    return jevConflictResponse()
+  }) as unknown as typeof fetch
+  try {
+    const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } }, undefined, (c) => {
+      c.askAnswer = [CONFLICT_CHOICES.replace]
+    })
+    const session = fakeSession({ events: [] })
+    await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+      { text: '可以随便改 data/ 目录下的文件', type: 'constraint' },
+      { agent: { session } },
+    )
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: CONFLICTING_TURN }) },
+      turn: 1,
+      signal: undefined,
+    })
+    assert.equal(captured.asked.length, 0, 'naming no partner must not produce a question')
+    await settle()
+    assert.match(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /"reason":"conflict-unpaired"/)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test('pairing falls back to lexical overlap when the model cannot answer', async () => {
+  const realFetch = globalThis.fetch
+  let partnerCalls = 0
+  globalThis.fetch = (async (_url: string, init?: { body?: unknown }) => {
+    const body = JSON.parse(String(init?.body ?? '{}'))
+    if (body?.questions?.partner) {
+      partnerCalls += 1
+      return new Response('upstream failed', { status: 500 })
+    }
+    return jevConflictResponse()
+  }) as unknown as typeof fetch
+  try {
+    const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } }, undefined, (c) => {
+      c.askAnswer = [CONFLICT_CHOICES['keep-both']]
+    })
+    const session = fakeSession({ events: [] })
+    await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+      { text: '可以随便改 data/ 目录下的文件', type: 'constraint' },
+      { agent: { session } },
+    )
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: CONFLICTING_TURN }) },
+      turn: 1,
+      signal: undefined,
+    })
+    assert.equal(partnerCalls >= 1, true, 'the model is asked first')
+    assert.equal(captured.asked.length, 1, 'a failed pairing still lets the human decide')
+    await settle()
+    // Both survive, and the ledger says the pairing came from overlap, not the model.
+    const found = await toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search').execute(
+      { query: 'data' },
+      { agent: { session } },
+    )
+    assert.equal(found.matches.length, 2)
+    assert.match(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /"via":"overlap"/)
+  } finally {
+    globalThis.fetch = realFetch
+  }
 })

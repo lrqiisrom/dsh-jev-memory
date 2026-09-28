@@ -58,7 +58,7 @@ test('judge auto mode picks up a credential that appears after mount', async () 
   const judge = createJudge({
     config: { judge: 'auto', types: ['constraint'] },
     jev: {
-      isAvailable: async () => available,
+      isAvailable: async () => available, choosePartner: async () => ({ index: null, confidence: null, model: null }),
       decide: async () => ({
         model: 'jev-1.13.0',
         rows: [{ key: 'k', type: 'constraint', importance: 0.9, remember: 0.9, conflict: 'no', confidence: 0.9 }],
@@ -77,6 +77,7 @@ test('an unavailable credential service never breaks a judgement', async () => {
       isAvailable: async () => {
         throw new Error('no service')
       },
+      choosePartner: async () => ({ index: null, confidence: null, model: null }),
       decide: async () => {
         throw new Error('must not be called')
       },

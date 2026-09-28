@@ -48,7 +48,7 @@ import { applyGate, createJudge, JUDGE_MODES, type Judgement } from './lib/judge
 import { createJevClient, JEV_DEFAULTS } from './lib/jev.ts'
 import { DEFAULT_QUOTA, inScope, renderRecall, searchMemories, selectMemories } from './lib/recall.ts'
 import { signatureOf } from './lib/signals.ts'
-import { createMemoryStore, MEMORY_TYPES } from './lib/store.ts'
+import { createMemoryStore, MEMORY_TYPES, type MemoryRecord } from './lib/store.ts'
 import { estimateTokens, excerpt } from './lib/text.ts'
 import type { Candidate, ExtractOptions, TurnEvent } from './lib/extract.ts'
 import type { Judge } from './lib/judge.ts'
@@ -95,7 +95,12 @@ export interface TurnStoppingPayload {
   agent?: AgentLike | null
   turn?: number
   signal?: AbortSignal
+  /** present on `agent/pre-step`, which is also how that event is told apart. */
+  step?: number
 }
+
+/** The continuation a waterfall listener must call. */
+export type NextCallback = () => Promise<unknown>
 
 /** What the prompt assembler passes to a context callback (synchronously). */
 export interface AssembleContext {
@@ -188,7 +193,7 @@ export interface UserQuestionsService {
 export interface PluginContext {
   logger?: Logger
   inject(names: string[], callback: (scope: InjectedScope) => void): unknown
-  on(event: string, handler: (payload: TurnStoppingPayload) => unknown): unknown
+  on(event: string, handler: (payload: TurnStoppingPayload, next: NextCallback) => unknown): unknown
   tools: ToolRegistry
   effect(factory: () => () => void): unknown
   /** optional service lookup; absent members are the caller's problem, not a failure. */
@@ -221,6 +226,8 @@ export interface PluginConfig {
   askOnConflict: boolean
   /** how long to wait for that answer before leaving the record in `needs-review`. */
   askOnConflictTimeoutMs: number
+  /** how many times one unresolved conflict may be asked about, in total. */
+  askOnConflictMaxAttempts: number
   /** how many times a tool failure must repeat before it is worth remembering at all. */
   repeatFailuresToWrite: number
   writeEnabled: boolean
@@ -293,14 +300,24 @@ interface TurnWriteOutcome {
   model?: string | null
   degraded?: string | null
   /** conflicts the judge raised, paired with the record they contradict. */
-  pendingConflicts?: PendingConflict[]
+  pendingConflicts?: ConflictAsk[]
 }
 
 /** One suspected contradiction, waiting for a human's answer. */
-interface PendingConflict {
-  candidate: Candidate
-  judgement: Judgement
+/**
+ * One suspected contradiction, ready to be put to the human.
+ *
+ * Deliberately not the raw candidate: the retry path resumes from a *stored
+ * record* (whose original candidate object is long gone), so both paths describe
+ * the question in the same small shape.
+ */
+interface ConflictAsk {
+  incomingId: string
   pair: ConflictPair
+  /** how the partner was chosen: `jev` (the model picked) or `overlap` (lexical). */
+  via: 'jev' | 'overlap'
+  /** which judge raised the conflict, for the ledger. */
+  by: string
 }
 
 /**
@@ -326,7 +343,7 @@ export const name = 'jev-memory'
  * process using the code I just edited?" is answerable from the ledger alone —
  * a hot-reloaded module and a cached one otherwise look identical.
  */
-export const version = '0.5.0'
+export const version = '0.6.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -364,11 +381,20 @@ export const DEFAULT_CONFIG: PluginConfig = {
   /**
    * Budget for that answer, in milliseconds.
    *
-   * Two minutes: long enough that a present user is never cut off, short enough
-   * that a session whose user walked away resumes instead of hanging forever.
-   * On expiry the record simply stays `needs-review` — withheld, not lost.
+   * Ten minutes: long enough that a present user is never cut off mid-thought,
+   * short enough that a session whose user walked away resumes instead of hanging.
+   * Expiry is not the end of the question — the record stays `needs-review` and is
+   * re-asked at the start of the next turn (see `askOnConflictMaxAttempts`).
    */
-  askOnConflictTimeoutMs: 120_000,
+  askOnConflictTimeoutMs: 600_000,
+  /**
+   * How many times one unresolved conflict may be put to the human.
+   *
+   * The retry is what makes a long first timeout safe: a missed question is
+   * resumed rather than lost. The bound is what keeps it from becoming nagging —
+   * after the last attempt the record simply stays withheld.
+   */
+  askOnConflictMaxAttempts: 3,
   /**
    * How many times a tool failure must be seen before it counts as a pitfall.
    *
@@ -468,6 +494,7 @@ export function resolveConfig(raw: unknown): { config: PluginConfig; problems: s
     'knownForConflict',
     'contextOrder',
     'askOnConflictTimeoutMs',
+    'askOnConflictMaxAttempts',
     'repeatFailuresToWrite',
   ] as const) {
     if (!Number.isFinite(config[field])) {
@@ -678,6 +705,151 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   // person and is therefore slow on purpose: it gets its own budget, and on
   // expiry the record simply stays withheld rather than being guessed at.
   // ---------------------------------------------------------------------------
+  /**
+   * Put one suspected contradiction to the human and apply the answer.
+   *
+   * Everything here is written to the ledger *before* the outcome is known, so
+   * the audit trail shows the question even when nobody answers — that record is
+   * what makes "how often was the judge right about conflicts?" answerable.
+   *
+   * @param pending - the contradiction to ask about.
+   * @param owner - the live agent the question belongs to.
+   * @param abort - the turn's abort signal.
+   * @returns nothing.
+   */
+  async function askAboutConflict(ask: ConflictAsk, owner: AgentLike | null | undefined, abort: AbortSignal | undefined): Promise<void> {
+    const incoming = ask.incomingId
+    const existing = ask.pair.existing.id
+    const service = userQuestionsOf()
+    store.noteAsked(incoming)
+    void store.ledger({
+      kind: 'conflict-ask',
+      id: incoming,
+      with: existing,
+      attempt: store.askedCount(incoming),
+      via: ask.via,
+      score: Number(ask.pair.score.toFixed(3)),
+      shared: ask.pair.shared.slice(0, 8),
+      by: ask.by,
+    })
+    if (service === undefined) {
+      void store.ledger({ kind: 'conflict-resolved', id: incoming, with: existing, choice: 'unanswered', reason: 'no-answerer' })
+      return
+    }
+
+    const question = buildConflictQuestion(ask.pair, incoming)
+    log('info', `asking which side of a suspected conflict wins (${incoming} vs ${existing})`)
+    const answer = await service.ask({ questions: [question], agent: owner, signal: abort })
+    const choice = choiceFromAnswer(answer?.answers?.[0])
+    if (choice === null) {
+      void store.ledger({ kind: 'conflict-resolved', id: incoming, with: existing, choice: 'unanswered', reason: 'no-selection' })
+      return
+    }
+
+    if (choice === 'keep-old') {
+      await store.remove(incoming)
+      void store.ledger({ kind: 'conflict-resolved', id: incoming, with: existing, choice })
+      log('info', 'conflict resolved: kept the earlier memory, dropped the new one')
+      return
+    }
+
+    // `superseded` rather than deleted: the old record stays auditable, and a
+    // human who changes their mind can see what the previous statement was.
+    if (choice === 'replace') await store.remove(existing)
+    const record = store.get(incoming)
+    if (record) await store.put({ ...record, status: 'active', updatedAt: Date.now() })
+    void store.ledger({
+      kind: 'conflict-resolved',
+      id: incoming,
+      with: existing,
+      choice,
+      superseded: choice === 'replace' ? existing : null,
+    })
+    log('info', `conflict resolved by the user: ${choice}`)
+  }
+
+  /**
+   * Resume a question the human did not answer in time.
+   *
+   * Runs at the start of the next turn, before the model's first step: the user
+   * is present by definition (they just typed), which is exactly what the
+   * turn-end timeout could not assume. Bounded by `askOnConflictMaxAttempts`, so
+   * an ignored question eventually stops asking instead of nagging.
+   *
+   * @param owner - the live agent whose turn is starting.
+   * @param abort - that turn's abort signal.
+   * @returns nothing.
+   */
+  async function retryPendingConflict(owner: AgentLike | null | undefined, abort: AbortSignal | undefined): Promise<void> {
+    const header = owner?.session?.header
+    if (config.writeSkipSubagents && (header?.delegationDepth ?? 0) > 0) return
+    const cwd = header?.cwd ?? null
+    const records = store.all()
+    const pending = records.find(
+      (record) =>
+        record.status === 'needs-review' &&
+        record.judge.conflict === 'yes' &&
+        inScope(record, cwd) &&
+        // asked at least once (the turn-end path already tried) but not too often
+        store.askedCount(record.id) > 0 &&
+        store.askedCount(record.id) < config.askOnConflictMaxAttempts,
+    )
+    if (!pending) return
+    const partners = records.filter((record) => record.status === 'active' && inScope(record, cwd))
+    const paired = await pairConflict(pending.text, partners, cwd, abort)
+    if (!paired) {
+      void store.ledger({ kind: 'conflict-resolved', id: pending.id, choice: 'unanswered', reason: 'no-partner-on-retry' })
+      return
+    }
+    await askAboutConflict({ incomingId: pending.id, pair: paired.pair, via: paired.via, by: pending.judge.kind }, owner, abort)
+  }
+
+  /**
+   * Choose which existing memory an incoming one contradicts.
+   *
+   * Two levels on purpose. The model already said *that* a conflict exists, so it
+   * is the right party to ask *which* one — lexical overlap cannot see through a
+   * paraphrase ("data 下的文件别碰" vs "不要改动 data/ 目录"). But the model can be
+   * unavailable, and a question that cannot name the other side is unanswerable, so
+   * the deterministic pairing stays as the floor rather than being replaced.
+   *
+   * @param incoming - the new memory's text.
+   * @param partners - the active memories in scope.
+   * @param cwd - the workspace, forwarded as framing.
+   * @param signal - the turn's abort signal.
+   * @returns the pairing plus how it was chosen, or null when nothing can be named.
+   */
+  async function pairConflict(
+    incoming: string,
+    partners: readonly MemoryRecord[],
+    cwd: string | null,
+    signal: AbortSignal | undefined,
+  ): Promise<{ pair: ConflictPair; via: 'jev' | 'overlap' } | null> {
+    if (partners.length === 0) return null
+
+    const known = partners.slice(0, config.knownForConflict)
+    const picked = await judge.choosePartner(
+      incoming,
+      known.map((record) => record.text),
+      { project: cwd, signal },
+    )
+    if (picked) {
+      // Asked, and the model named none of them. That is an answer, not a failure:
+      // guessing a partner afterwards would put words in its mouth.
+      if (picked.index === null) return null
+      const chosen = known[picked.index]
+      if (chosen) {
+        // Score the model's pick with the same lexical measure anyway: it costs
+        // nothing and makes a mismatched pairing visible in the ledger.
+        const lexical = findConflictPartner(incoming, [chosen], 0)
+        return { pair: lexical ?? { incoming, existing: chosen, score: 0, shared: [] }, via: 'jev' }
+      }
+    }
+
+    const fallback = findConflictPartner(incoming, partners)
+    return fallback ? { pair: fallback, via: 'overlap' } : null
+  }
+
   ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => {
     if (!config.writeEnabled || !ready) return
     const turnHeader = agent?.session?.header
@@ -686,7 +858,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       return
     }
 
-    let pending: PendingConflict[] = []
+    let pending: ConflictAsk[] = []
     try {
       const outcome = await withDeadline(handleTurn(), config.writeTimeoutMs)
       pending = outcome?.pendingConflicts ?? []
@@ -703,7 +875,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         await withDeadline(askAboutConflict(pending[0], agent, signal), config.askOnConflictTimeoutMs)
       } catch (error) {
         log('warn', `conflict question left unanswered (fail-open): ${String(error)}`)
-        void store.ledger({ kind: 'conflict-resolved', id: pending[0].candidate.key, choice: 'unanswered', error: String(error) })
+        void store.ledger({ kind: 'conflict-resolved', id: pending[0].incomingId, choice: 'unanswered', error: String(error) })
       }
     }
 
@@ -768,7 +940,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         void store.ledger({ kind: 'degraded', reason: 'jev-missing-row', count: unanswered, cwd })
       }
       let written = 0
-      const pendingConflicts: PendingConflict[] = []
+      const pendingConflicts: ConflictAsk[] = []
       for (const candidate of fresh) {
         const judgement = rows.find((row) => row.key === candidate.key)
         const gate = applyGate(judgement, config)
@@ -791,11 +963,22 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         // system exactly where it is today — the record exists, and it is withheld
         // from recall — instead of losing what the user said.
         if (gate.review && config.askOnConflict && pendingConflicts.length === 0) {
-          const partner = findConflictPartner(
-            candidate.text,
-            store.all().filter((record) => record.status === 'active' && inScope(record, cwd)),
-          )
-          if (partner) pendingConflicts.push({ candidate, judgement, pair: partner })
+          const partners = store.all().filter((record) => record.status === 'active' && inScope(record, cwd))
+          const paired = await pairConflict(candidate.text, partners, cwd, signal)
+          if (paired) {
+            pendingConflicts.push({ incomingId: candidate.key, pair: paired.pair, via: paired.via, by: judgement.by })
+          } else {
+            // A raised conflict nobody can be asked about is still a fact worth
+            // recording: without this line the memory silently disappears from
+            // recall and the ledger says nothing about why.
+            void store.ledger({
+              kind: 'skip',
+              reason: 'conflict-unpaired',
+              id: candidate.key,
+              by: judgement.by,
+              quote: excerpt(candidate.quote, 120),
+            })
+          }
         }
         const now = Date.now()
         await store.put({
@@ -832,65 +1015,26 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       return { written, candidates: candidates.length, duplicates: candidates.length - fresh.length, model, degraded, pendingConflicts }
     }
 
-    /**
-     * Put one suspected contradiction to the human and apply the answer.
-     *
-     * Everything here is written to the ledger *before* the outcome is known, so
-     * the audit trail shows the question even when nobody answers — that record is
-     * what makes "how often was the judge right about conflicts?" answerable.
-     *
-     * @param pending - the contradiction to ask about.
-     * @param owner - the live agent the question belongs to.
-     * @param abort - the turn's abort signal.
-     * @returns nothing.
-     */
-    async function askAboutConflict(pending: PendingConflict, owner: AgentLike | null | undefined, abort: AbortSignal | undefined): Promise<void> {
-      const incoming = pending.candidate.key
-      const existing = pending.pair.existing.id
-      const service = userQuestionsOf()
-      void store.ledger({
-        kind: 'conflict-ask',
-        id: incoming,
-        with: existing,
-        score: Number(pending.pair.score.toFixed(3)),
-        shared: pending.pair.shared.slice(0, 8),
-        by: pending.judgement.by,
-      })
-      if (service === undefined) {
-        void store.ledger({ kind: 'conflict-resolved', id: incoming, with: existing, choice: 'unanswered', reason: 'no-answerer' })
-        return
-      }
+  })
 
-      const question = buildConflictQuestion(pending.pair, incoming)
-      log('info', `asking which side of a suspected conflict wins (${incoming} vs ${existing})`)
-      const answer = await service.ask({ questions: [question], agent: owner, signal: abort })
-      const choice = choiceFromAnswer(answer?.answers?.[0])
-      if (choice === null) {
-        void store.ledger({ kind: 'conflict-resolved', id: incoming, with: existing, choice: 'unanswered', reason: 'no-selection' })
-        return
+  // ---------------------------------------------------------------------------
+  // Retry: resume a question the human did not answer before its budget expired.
+  //
+  // `agent/pre-step` is a waterfall, so it must call `next()`; the ask happens in
+  // between, which is precisely "before this turn's first step" — the user is
+  // present by definition, having just sent the message, which is the assumption
+  // the turn-end timeout could not make. Fail-open in every direction: a broken
+  // retry must never stop a turn from starting.
+  // ---------------------------------------------------------------------------
+  ctx.on('agent/pre-step', async (payload, next) => {
+    try {
+      if (config.askOnConflict && ready && (payload?.step ?? 1) === 1) {
+        await withDeadline(retryPendingConflict(payload.agent, payload.signal), config.askOnConflictTimeoutMs)
       }
-
-      if (choice === 'keep-old') {
-        await store.remove(incoming)
-        void store.ledger({ kind: 'conflict-resolved', id: incoming, with: existing, choice })
-        log('info', 'conflict resolved: kept the earlier memory, dropped the new one')
-        return
-      }
-
-      // `superseded` rather than deleted: the old record stays auditable, and a
-      // human who changes their mind can see what the previous statement was.
-      if (choice === 'replace') await store.remove(existing)
-      const record = store.get(incoming)
-      if (record) await store.put({ ...record, status: 'active', updatedAt: Date.now() })
-      void store.ledger({
-        kind: 'conflict-resolved',
-        id: incoming,
-        with: existing,
-        choice,
-        superseded: choice === 'replace' ? existing : null,
-      })
-      log('info', `conflict resolved by the user: ${choice}`)
+    } catch (error) {
+      log('warn', `conflict retry skipped (fail-open): ${String(error)}`)
     }
+    return next()
   })
 
   // ---------------------------------------------------------------------------

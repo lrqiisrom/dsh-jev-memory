@@ -26,7 +26,7 @@
 
 import { clamp01 } from './store.ts'
 import { MEMORY_TYPES } from './store.ts'
-import type { JevCandidate, JevDecideRequest, JevDecideResult, JevRow } from './jev.ts'
+import type { JevCandidate, JevDecideRequest, JevDecideResult, JevPartnerRequest, JevPartnerResult, JevRow } from './jev.ts'
 
 /** Host logger signature, repeated per module so no module imports another for it. */
 export type LogSink = (level: string, message: string, detail?: unknown) => void
@@ -90,6 +90,8 @@ export interface JudgeModelPort {
   /** asked per judgement call, so a credential added later takes effect next turn. */
   isAvailable(): Promise<boolean>
   decide(request: JevDecideRequest): Promise<JevDecideResult | JevRow[]>
+  /** which known memory a new one contradicts; see `Judge.choosePartner`. */
+  choosePartner(request: JevPartnerRequest): Promise<JevPartnerResult>
 }
 
 /** The judge handle the plugin mounts. */
@@ -98,6 +100,19 @@ export interface Judge {
   kind: string
   heuristics(candidates: JevCandidate[]): Judgement[]
   judge(candidates: JevCandidate[], context?: JudgeContext): Promise<JudgeResult>
+  /**
+   * Ask which known memory an incoming one contradicts.
+   *
+   * `null` means the judge could not answer at all (offline judge, or the call
+   * failed) and the caller should fall back to its deterministic pairing. An
+   * answer with `index: null` means the model *was* asked and named none of them —
+   * a different fact, and one the caller must not paper over with a guess.
+   */
+  choosePartner(
+    incoming: string,
+    known: string[],
+    context?: JudgeContext,
+  ): Promise<{ index: number | null; confidence: number | null; via: 'jev' } | null>
 }
 
 /** The judgement fields the write gate reads. */
@@ -222,6 +237,25 @@ export function createJudge({ config, jev, log = () => {} }: { config: JudgeConf
           model: null,
           degraded: 'jev-failed',
         }
+      }
+    },
+    async choosePartner(incoming, known, context = {}) {
+      if (known.length === 0) return null
+      if (!(await jevReady())) return null
+      try {
+        const result = await jev!.choosePartner({
+          incoming,
+          known,
+          project: context.project ?? null,
+          timeoutMs: config.judgeTimeoutMs,
+          signal: context.signal,
+        })
+        return { index: result.index, confidence: result.confidence, via: 'jev' }
+      } catch (error) {
+        // Falling back to the lexical pairing keeps the question askable; losing it
+        // would mean silently withholding a memory the user could have resolved.
+        log('warn', 'partner choice failed; falling back to lexical pairing', { error: String(error) })
+        return null
       }
     },
   }

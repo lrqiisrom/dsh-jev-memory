@@ -142,6 +142,27 @@ export interface JevDecideResult {
   model: string | null
 }
 
+/** Input for {@link JevClient.choosePartner}. */
+export interface JevPartnerRequest {
+  /** the incoming memory's text. */
+  incoming: string
+  /** the known memories to choose from, in the caller's order. */
+  known: string[]
+  /** the workspace, as framing. */
+  project?: string | null
+  timeoutMs?: number
+  signal?: AbortSignal
+}
+
+/** Which known memory the model picked, or an explicit "none of them". */
+export interface JevPartnerResult {
+  /** index into the request's `known`, or null for `none-of-the-above`. */
+  index: number | null
+  /** the model's confidence in that choice, when it reported one. */
+  confidence: number | null
+  model: string | null
+}
+
 /** One typed question in the request body. */
 export interface JevQuestion {
   type: string
@@ -190,6 +211,14 @@ export interface JevClient {
   isAvailable(): Promise<boolean>
   /** readiness plus the layer the key came from (`credentials` / `config` / `env` / `none`). */
   describe(): Promise<{ ready: boolean; source: string; endpoint: string }>
+  /**
+   * Ask which known memory a new one contradicts.
+   *
+   * A second, small request, issued only when the first one already said a
+   * conflict exists — because "something conflicts" is not something a human can
+   * answer unless the plugin can name the other side.
+   */
+  choosePartner(request: JevPartnerRequest): Promise<JevPartnerResult>
   endpoint: string
   decide(request: JevDecideRequest): Promise<JevDecideResult>
 }
@@ -328,6 +357,68 @@ export function createJevClient({
           conflictThreshold: settings.conflictThreshold,
           importanceLevels: settings.importanceLevels.length,
         }),
+        model: typeof json?.model === 'string' ? json.model : null,
+      }
+    },
+    /**
+     * Ask which of the known memories the incoming one contradicts.
+     *
+     * One `choice` question, one label per known memory — deliberately short
+     * labels (`m0`, `m1`) carrying the text in the criteria *descriptions*, so the
+     * answer stays a token the plugin can map back without trusting the model to
+     * echo a sentence. `none-of-the-above` is always present: official guidance,
+     * and here it also means "I cannot honestly name the other side".
+     *
+     * @param request - the incoming text and the candidates to choose from.
+     * @returns the chosen index (or null), its confidence, and the responding model.
+     */
+    async choosePartner(request: JevPartnerRequest): Promise<JevPartnerResult> {
+      const apiKey = (await resolveKey()).key
+      if (!apiKey) throw new Error('jev is not configured')
+      const known = (request.known ?? []).slice(0, settings.maxKnown)
+      if (known.length === 0) return { index: null, confidence: null, model: null }
+
+      const criteria: Record<string, string> = {}
+      known.forEach((text, index) => {
+        criteria[`m${index}`] = text
+      })
+      criteria['none-of-the-above'] = '与以上任何一条都不冲突'
+      const body: JevRequestBody = {
+        state: { memory_system: MEMORY_CONTEXT, project: request.project ?? null, known_memories: known },
+        model: settings.model,
+        questions: {
+          partner: {
+            type: 'choice',
+            instructions: {
+              incoming: request.incoming,
+              question: '新记下的 `incoming` 与 `known_memories` 里的**哪一条**互相矛盾（同一件事说法不同）？只选真正矛盾的那一条；不确定就选 none-of-the-above。',
+            },
+            criteria,
+          },
+        },
+      }
+
+      const response = await postWithRetry({
+        url: endpoint,
+        apiKey,
+        body,
+        timeoutMs: typeof request.timeoutMs === 'number' && Number.isFinite(request.timeoutMs) ? request.timeoutMs : settings.timeoutMs,
+        maxRetries: settings.maxRetries,
+        retryStatuses: settings.retryStatuses,
+        fetchImpl,
+        signal: request.signal,
+        log,
+      })
+
+      const json = asRecord(response.json)
+      const answer = asRecord(asRecord(json?.answers)?.partner)
+      const label = typeof answer?.choice === 'string' ? answer.choice : null
+      const confidence = typeof answer?.confidence === 'number' ? clamp01(answer.confidence) : null
+      const matched = label ? /^m(\d+)$/u.exec(label) : null
+      const index = matched ? Number(matched[1]) : null
+      return {
+        index: index !== null && index < known.length ? index : null,
+        confidence,
         model: typeof json?.model === 'string' ? json.model : null,
       }
     },

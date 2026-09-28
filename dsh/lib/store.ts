@@ -175,6 +175,15 @@ export class MemoryStore {
    * source of truth that could disagree with the audit trail.
    */
   #observed = new Map<string, number>()
+  /**
+   * How many times each conflict question has been put to the human.
+   *
+   * Same derivation, same reason: the retry-after-a-timeout path needs to know
+   * whether it already asked, and the ledger already says so. Without a bound the
+   * plugin would re-ask the same unresolved question forever, which turns a
+   * helpful prompt into nagging.
+   */
+  #asked = new Map<string, number>()
   #loaded = false
   #flushCount = 0
 
@@ -255,9 +264,15 @@ export class MemoryStore {
           // happens to carry an id would double-count one sighting — the hook logs
           // the observation and then the judgement outcome for the same signature —
           // and "seen twice" would quietly become "seen once".
-          if (parsed?.kind !== 'observed') continue
-          const id = parsed.id
-          if (typeof id === 'string' && id !== '') this.#observed.set(id, (this.#observed.get(id) ?? 0) + 1)
+          if (parsed?.kind === 'observed') {
+            const id = parsed.id
+            if (typeof id === 'string' && id !== '') this.#observed.set(id, (this.#observed.get(id) ?? 0) + 1)
+            continue
+          }
+          if (parsed?.kind === 'conflict-ask') {
+            const id = parsed.id
+            if (typeof id === 'string' && id !== '') this.#asked.set(id, (this.#asked.get(id) ?? 0) + 1)
+          }
         } catch {
           /* one unreadable line must not lose the rest of the counts */
         }
@@ -285,6 +300,30 @@ export class MemoryStore {
    */
   noteObserved(id: string): void {
     this.#observed.set(id, (this.#observed.get(id) ?? 0) + 1)
+  }
+
+  /**
+   * How many times a conflict question was already asked about this record.
+   *
+   * @param id - the incoming record's id.
+   * @returns the recorded ask count, or 0.
+   */
+  askedCount(id: string): number {
+    return this.#asked.get(id) ?? 0
+  }
+
+  /**
+   * Record that a conflict question was just asked.
+   *
+   * The ledger line is written anyway, but the in-memory count has to move at the
+   * same moment — otherwise a retry in the same process would read 0 and refuse to
+   * resume the very question it just asked.
+   *
+   * @param id - the incoming record's id.
+   * @returns nothing.
+   */
+  noteAsked(id: string): void {
+    this.#asked.set(id, (this.#asked.get(id) ?? 0) + 1)
   }
 
   /** @returns every live record, newest first. */
