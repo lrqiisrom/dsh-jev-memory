@@ -50,9 +50,31 @@ export interface JevSettings {
   retryStatuses: number[]
   conflictThreshold: number
   importanceLevels: string[]
+  /**
+   * The "is this worth remembering at all" question, verbatim.
+   *
+   * Overridable because the wording is a hypothesis that can be measured: the first
+   * version asked whether the sentence is "用户对项目的说法或偏好（不是这一次任务的
+   * 操作指令）", and the model answered correctly — it refused imperative sentences.
+   * But that judges the *form* of the sentence rather than the lifetime of the rule, so
+   * standing preferences phrased as commands ("我要求你说设计是怎么设计的…就说流程
+   * 就行了", scored 0.14) were refused along with genuine one-off instructions.
+   */
+  rememberQuestion: string
   maxCandidates: number
   maxKnown: number
 }
+
+/**
+ * What the model is asked when deciding whether a sentence belongs in memory.
+ *
+ * The distinction the wording has to carry is *how long the content stays true*, not
+ * whether the sentence is phrased as an instruction — the person's own labelling
+ * standard draws the line at "一次性任务指令", which is about scope, not grammar.
+ */
+export const REMEMBER_QUESTION =
+  '上一条 `candidate` 里包含的要求或信息，在以后**新的会话**里是否仍然适用或成立？只看内容还有没有效：以后还要照做的规矩、约定、禁忌、偏好、取舍或事实都算；今天做什么、这一段怎么写、临时状态不算。句子是以指令的形式说的并不影响判断——只看它是不是只管这一次。'
+
 
 /** Transport and vocabulary defaults; every one is overridable from plugin config. */
 export const JEV_DEFAULTS: Omit<JevSettings, 'apiKey'> = {
@@ -77,6 +99,7 @@ export const JEV_DEFAULTS: Omit<JevSettings, 'apiKey'> = {
    * still matter tomorrow.
    */
   importanceLevels: ['与未来会话无关', '只对本次任务有用', '对未来会话有点参考', '对未来会话重要', '以后必须遵守或反复用到'],
+  rememberQuestion: REMEMBER_QUESTION,
   /** Only this many candidates are judged per request; the rest stay unjudged. */
   maxCandidates: 6,
   /** Known memories included as conflict context (context rot is real: keep it small). */
@@ -336,6 +359,7 @@ export function createJevClient({
         types: request.types?.length ? request.types : ['constraint', 'pitfall', 'decision'],
         known: (request.known ?? []).slice(0, settings.maxKnown),
         importanceLevels: settings.importanceLevels,
+        rememberQuestion: settings.rememberQuestion,
         project: request.project ?? null,
       })
 
@@ -443,6 +467,7 @@ export function buildRequestBody({
   types,
   known,
   importanceLevels,
+  rememberQuestion,
   project,
 }: {
   model: string
@@ -454,6 +479,8 @@ export function buildRequestBody({
   known: string[]
   /** ordered score legend. */
   importanceLevels: string[]
+  /** the gate question, verbatim. */
+  rememberQuestion: string
   /** the workspace the memories belong to, as framing for the judgement. */
   project?: string | null
 }): JevRequestBody {
@@ -468,11 +495,11 @@ export function buildRequestBody({
       instructions: {
         context: MEMORY_CONTEXT,
         candidate: candidate.text,
-        question: '上一条 `candidate` 是否值得写进长期记忆，供以后**新的会话**使用？判断标准：换个会话、换一天，它是否仍然有用，并且是用户对项目的说法或偏好（不是这一次任务的操作指令）。',
+        question: rememberQuestion,
       },
       criteria: {
-        true: '跨会话仍然成立、且对以后有用',
-        false: '只对当前这一次任务有意义，或是寒暄/提问/临时状态',
+        true: '以后仍然适用或成立，照做还有用',
+        false: '只管这一次任务、这一段时间，或是寒暄/提问/临时状态',
       },
     }
     questions[typeId(index)] = {

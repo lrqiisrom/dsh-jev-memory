@@ -63,6 +63,8 @@ const GATE: GateConfig = {
 const SHIPPED_MAX_CANDIDATES = 6
 const SHIPPED_JUDGE_TIMEOUT_MS = 1800
 
+/** Set when the run swaps the gate question, so the report says which one it used. */
+const questionOverride = process.env.REPORT_REMEMBER_QUESTION?.trim() ?? ''
 const labelDir = process.env.REPORT_DIR?.trim() || new URL('./labels/', import.meta.url).pathname
 const batches = (process.env.REPORT_BATCHES?.trim() || 'round1.csv,round2.csv,round3.csv')
   .split(',')
@@ -223,7 +225,17 @@ const candidates: JevCandidate[] = rows.map((row) => ({
 const heuristicJudge = createJudge({ config: { judge: 'heuristic', types: GATE.types } })
 const heuristicRows: Judgement[] = heuristicJudge.heuristics(candidates)
 
-const jev = createJevClient({ config: { maxCandidates }, env: process.env })
+// `REPORT_REMEMBER_QUESTION` swaps the gate question, so two wordings can be measured
+// back to back on the same labels instead of argued about.
+const jev = createJevClient({
+  config: {
+    maxCandidates,
+    ...(process.env.REPORT_REMEMBER_QUESTION?.trim()
+      ? { rememberQuestion: process.env.REPORT_REMEMBER_QUESTION }
+      : {}),
+  },
+  env: process.env,
+})
 let jevRuns: Judgement[][] = []
 let jevLatency: number[] = []
 let jevModel: string | null = null
