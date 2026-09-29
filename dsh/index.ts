@@ -71,7 +71,7 @@ import {
   type NormalizeSettings,
 } from './lib/normalize.ts'
 import { DEFAULT_QUOTA, inScope, renderRecall, searchMemories, selectMemories } from './lib/recall.ts'
-import { signatureOf } from './lib/signals.ts'
+import { isNoteworthyVeto, signatureOf } from './lib/signals.ts'
 import { createMemoryStore, MEMORY_TYPES, type MemoryRecord } from './lib/store.ts'
 import { estimateTokens, excerpt } from './lib/text.ts'
 import type { Candidate, ExtractOptions, TurnEvent } from './lib/extract.ts'
@@ -482,7 +482,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.14.0'
+export const version = '0.15.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -1338,7 +1338,13 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const events = collectTurnEvents(session)
       const candidates = extractCandidates(events, {
         ...config.extract,
-        onVeto: (sentence, reason) => void store.ledger({ kind: 'skip', reason: `veto:${reason}`, quote: excerpt(sentence, 120) }),
+        // The extractor reports every rejection; the ledger records the reasons that carry
+        // information (see isNoteworthyVeto), because a line per question and per "好的"
+        // would bury the lines that matter.
+        onVeto: (sentence, reason) => {
+          if (!isNoteworthyVeto(reason)) return
+          void store.ledger({ kind: 'skip', reason: `veto:${reason}`, quote: excerpt(sentence, 120) })
+        },
       })
       if (candidates.length === 0) return { written: 0, writtenIds: [], candidates: 0 }
 

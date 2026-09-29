@@ -235,3 +235,31 @@ test('a pasted prefix is stripped, and it no longer decides the verdict', () => 
     { keep: false, reason: 'task-instruction' },
   )
 })
+
+test('a question whose marker sits mid-sentence is still a question', () => {
+  // The splitter does not break on `，`, and every anchored pattern needs the marker at the
+  // start or the end, so this reached the judge as if it were a statement. Measured on the
+  // 38 labelled rows: the anchored screen rejected *none* of the questions the person had
+  // marked "just a question".
+  assert.equal(
+    screenSentence('能说一下一次mcp调用的流程吗，然后mcp是在function calling上面做了个什么层面的限制和封装').keep,
+    false,
+  )
+  assert.equal(screenSentence('mysql执行查询操作的时候会经历哪些步骤').keep, false)
+})
+
+test('a requirement that merely contains a question word is not a question', () => {
+  // Both of these are labelled "remember" in the corpus, and unanchored markers alone
+  // rejected them — measured: 12 rejections including these 2. Requiring the absence of an
+  // instruction shape rejects 7 and none marked remember.
+  assert.deepEqual(
+    screenSentence('我要求你说设计是怎么设计的，一些变量名啊什么东西的不要说出来，你就说流程就行了。'),
+    { keep: true, reason: null },
+  )
+  assert.deepEqual(
+    screenSentence('简历上原本这么写的应该可以优化吧，你觉得怎么写简历好点，请你一定要根据代码事实来，不要凭空捏造'),
+    { keep: true, reason: null },
+  )
+  // And the anchored behaviour is unchanged for questions that end in a particle.
+  assert.deepEqual(screenSentence('这个项目有哪些约定'), { keep: false, reason: 'question' })
+})

@@ -28,7 +28,6 @@
 import { excerpt, normalize, splitSentences } from './text.ts'
 import {
   emphasisWeight,
-  isNoteworthyVeto,
   matchTypeSignals,
   screenSentence,
   signatureOf,
@@ -235,10 +234,12 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
     if (sentence.length < config.minChars) continue
     const screen = screenSentence(sentence)
     if (!screen.keep) {
-      // Report the rejection instead of dropping it silently: write precision is
-      // measured from what the screens threw away as much as from what was kept —
-      // but only the rejections that carry information (see isNoteworthyVeto).
-      if (isNoteworthyVeto(screen.reason)) config.onVeto?.(sentence, screen.reason)
+      // Every rejection is reported; the caller decides what to record. The gate used to
+      // live here, and it hid the `question` screen from the evaluation entirely — the one
+      // screen whose reach was just widened, and therefore the one whose mistakes most need
+      // to be measurable. A ledger that would drown in questions is the ledger's problem,
+      // not the extractor's.
+      config.onVeto?.(sentence, screen.reason)
       continue
     }
 

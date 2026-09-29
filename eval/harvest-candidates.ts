@@ -64,6 +64,15 @@ const SAMPLE = {
   office: 40,
   other: 40,
   vetoed: 30,
+  /**
+   * Sentences the question screen threw away, sampled separately.
+   *
+   * They used to be invisible: the extractor filtered them out before the harvester could
+   * see them, so the one screen with the widest reach could not be checked against a
+   * person's judgement at all. Twenty rows is enough to notice a rule that kills
+   * requirements; a bigger quota would crowd out the strata that answer other questions.
+   */
+  question: 20,
 }
 
 type Stratum = keyof typeof SAMPLE
@@ -190,11 +199,14 @@ function ingest(scope: string, events: Array<{ seq: number; type: string; data: 
           existing.seen += 1
           return
         }
-        population.vetoed += 1
+        // `noise` is chatter — sampling it would spend labelling time on "好的" — while
+        // `question` gets its own stratum precisely so a widened rule can be checked.
+        const stratum: Stratum = reason === 'question' ? 'question' : 'vetoed'
+        population[stratum] += 1
         classPopulation[taskClass()] += 1
         rows.set(key, {
           key,
-          stratum: 'vetoed',
+          stratum,
           taskClass: taskClass(),
           workspace,
           // The row keeps its real kind: writing `vetoed` here lost whether the line
@@ -221,6 +233,7 @@ function ingest(scope: string, events: Array<{ seq: number; type: string; data: 
         cls === 'coding' ? (candidate.hintedType ? 'coding-signal' : 'coding-plain') : cls
       population[stratum] += 1
       classPopulation[cls] += 1
+      classCandidates[cls] += 1
       rows.set(candidate.key, {
         key: candidate.key,
         stratum,
@@ -237,9 +250,19 @@ function ingest(scope: string, events: Array<{ seq: number; type: string; data: 
 }
 
 const rows = new Map<string, Row>()
-const population = { 'coding-signal': 0, 'coding-plain': 0, study: 0, office: 0, other: 0, vetoed: 0 } as Record<Stratum, number>
+const population = {
+  'coding-signal': 0,
+  'coding-plain': 0,
+  study: 0,
+  office: 0,
+  other: 0,
+  vetoed: 0,
+  question: 0,
+} as Record<Stratum, number>
 /** Deduped rows per task class, so the report can weight by what the corpus holds. */
 const classPopulation: Record<TaskClass, number> = { coding: 0, study: 0, office: 0, other: 0 }
+/** Rows that passed the screens, per class — the number worth quoting, unlike the one above. */
+const classCandidates: Record<TaskClass, number> = { coding: 0, study: 0, office: 0, other: 0 }
 /** `legacy` = only pre-versioned logs; anything else = every session. */
 const frame = process.env.HARVEST_FRAME?.trim() ?? ''
 let turns = 0
@@ -410,7 +433,11 @@ for (const stratum of Object.keys(SAMPLE) as Stratum[]) {
   // is still reported, because a screen that rejects thousands of sentences is a
   // claim worth being able to check.
   const pool =
-    stratum === 'vetoed' ? eligible.filter((row) => row.vetoReason !== 'transcript') : eligible
+    stratum === 'vetoed'
+      ? eligible.filter((row) => row.vetoReason !== 'transcript')
+      : stratum === 'question'
+        ? eligible.filter((row) => row.vetoReason === 'question')
+        : eligible
   if (stratum === 'vetoed') {
     transcriptVetoes = eligible.length - pool.length
     for (const row of pool) vetoedByReason[row.vetoReason] = (vetoedByReason[row.vetoReason] ?? 0) + 1
@@ -547,6 +574,7 @@ const snapshot = {
   vetoedByReason,
   population,
   classPopulation,
+  classCandidates,
   sources: sourceReads,
   poolSizes,
   sample: SAMPLE,
@@ -592,7 +620,7 @@ console.log(
   `\n编码组权重：带信号 ${(population['coding-signal'] / codingTotal * 100).toFixed(1)}%、不带信号 ${(population['coding-plain'] / codingTotal * 100).toFixed(1)}%（报告里按此加权）`,
 )
 console.log(
-  `语料按任务类：${Object.entries(classPopulation).map(([cls, count]) => `${cls} ${count}`).join('｜')}`,
+  `语料按任务类（通过筛子的候选）：${Object.entries(classCandidates).map(([cls, count]) => `${cls} ${count}`).join('｜')}`,
 )
 
 if (own.size > 0) console.log(`\n沿用本文件已有标注 ${keptOwn}/${own.size} 行`)

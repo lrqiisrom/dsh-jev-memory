@@ -382,6 +382,32 @@ export function stripPastedPrefixes(sentence: string): string {
 }
 
 /**
+ * Chinese question markers, unanchored — the other half of the question screen.
+ *
+ * Why unanchored: `looksInterrogative` anchors its markers at the start or the end of a
+ * sentence, and the splitter does not break on `，`. So in a message like "能说一下一次
+ * mcp 调用的流程吗，然后 mcp 是在 function calling 上面做了个什么层面的限制和封装" the
+ * `吗` sits in the middle and every anchored pattern misses. Measured on the 38 labelled
+ * rows: the anchored screen rejected **none** of the questions the person had marked
+ * "just a question", which is why they reached the judge at all.
+ */
+export const QUESTION_MARKERS =
+  /哪些|啥|能不能|可不可以|是什么|怎么|为什么|如何|吗|呢|多少|是不是|有没有/u
+
+/**
+ * Instruction shapes that keep a question marker from making the sentence a question.
+ *
+ * The list is broad on purpose, because its job is to *protect* sentences: a sentence that
+ * tells the agent to do something is a requirement or an instruction, and one that merely
+ * contains 怎么 or 什么 is not a question. Measured on the same 38 rows: unanchored markers
+ * alone reject 12 sentences including **2 the person marked as requirements** ("我要求你说
+ * 设计是怎么设计的，一些变量名啊什么东西的不要说出来…", "…请你一定要根据代码事实来，不要
+ * 凭空捏造"). Requiring the absence of an instruction shape rejects 7 — 5 questions marked
+ * "do not remember", 2 marked unsure, and **none marked remember**.
+ */
+export const INSTRUCTION_MARKERS = /不要|不准|别|必须|应当|应该|请|改|加|删|禁止|务必/u
+
+/**
  * Decide whether one sentence may become a memory at all.
  *
  * Returns a reason instead of a boolean so the ledger can record *why* a
@@ -409,7 +435,15 @@ export function screenSentence(sentence: string): ScreenDecision {
   // screen entry point: the write-precision harness runs the same screens the
   // plugin does, and a sentence cannot be screened in one path but not the other.
   if (isNoise(sentence)) return { keep: false, reason: 'noise' }
+  // Two ways to be a question, and the second one exists because the first cannot see a
+  // marker in the middle of a sentence: either the anchored test fires, or a marker appears
+  // anywhere *and* the sentence carries no instruction shape. The conjunction is what keeps
+  // a requirement that happens to contain 什么 from being thrown away — see the note on
+  // INSTRUCTION_MARKERS for the two sentences that made this necessary.
   if (looksInterrogative(sentence)) return { keep: false, reason: 'question' }
+  if (QUESTION_MARKERS.test(sentence) && !INSTRUCTION_MARKERS.test(sentence)) {
+    return { keep: false, reason: 'question' }
+  }
   return { keep: true, reason: null }
 }
 
