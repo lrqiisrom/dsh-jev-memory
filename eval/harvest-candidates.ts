@@ -46,6 +46,7 @@ import { join } from 'node:path'
 import { extractCandidates } from '../dsh/lib/extract.ts'
 import { signatureOf } from '../dsh/lib/signals.ts'
 import { carriedLabels, csvField as field, parseCsv } from './lib/csv.ts'
+import { readCodexTurns, readCursorTurns } from './lib/source.ts'
 import { taskClassOf, type TaskClass } from './lib/task-class.ts'
 
 /**
@@ -175,50 +176,12 @@ async function sessionFiles(): Promise<SessionLog[]> {
   return files
 }
 
-const rows = new Map<string, Row>()
-const population = { 'coding-signal': 0, 'coding-plain': 0, study: 0, office: 0, other: 0, vetoed: 0 } as Record<Stratum, number>
-/** Deduped rows per task class, so the report can weight by what the corpus holds. */
-const classPopulation: Record<TaskClass, number> = { coding: 0, study: 0, office: 0, other: 0 }
-/** `legacy` = only pre-versioned logs; anything else = every session. */
-const frame = process.env.HARVEST_FRAME?.trim() ?? ''
-let turns = 0
-let humanMessages = 0
-let rawCandidates = 0
-let rawVetoes = 0
-
-let skippedChildSessions = 0
-
-for (const log of await sessionFiles()) {
-  // `HARVEST_FRAME=legacy` restricts the run to sessions that only ever existed in
-  // the pre-versioned format. They are the ones the old hard-coded file name could
-  // not see, so they are labelled as their own batch instead of being folded into a
-  // sample whose frame was a different corpus.
-  if (frame === 'legacy' && log.generation !== 0) continue
-  const raw = readLog(log.file)
-  if (raw === '') continue
-  // Child sessions are skipped outright. In a delegated child the "user" message
-  // is the parent agent's own prompt — the plugin's live rule already refuses to
-  // learn from those, so harvesting them would ask a person to label sentences
-  // they never wrote. That contamination is what made the first CSV confusing.
-  try {
-    const head: unknown = JSON.parse(raw.slice(0, raw.indexOf('\n')))
-    const depth = (head as { delegationDepth?: number } | null)?.delegationDepth ?? 0
-    if (depth > 0) {
-      skippedChildSessions += 1
-      continue
-    }
-  } catch {
-    /* a log without a readable header is treated as a normal session */
-  }
-  let workspace = '?'
-  let turn: Array<{ seq: number; type: string; data: unknown }> = []
-  let seq = 0
-  /** The class of the session currently being read; `other` for an unlisted one. */
-  const taskClass = (): TaskClass => taskClassOf(workspace)
-  const flush = () => {
-    if (turn.length === 0) return
-    turns += 1
-    const candidates = extractCandidates(turn as never, {
+function ingest(scope: string, events: Array<{ seq: number; type: string; data: unknown }>): void {
+  if (events.length === 0) return
+  const taskClass = (): TaskClass => taskClassOf(scope)
+  const workspace = scope
+  turns += 1
+    const candidates = extractCandidates(events as never, {
       onVeto: (sentence: string, reason: string | null) => {
         rawVetoes += 1
         const key = signatureOf(sentence)
@@ -271,8 +234,66 @@ for (const log of await sessionFiles()) {
         text: candidate.text,
       })
     }
+}
+
+const rows = new Map<string, Row>()
+const population = { 'coding-signal': 0, 'coding-plain': 0, study: 0, office: 0, other: 0, vetoed: 0 } as Record<Stratum, number>
+/** Deduped rows per task class, so the report can weight by what the corpus holds. */
+const classPopulation: Record<TaskClass, number> = { coding: 0, study: 0, office: 0, other: 0 }
+/** `legacy` = only pre-versioned logs; anything else = every session. */
+const frame = process.env.HARVEST_FRAME?.trim() ?? ''
+let turns = 0
+let humanMessages = 0
+let rawCandidates = 0
+let rawVetoes = 0
+
+let skippedChildSessions = 0
+/** DSH turns and human messages, captured before the other sources are added. */
+let dshTurns = 0
+let dshHumanMessages = 0
+/** What each adapter read, so the "three agents" claim is checkable. */
+let sourceReads: Record<string, unknown> = {}
+
+for (const log of await sessionFiles()) {
+  // `HARVEST_FRAME=legacy` restricts the run to sessions that only ever existed in
+  // the pre-versioned format. They are the ones the old hard-coded file name could
+  // not see, so they are labelled as their own batch instead of being folded into a
+  // sample whose frame was a different corpus.
+  if (frame === 'legacy' && log.generation !== 0) continue
+  const raw = readLog(log.file)
+  if (raw === '') continue
+  // Child sessions are skipped outright. In a delegated child the "user" message
+  // is the parent agent's own prompt — the plugin's live rule already refuses to
+  // learn from those, so harvesting them would ask a person to label sentences
+  // they never wrote. That contamination is what made the first CSV confusing.
+  try {
+    const head: unknown = JSON.parse(raw.slice(0, raw.indexOf('\n')))
+    const depth = (head as { delegationDepth?: number } | null)?.delegationDepth ?? 0
+    if (depth > 0) {
+      skippedChildSessions += 1
+      continue
+    }
+  } catch {
+    /* a log without a readable header is treated as a normal session */
+  }
+  let workspace = '?'
+  let turn: Array<{ seq: number; type: string; data: unknown }> = []
+  let seq = 0
+  const flush = () => {
+    ingest(workspace, turn)
     turn = []
   }
+/**
+ * Extract one turn, whichever agent it came from.
+ *
+ * One entry point on purpose: Codex and Cursor turns are converted into the same event
+ * shape their adapters produce and then run through *this* extractor and *these*
+ * screens, so a sentence is never judged by a second, subtler set of rules.
+ *
+ * @param scope - the workspace the turn belongs to.
+ * @param events - the turn's events.
+ */
+
 
   for (const line of raw.split('\n')) {
     if (line === '') continue
@@ -303,6 +324,33 @@ for (const log of await sessionFiles()) {
     }
   }
   flush()
+}
+dshTurns = turns
+dshHumanMessages = humanMessages
+
+/**
+ * The other two agents on this machine.
+ *
+ * Skipped under `HARVEST_FRAME=legacy`: that frame means "the DSH sessions the old
+ * filename bug hid", and these stores have no generations to reason about. Their skip
+ * accounting travels into the snapshot, because an undocumented format that silently
+ * returns nothing is indistinguishable from a store with nothing in it.
+ */
+if (frame !== 'legacy') {
+  // Overridable so a test can point them at empty directories: without this the harness
+  // tests read the developer's real Codex and Cursor stores, which makes them slow and
+  // makes their outcome depend on the machine they run on.
+  const codex = readCodexTurns({ codex: process.env.HARVEST_CODEX_DIR?.trim() || undefined })
+  const cursor = readCursorTurns({ cursorDb: process.env.HARVEST_CURSOR_DB?.trim() || undefined })
+  for (const turn of [...codex.turns, ...cursor.turns]) {
+    humanMessages += turn.events.length
+    ingest(turn.workspace ?? '?', turn.events)
+  }
+  sourceReads = {
+    dsh: { turns: dshTurns, humanMessages: dshHumanMessages, skipped: {} },
+    codex: { turns: codex.turns.length, humanMessages: codex.humanMessages, skipped: codex.skipped },
+    cursor: { turns: cursor.turns.length, humanMessages: cursor.humanMessages, skipped: cursor.skipped },
+  }
 }
 
 /**
@@ -499,6 +547,7 @@ const snapshot = {
   vetoedByReason,
   population,
   classPopulation,
+  sources: sourceReads,
   poolSizes,
   sample: SAMPLE,
   ...(onlyClass === '' ? {} : { onlyClasses: onlyClass }),
@@ -514,6 +563,18 @@ await writeFile(frameFile, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8')
 
 if (transcriptVetoes > 0) {
   console.log(`拼接转录被筛 ${transcriptVetoes} 行（不计入 vetoed 抽样池）；vetoed 池按原因：${Object.entries(vetoedByReason).map(([reason, count]) => `${reason} ${count}`).join('｜')}`)
+}
+// Printed as well as snapshotted: "the corpus is three agents" is a claim about the data,
+// and a claim is worth being able to read off a run rather than only off a JSON file.
+if (Object.keys(sourceReads).length > 0) {
+  const parts = Object.entries(sourceReads).map(([name, entry]) => {
+    const value = entry as { turns: number; humanMessages: number; skipped: Record<string, number> }
+    const skipped = Object.entries(value.skipped ?? {})
+      .map(([reason, count]) => `${reason} ${count}`)
+      .join('｜')
+    return `${name} ${value.turns} 回合/${value.humanMessages} 条${skipped === '' ? '' : `（跳过 ${skipped}）`}`
+  })
+  console.log(`来源：${parts.join('｜')}`)
 }
 console.log(`日志代数：${Object.entries(logsByGeneration).map(([gen, count]) => `v${gen} ${count} 个`).join('｜') || '无'}`)
 if (skippedUnreadableDirs > 0) console.log(`无法列出的会话目录 ${skippedUnreadableDirs} 个（已计入上方代数之外）`)

@@ -37,6 +37,15 @@ export const WORKSPACE_CLASS: Record<string, TaskClass> = {
   '/Users/rom/PycharmProjects/yakumo-main': 'study',
   '/Users/rom/PycharmProjects/blarify-main': 'study',
   '/Users/rom/WebstormProjects/satellite-web': 'office',
+  // Added 2026-09-29 with the Codex and Cursor adapters, classified by the person:
+  // the paper directory is writing, the three project directories are software, and the
+  // two Codex scratch directories are neither.
+  '/Users/rom/Documents/Rom‘s paper': 'office',
+  '/Users/rom/PycharmProjects/DID': 'coding',
+  '/Users/rom/Documents/vObliChain': 'coding',
+  '/Users/rom/IdeaProjects/blockchain': 'coding',
+  '/Users/rom/Documents/Codex/2026-07-23/zhe-g': 'other',
+  '/Users/rom/Documents/Codex/2026-08-04/zhe': 'other',
 }
 
 /**

@@ -48,9 +48,23 @@ async function writeSession(home: string, id: string, cwd: string, sentences: st
 }
 
 /** Run the harvester against a temporary harness home. */
-function harvest(home: string, outDir: string): { status: number | null; stderr: string; stdout: string } {
+function harvest(
+  home: string,
+  outDir: string,
+  extraEnv: Record<string, string> = {},
+): { status: number | null; stderr: string; stdout: string } {
   const result = spawnSync(process.execPath, [SCRIPT], {
-    env: { ...process.env, DSH_HOME: home, HARVEST_OUT_DIR: outDir, HARVEST_OUT: 'round.csv' },
+    env: {
+      ...process.env,
+      DSH_HOME: home,
+      HARVEST_OUT_DIR: outDir,
+      HARVEST_OUT: 'round.csv',
+      // Empty sources: these tests are about the DSH reader and the laws around
+      // labelling, not about whatever is in this machine's Codex and Cursor stores.
+      HARVEST_CODEX_DIR: join(outDir, 'no-codex'),
+      HARVEST_CURSOR_DB: join(outDir, 'no-cursor.vscdb'),
+      ...extraEnv,
+    },
     encoding: 'utf8',
   })
   return { status: result.status, stderr: String(result.stderr ?? ''), stdout: String(result.stdout ?? '') }
@@ -159,10 +173,12 @@ test('a second run keeps the rows already chosen, and the labels on them', async
     const labelled = (await readFile(outFile, 'utf8'))
       .trimEnd()
       .split('\n')
-      // Replace the empty label,note pair rather than appending after it: the
-      // columns are positional, and a test that writes into the wrong one would
-      // pass while the tool ignored the label.
-      .map((record, index) => (index === 1 ? record.replace(/,,$/u, ',1,looks useful') : record))
+      // Label *our* sentence by finding it, not by position: the pool can hold rows from
+      // other sources, and a test that labels "row 1" would label somebody else's row and
+      // then pass or fail for reasons unrelated to the guard.
+      .map((record) =>
+        record.includes(SENTENCES[0]!.slice(0, 12)) ? record.replace(/,,$/u, ',1,looks useful') : record,
+      )
       .join('\n')
     await writeFile(outFile, `${labelled}\n`, 'utf8')
 
@@ -195,10 +211,12 @@ test('refuses to write when a re-run would drop a label', async () => {
     const labelled = (await readFile(outFile, 'utf8'))
       .trimEnd()
       .split('\n')
-      // Replace the empty label,note pair rather than appending after it: the
-      // columns are positional, and a test that writes into the wrong one would
-      // pass while the tool ignored the label.
-      .map((record, index) => (index === 1 ? record.replace(/,,$/u, ',1,looks useful') : record))
+      // Label *our* sentence by finding it, not by position: the pool can hold rows from
+      // other sources, and a test that labels "row 1" would label somebody else's row and
+      // then pass or fail for reasons unrelated to the guard.
+      .map((record) =>
+        record.includes(SENTENCES[0]!.slice(0, 12)) ? record.replace(/,,$/u, ',1,looks useful') : record,
+      )
       .join('\n')
     await writeFile(outFile, `${labelled}\n`, 'utf8')
 
@@ -210,6 +228,40 @@ test('refuses to write when a re-run would drop a label', async () => {
     assert.equal(refused.status, 1, 'the run stops instead of overwriting')
     assert.match(refused.stderr, /不在样本里/u)
     assert.match(await readFile(outFile, 'utf8'), /,1,looks useful/u, 'the labelled file is untouched')
+  } finally {
+    await rm(home, { recursive: true, force: true })
+    await rm(out, { recursive: true, force: true })
+  }
+})
+
+test('reads Codex rollouts and counts what it refuses', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'jev-codex-'))
+  const out = await mkdtemp(join(tmpdir(), 'jev-out-'))
+  try {
+    const dir = join(home, 'sessions', '2026-01-01', 'rollout-1')
+    await mkdir(dir, { recursive: true })
+    const line = (value: unknown): string => `${JSON.stringify(value)}\n`
+    const body = [
+      line({ type: 'session_meta', payload: { id: 'codex-1', cwd: CODING_WORKSPACE } }),
+      line({ type: 'turn_context', payload: { turn_id: 't1', cwd: CODING_WORKSPACE } }),
+      // Injected context arrives through the same door as a person's words; treating it as
+      // theirs is the mistake this project has already made once.
+      line({
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<environment_context>\n<cwd>/x</cwd>\n</environment_context>' }] },
+      }),
+      line({
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: SENTENCES[0] }] },
+      }),
+    ].join('')
+    await writeFile(join(dir, 'rollout-1.jsonl'), body, 'utf8')
+
+    const result = harvest(home, out, { HARVEST_CODEX_DIR: home })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /codex 1 回合/)
+    assert.match(result.stdout, /injected-context 1/)
+    assert.ok(idsOf(await readFile(join(out, 'round.csv'), 'utf8')).length > 0, 'the real message became a candidate')
   } finally {
     await rm(home, { recursive: true, force: true })
     await rm(out, { recursive: true, force: true })
