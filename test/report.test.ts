@@ -21,10 +21,13 @@ const HEADER = 'row,stratum,task_class,workspace,kind,hinted_type,signal_score,v
 
 /** Run the report against a temporary label directory. */
 function report(dir: string): { status: number | null; stdout: string; stderr: string } {
-  const result = spawnSync(process.execPath, [SCRIPT], {
-    env: { ...process.env, REPORT_DIR: dir, REPORT_BATCHES: 'a.csv,b.csv', REPORT_REPEAT: '1' },
-    encoding: 'utf8',
-  })
+  // No credential, so the report cannot reach the network inside a test: with a key
+  // in the ambient environment these tests made real judge calls, and the numbers
+  // they assert on then depended on a model.
+  const env: NodeJS.ProcessEnv = { ...process.env, REPORT_DIR: dir, REPORT_BATCHES: 'a.csv,b.csv', REPORT_REPEAT: '1' }
+  delete env.TYPESAFE_API_KEY
+  delete env.TYPESAFE_BASE_URL
+  const result = spawnSync(process.execPath, [SCRIPT], { env, encoding: 'utf8' })
   return { status: result.status, stdout: String(result.stdout ?? ''), stderr: String(result.stderr ?? '') }
 }
 

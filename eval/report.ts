@@ -483,6 +483,25 @@ if (jevRuns.length > 1) {
   }
   say(`${repeats} 次重复：**${flips}/${rows.length}** 行的判定结果不一致，**${moved}/${rows.length}** 行的分数有波动。`)
   say('')
+  // The arm's own numbers move with those flips, so they are printed per run rather
+  // than as one figure: on this set the model writes none or one of the positives
+  // depending on the run, which is a recall of 0% or 11%.
+  const perRun = jevRuns.map((run) => {
+    const score: Score = { tp: 0, fp: 0, fn: 0, tn: 0 }
+    for (const row of decided) {
+      const index = indexOf.get(row)!
+      const wrote = row.screensKeptNow && applyGate(run[index], GATE).write
+      const want = row.label === '1'
+      if (want && wrote) score.tp += 1
+      else if (want) score.fn += 1
+      else if (wrote) score.fp += 1
+      else score.tn += 1
+    }
+    const m = metrics(score)
+    return `${percent(m.precision)}/${percent(m.recall)}`
+  })
+  say(`这一次的每一跑：${perRun.join('、')}（精确率/召回率）——**模型判定的数字必须带上这个区间读**。`)
+  say('')
   say('所以 Jev 那一栏必须连同这个数字一起读：单次运行的精确率会随这些行上下浮动。')
   say('')
 }
