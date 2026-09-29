@@ -107,9 +107,25 @@ let humanMessages = 0
 let rawCandidates = 0
 let rawVetoes = 0
 
+let skippedChildSessions = 0
+
 for (const file of await sessionFiles()) {
   const raw = readLog(file)
   if (raw === '') continue
+  // Child sessions are skipped outright. In a delegated child the "user" message
+  // is the parent agent's own prompt — the plugin's live rule already refuses to
+  // learn from those, so harvesting them would ask a person to label sentences
+  // they never wrote. That contamination is what made the first CSV confusing.
+  try {
+    const head: unknown = JSON.parse(raw.slice(0, raw.indexOf('\n')))
+    const depth = (head as { delegationDepth?: number } | null)?.delegationDepth ?? 0
+    if (depth > 0) {
+      skippedChildSessions += 1
+      continue
+    }
+  } catch {
+    /* a log without a readable header is treated as a normal session */
+  }
   let workspace = '?'
   let turn: Array<{ seq: number; type: string; data: unknown }> = []
   let seq = 0
@@ -229,6 +245,7 @@ await mkdir(outDir, { recursive: true })
 const outFile = join(outDir, 'round1.csv')
 await writeFile(outFile, [header, ...lines].join('\n') + '\n', 'utf8')
 
+console.log(`跳过子会话 ${skippedChildSessions} 个（父代理的提示词不是人的话）`)
 console.log(`回合 ${turns}｜人类消息 ${humanMessages}｜原始候选 ${rawCandidates} → 去重 ${population['coding-signal'] + population['coding-plain'] + population.control}｜原始被筛 ${rawVetoes} → 去重 ${population.vetoed}`)
 console.log('\n总体（去重后）与抽样：')
 for (const stratum of Object.keys(SAMPLE) as Stratum[]) {
