@@ -6,7 +6,7 @@
  * number. The real distribution lives in the session logs already on disk, and
  * this tool turns it into a CSV a person can label in half an hour.
  *
- * Four deliberate choices, each of which came from looking at the data:
+ * Five deliberate choices, each of which came from looking at the data:
  *
  *  - **The plugin's own extractor does the work**, so a row is exactly what the
  *    plugin saw (`extractCandidates` + `screenSentence`). A separate parser would
@@ -21,6 +21,14 @@
  *    sentences that are *easy* to reject, so a sample dominated by them reports a
  *    precision that no one should believe. The headline number is the weighted
  *    combination, and both slices are reported.
+ *  - **One log per session, whichever generation it is.** A session directory may
+ *    hold `session.jsonl.zstd` (the format before it gained a version suffix),
+ *    `session.v3.jsonl.zstd` (what the harness writes now), or both after a
+ *    migration. Hard-coding the v3 name silently dropped the 8 un-migrated
+ *    sessions on this machine (92 human messages); reading both names for a
+ *    migrated session would instead count one conversation twice — verified, the
+ *    two files carry the same 207 human messages. So the newest generation in
+ *    each directory is read, and nothing else.
  *
  * Dependency note: the logs are multi-frame zstd, which Node's
  * `zstdDecompressSync` refuses to read past the first frame, so this shells out
@@ -30,7 +38,8 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { mkdir, readdir, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -68,6 +77,12 @@ const SAMPLE = {
 
 type Stratum = keyof typeof SAMPLE
 
+/**
+ * The sample seed. Fixed, so the same pool and seed always choose the same rows;
+ * with hash ranking the choice also survives the pool growing.
+ */
+const SAMPLE_SEED = 20260928
+
 interface Row {
   key: string
   stratum: Stratum
@@ -79,16 +94,19 @@ interface Row {
   text: string
 }
 
-/** Deterministic PRNG so the same corpus yields the same sample. */
-function mulberry32(seed: number): () => number {
-  let state = seed
-  return () => {
-    state |= 0
-    state = (state + 0x6d2b79f5) | 0
-    let t = Math.imul(state ^ (state >>> 15), 1 | state)
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+/**
+ * A stable 32-bit rank for a string (FNV-1a), so a row's fate depends only on itself.
+ *
+ * @param value - the string to rank.
+ * @returns a rank in [0, 2^32).
+ */
+function hashRank(value: string): number {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
   }
+  return hash >>> 0
 }
 
 /** Read one multi-frame zstd log through the CLI. */
@@ -97,24 +115,76 @@ function readLog(path: string): string {
   return result.status === 0 ? String(result.stdout ?? '') : ''
 }
 
-/** Every session log under the harness home. */
-async function sessionFiles(): Promise<string[]> {
+/**
+ * A session log file name. `session.jsonl.zstd` carries no version suffix and is
+ * generation 0; `session.v3.jsonl.zstd` is generation 3.
+ */
+const SESSION_LOG = /^session(?:\.v(\d+))?\.jsonl\.zstd$/u
+
+/** One session log to read, with the format generation it belongs to. */
+interface SessionLog {
+  file: string
+  generation: number
+}
+
+/** Session directories that could not be listed, instead of skipping them mutely. */
+let skippedUnreadableDirs = 0
+/** Session directories holding no log at all. */
+let skippedLoglessSessions = 0
+/** How many logs of each generation were read. */
+const logsByGeneration: Record<number, number> = {}
+
+/**
+ * Every session log under the harness home, newest generation per session.
+ *
+ * The unsuffixed `session.jsonl.zstd` is generation 0, `session.vN.` is generation
+ * N. Only the highest generation present in a directory is returned, so a migrated
+ * session is counted once and an un-migrated one is no longer invisible.
+ *
+ * @returns one log per session directory, with its generation.
+ */
+async function sessionFiles(): Promise<SessionLog[]> {
   const root = join(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh'), 'sessions')
-  const files: string[] = []
+  const files: SessionLog[] = []
   for (const workspace of await readdir(root)) {
     let ids: string[] = []
     try {
       ids = await readdir(join(root, workspace))
     } catch {
+      skippedUnreadableDirs += 1
       continue
     }
-    for (const id of ids) files.push(join(root, workspace, id, 'session.v3.jsonl.zstd'))
+    for (const id of ids) {
+      const dir = join(root, workspace, id)
+      let entries: string[] = []
+      try {
+        entries = await readdir(dir)
+      } catch {
+        skippedUnreadableDirs += 1
+        continue
+      }
+      let best: { name: string; generation: number } | undefined
+      for (const name of entries) {
+        const match = SESSION_LOG.exec(name)
+        if (match === null) continue
+        const generation = match[1] === undefined ? 0 : Number(match[1])
+        if (best === undefined || generation > best.generation) best = { name, generation }
+      }
+      if (best === undefined) {
+        skippedLoglessSessions += 1
+        continue
+      }
+      logsByGeneration[best.generation] = (logsByGeneration[best.generation] ?? 0) + 1
+      files.push({ file: join(dir, best.name), generation: best.generation })
+    }
   }
   return files
 }
 
 const rows = new Map<string, Row>()
 const population = { 'coding-signal': 0, 'coding-plain': 0, control: 0, vetoed: 0 } as Record<Stratum, number>
+/** `legacy` = only pre-versioned logs; anything else = every session. */
+const frame = process.env.HARVEST_FRAME?.trim() ?? ''
 let turns = 0
 let humanMessages = 0
 let rawCandidates = 0
@@ -122,8 +192,13 @@ let rawVetoes = 0
 
 let skippedChildSessions = 0
 
-for (const file of await sessionFiles()) {
-  const raw = readLog(file)
+for (const log of await sessionFiles()) {
+  // `HARVEST_FRAME=legacy` restricts the run to sessions that only ever existed in
+  // the pre-versioned format. They are the ones the old hard-coded file name could
+  // not see, so they are labelled as their own batch instead of being folded into a
+  // sample whose frame was a different corpus.
+  if (frame === 'legacy' && log.generation !== 0) continue
+  const raw = readLog(log.file)
   if (raw === '') continue
   // Child sessions are skipped outright. In a delegated child the "user" message
   // is the parent agent's own prompt — the plugin's live rule already refuses to
@@ -222,23 +297,108 @@ for (const file of await sessionFiles()) {
   flush()
 }
 
-/** Sample `count` rows from one pool, deterministically. */
-function sample(pool: Row[], count: number, random: () => number): Row[] {
-  const copy = [...pool].sort((a, b) => (a.key < b.key ? -1 : 1))
-  for (let index = copy.length - 1; index > 0; index -= 1) {
-    const swap = Math.floor(random() * (index + 1))
-    const held = copy[index]
-    copy[index] = copy[swap]
-    copy[swap] = held
-  }
-  return copy.slice(0, count)
+/**
+ * Sample `count` rows from one pool, deterministically and stably.
+ *
+ * Rows are ranked by a hash of (seed, row key) and the lowest ranks win. The first
+ * version shuffled the sorted pool with a single PRNG stream instead. That is
+ * deterministic for a frozen corpus and worthless for a growing one: the log
+ * directory gains sessions every day, one new row shifts the whole stream, and a
+ * re-run replaces roughly half of the rows a person has already labelled —
+ * measured at 50.4% here. Ranking each row independently means growth only
+ * displaces the rows a newcomer actually outranks.
+ *
+ * @param pool - the stratum's rows.
+ * @param count - how many to take.
+ * @param seed - the sample seed, fixed per round.
+ * @returns the chosen rows.
+ */
+function sample(pool: Row[], count: number, seed: number): Row[] {
+  return [...pool]
+    .map((row) => ({ row, rank: hashRank(`${seed}:${row.key}`) }))
+    .sort((left, right) =>
+      left.rank === right.rank ? (left.row.key < right.row.key ? -1 : 1) : left.rank - right.rank,
+    )
+    .slice(0, count)
+    .map((entry) => entry.row)
 }
 
-const random = mulberry32(20260928)
+/**
+ * Parse CSV text into records of cells, honouring quotes.
+ *
+ * A sentence can contain commas, quotes and newlines, so neither splitting on `,`
+ * nor on `\n` reads this file correctly: a naive split reported 240 labelled rows
+ * where the true count was 3. Keeping the parser here keeps the tool
+ * dependency-free, like the rest of the repository.
+ *
+ * @param text - the whole file.
+ * @returns one array of cells per record.
+ */
+function parseCsv(text: string): string[][] {
+  const records: string[][] = []
+  let cells: string[] = []
+  let cell = ''
+  let quoted = false
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    if (quoted) {
+      if (char !== '"') {
+        cell += char
+      } else if (text[index + 1] === '"') {
+        cell += '"'
+        index += 1
+      } else {
+        quoted = false
+      }
+      continue
+    }
+    if (char === '"') {
+      quoted = true
+    } else if (char === ',') {
+      cells.push(cell)
+      cell = ''
+    } else if (char === '\n') {
+      cells.push(cell)
+      records.push(cells)
+      cells = []
+      cell = ''
+    } else {
+      cell += char
+    }
+  }
+  if (cell !== '' || cells.length > 0) {
+    cells.push(cell)
+    records.push(cells)
+  }
+  return records
+}
+
+/**
+ * The labels already present in a CSV, by row id.
+ *
+ * @param text - the previous file, or '' when there is none.
+ * @returns row id → its label and note.
+ */
+function carriedLabels(text: string): Map<string, { label: string; note: string }> {
+  const carried = new Map<string, { label: string; note: string }>()
+  const records = parseCsv(text)
+  const header = records[0] ?? []
+  const idAt = header.indexOf('id')
+  const labelAt = header.indexOf('label')
+  const noteAt = header.indexOf('note')
+  if (idAt < 0 || labelAt < 0) return carried
+  for (const cells of records.slice(1)) {
+    const id = (cells[idAt] ?? '').trim()
+    const label = (cells[labelAt] ?? '').trim()
+    if (id !== '' && label !== '') carried.set(id, { label, note: (cells[noteAt] ?? '').trim() })
+  }
+  return carried
+}
+
 const chosen: Row[] = []
 for (const stratum of Object.keys(SAMPLE) as Stratum[]) {
   const pool = [...rows.values()].filter((row) => row.stratum === stratum)
-  chosen.push(...sample(pool, SAMPLE[stratum], random))
+  chosen.push(...sample(pool, SAMPLE[stratum], SAMPLE_SEED))
 }
 
 /** One CSV field, quoted when it contains a comma, a quote or a newline. */
@@ -247,17 +407,88 @@ function field(value: string): string {
 }
 
 const header = 'row,stratum,workspace,kind,hinted_type,veto_reason,seen,id,text,label,note'
-const lines = chosen.map((row, index) =>
-  [String(index + 1), row.stratum, row.workspace, row.kind, row.hinted, row.vetoReason, String(row.seen), row.key, row.text, '', '']
-    .map((cell) => field(cell))
-    .join(','),
-)
 
-const outDir = new URL('./labels/', import.meta.url).pathname
+// `HARVEST_OUT_DIR` exists so a test can harvest into a temporary directory
+// instead of writing under `eval/labels/`, where it would sit beside a real batch.
+const outDir = process.env.HARVEST_OUT_DIR?.trim() || new URL('./labels/', import.meta.url).pathname
 await mkdir(outDir, { recursive: true })
-const outFile = join(outDir, 'round1.csv')
+const outFile = join(outDir, process.env.HARVEST_OUT?.trim() || 'round1.csv')
+
+let previous = ''
+try {
+  previous = await readFile(outFile, 'utf8')
+} catch {
+  /* no previous file: nothing to carry */
+}
+const carried = carriedLabels(previous)
+
+// A re-harvest is safe by construction: every label moves to the row with the same
+// id. A label whose row does not survive the new sample would be destroyed, and
+// that is the one thing this tool must never do quietly, so it stops instead.
+const orphaned = [...carried.keys()].filter((id) => !chosen.some((row) => row.key === id))
+if (orphaned.length > 0 && process.env.HARVEST_FORCE?.trim() !== '1') {
+  console.error(`重抽后有 ${orphaned.length} 行已标注的句子不在样本里，继续会丢掉这些标注：`)
+  for (const id of orphaned.slice(0, 10)) console.error(`  ${id}`)
+  console.error('确认要丢就设 HARVEST_FORCE=1。')
+  process.exit(1)
+}
+
+const lines = chosen.map((row, index) => {
+  const kept = carried.get(row.key)
+  return [
+    String(index + 1),
+    row.stratum,
+    row.workspace,
+    row.kind,
+    row.hinted,
+    row.vetoReason,
+    String(row.seen),
+    row.key,
+    row.text,
+    kept?.label ?? '',
+    kept?.note ?? '',
+  ]
+    .map((cell) => field(cell))
+    .join(',')
+})
+
 await writeFile(outFile, [header, ...lines].join('\n') + '\n', 'utf8')
 
+// The snapshot is what makes a labelled batch reproducible: a later run can show
+// whether the pool moved, instead of the report quietly resting on a frame that no
+// longer exists. Row ids are recorded as hashes so the snapshot can be committed —
+// a signature is the lowercased sentence itself, and the sentences are private.
+const rowHashes = chosen.map((row) => createHash('sha256').update(row.key).digest('hex').slice(0, 16))
+const snapshot = {
+  generatedAt: new Date().toISOString(),
+  frame: frame === 'legacy' ? 'legacy-only' : 'all-sessions',
+  sampler: 'hash-rank-fnv1a',
+  seed: SAMPLE_SEED,
+  logs: Object.fromEntries(
+    Object.entries(logsByGeneration).map(([generation, count]) => [`v${generation}`, count]),
+  ),
+  skippedChildSessions,
+  skippedUnreadableDirs,
+  skippedLoglessSessions,
+  turns,
+  humanMessages,
+  candidates: {
+    raw: rawCandidates,
+    deduped: population['coding-signal'] + population['coding-plain'] + population.control,
+  },
+  vetoes: { raw: rawVetoes, deduped: population.vetoed },
+  population,
+  sample: SAMPLE,
+  labelledCarried: chosen.filter((row) => carried.has(row.key)).length,
+  /** sha256(signature)[:16] per sampled row, in CSV order. */
+  rowHashes,
+}
+const frameFile = outFile.replace(/\.csv$/u, '.frame.json')
+await writeFile(frameFile, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8')
+
+console.log(`日志代数：${Object.entries(logsByGeneration).map(([gen, count]) => `v${gen} ${count} 个`).join('｜') || '无'}`)
+if (skippedUnreadableDirs > 0) console.log(`无法列出的会话目录 ${skippedUnreadableDirs} 个（已计入上方代数之外）`)
+if (skippedLoglessSessions > 0) console.log(`没有任何日志的会话目录 ${skippedLoglessSessions} 个`)
 console.log(`跳过子会话 ${skippedChildSessions} 个（父代理的提示词不是人的话）`)
 console.log(`回合 ${turns}｜人类消息 ${humanMessages}｜原始候选 ${rawCandidates} → 去重 ${population['coding-signal'] + population['coding-plain'] + population.control}｜原始被筛 ${rawVetoes} → 去重 ${population.vetoed}`)
 console.log('\n总体（去重后）与抽样：')
@@ -268,4 +499,7 @@ const codingTotal = population['coding-signal'] + population['coding-plain']
 console.log(
   `\n编码组权重：带信号 ${(population['coding-signal'] / codingTotal * 100).toFixed(1)}%、不带信号 ${(population['coding-plain'] / codingTotal * 100).toFixed(1)}%（报告里按此加权）`,
 )
+const keptLabels = chosen.filter((row) => carried.has(row.key)).length
+if (carried.size > 0) console.log(`\n沿用已有标注 ${keptLabels}/${carried.size} 行（按句子 id 对齐）`)
 console.log(`\n已写出 ${outFile}`)
+console.log(`语料快照 ${frameFile}`)
