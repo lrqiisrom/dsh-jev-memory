@@ -98,3 +98,40 @@ test('extractCandidates dedups identical candidates inside one turn', () => {
 test('extractCandidates tolerates malformed events', () => {
   assert.deepEqual(extractCandidates([null, {}, { type: 'tool/result', data: null }]), [])
 })
+
+test('a failure naming only an error code is refused, and says so', () => {
+  const vetoes: Array<{ text: string; reason: string | null }> = []
+  const events: TurnEvent[] = [
+    { seq: 1, type: 'tool/call', data: { callId: 'c1', name: 'edit' } },
+    {
+      seq: 2,
+      type: 'tool/result',
+      data: {
+        message: { source: { callId: 'c1' }, content: [{ type: 'text', text: 'FS_AMBIGUOUS_EDIT' }] },
+        error: { name: 'edit' },
+      },
+    },
+  ]
+  const candidates = extractCandidates(events, { onVeto: (text, reason) => vetoes.push({ text, reason }) })
+  assert.deepEqual(candidates, [], 'a bare code is not a memory')
+  // Not dropped in silence: this class of rejection was invisible once, and finding
+  // it took a person labelling rows by hand.
+  assert.deepEqual(vetoes, [{ text: 'edit 失败：FS_AMBIGUOUS_EDIT', reason: 'tool-failure-no-detail' }])
+})
+
+test('a failure that explains itself is still remembered', () => {
+  const events: TurnEvent[] = [
+    { seq: 1, type: 'tool/call', data: { callId: 'c2', name: 'sqlite' } },
+    {
+      seq: 2,
+      type: 'tool/result',
+      data: {
+        message: { source: { callId: 'c2' }, content: [{ type: 'text', text: 'EDQUOT，磁盘配额用尽，要先清 .pnpm-store' }] },
+        error: { name: 'sqlite' },
+      },
+    },
+  ]
+  const failure = extractCandidates(events).find((candidate) => candidate.kind === 'tool-failure')
+  assert.ok(failure, 'a failure with a cause is a pitfall worth keeping')
+  assert.match(failure.text, /磁盘配额用尽/u)
+})

@@ -298,6 +298,25 @@ export const SECRET_PATTERNS: RegExp[] = [
 ]
 
 /**
+ * A line from a pasted dialogue: a speaker label at the start of the sentence.
+ *
+ * Why this exists: whole interview transcripts were pasted into sessions, and since
+ * they arrive as ordinary user messages, every line inside them looked like something
+ * the user had said. Of 38 rows labelled from real sessions, 9 were transcript lines
+ * and the person marked all 9 "do not remember" — an interview being rehearsed is not
+ * the user's project knowledge, and the plugin was memorizing questions an interviewer
+ * had asked.
+ *
+ * The cost was measured on those labels before shipping: this rule rejects those 9
+ * rows and not one labelled "remember" among them. The signal is structural — `你:`
+ * is a transcript convention, not how a person types their own claim — so it is not
+ * fitted to the sample the way a tuned keyword threshold would be.
+ */
+export const TRANSCRIPT_PATTERNS: RegExp[] = [
+  /^(?:你|我|他|她|面试官|面试者|面试人|候选人|提问者|回答者|用户|助手|ai|assistant|user|human|interviewer|candidate)\s*[:：]/iu,
+]
+
+/**
  * Decide whether one sentence may become a memory at all.
  *
  * Returns a reason instead of a boolean so the ledger can record *why* a
@@ -308,6 +327,10 @@ export const SECRET_PATTERNS: RegExp[] = [
  * @returns the screening decision.
  */
 export function screenSentence(sentence: string): ScreenDecision {
+  // Quoted material is rejected before anything else looks at the sentence: a line
+  // from a pasted transcript can satisfy every other rule — long enough, no secret,
+  // no task-instruction shape, not a question — while being somebody else's words.
+  if (TRANSCRIPT_PATTERNS.some((pattern) => pattern.test(sentence))) return { keep: false, reason: 'transcript' }
   if (SECRET_PATTERNS.some((pattern) => pattern.test(sentence))) return { keep: false, reason: 'secret' }
   // An explicit "remember this" outranks the request screen: the user is telling
   // the plugin to write, which is the strongest signal there is.
@@ -334,7 +357,15 @@ export function screenSentence(sentence: string): ScreenDecision {
  * @returns whether the rejection deserves an audit line.
  */
 export function isNoteworthyVeto(reason: string | null): boolean {
-  return reason === 'secret' || reason === 'task-instruction' || reason === 'payload'
+  return (
+    reason === 'secret' ||
+    reason === 'task-instruction' ||
+    reason === 'payload' ||
+    // A transcript line is dropped in bulk, but it is worth counting: a batch of
+    // them means the user pasted a dialogue, which is a different situation from a
+    // sentence that merely looked like chatter.
+    reason === 'transcript'
+  )
 }
 
 /**

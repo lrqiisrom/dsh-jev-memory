@@ -197,7 +197,7 @@ export function extractCandidates(
       continue
     }
     if (event.type === 'tool/result' && config.includeToolFailures) {
-      const candidate = fromToolFailure(event.data, seq, callNames)
+      const candidate = fromToolFailure(event.data, seq, callNames, config)
       if (candidate) candidates.push(candidate)
     }
   }
@@ -265,7 +265,33 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
  * @param callNames - callId → tool name.
  * @returns the candidate, or null when this is not a failure.
  */
-function fromToolFailure(data: EventData | null | undefined, seq: number, callNames: Map<string, string>): Candidate | null {
+/**
+ * Whether a failure says anything beyond its own name.
+ *
+ * A bare error code is not a memory. "edit 失败：FS_AMBIGUOUS_EDIT" names a condition
+ * and no cause, cannot be acted on in a later session, and the person labelling the
+ * real corpus marked exactly these rows as unmemorable (`?`, note: "只有调用失败不给
+ * 原因分析"). A failure that explains itself does get remembered — "sqlite 写入失败：
+ * EDQUOT，磁盘配额用尽，要先清 .pnpm-store" is a labelled positive.
+ *
+ * @param detail - the failure's first line of detail.
+ * @returns true when there is something to learn from it.
+ */
+function hasDiagnostic(detail: string): boolean {
+  const value = detail.trim()
+  if (value === '') return false
+  if (/^(?:未知错误|unknown(?: error)?|error|failed|failure)$/iu.test(value)) return false
+  // A bare code: capitals, digits and underscores only, with no spaces or prose.
+  if (/^[A-Z][A-Z0-9_]{2,}$/u.test(value)) return false
+  return true
+}
+
+function fromToolFailure(
+  data: EventData | null | undefined,
+  seq: number,
+  callNames: Map<string, string>,
+  config: ExtractOptions,
+): Candidate | null {
   const blocks: unknown[] = Array.isArray(data?.message?.content) ? data.message.content : []
   const failed = data?.error !== undefined || blocks.some((block) => asRecord(block)?.isError === true)
   if (!failed) return null
@@ -274,8 +300,16 @@ function fromToolFailure(data: EventData | null | undefined, seq: number, callNa
   const tool = (callId && callNames.get(String(callId))) || data?.error?.name || 'tool'
   const detail = normalize(textBlocksOf(data?.message?.content).join(' '))
   const firstLine = detail.split('\n')[0] ?? ''
-  const text = normalize(`${tool} 失败：${firstLine || data?.error?.code || '未知错误'}`).slice(0, 240)
+  const summary = firstLine || String(data?.error?.code ?? '')
+  const text = normalize(`${tool} 失败：${summary || '未知错误'}`).slice(0, 240)
   if (text.length < 12) return null
+  // Refused for a reason the ledger records rather than dropped in silence: this
+  // exact class of rejection was invisible once and it took a person labelling rows
+  // by hand to find it.
+  if (!hasDiagnostic(summary)) {
+    config.onVeto?.(text, 'tool-failure-no-detail')
+    return null
+  }
 
   return {
     kind: 'tool-failure',

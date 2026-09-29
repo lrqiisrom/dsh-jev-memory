@@ -413,10 +413,28 @@ const onlyClass = process.env.HARVEST_ONLY_CLASS?.trim() ?? ''
 const chosen: Row[] = []
 /** How many rows the sample was actually drawn from, per stratum. */
 const poolSizes: Record<string, number> = {}
+/** Screened-out rows per reason, so the vetoed pool can be read rather than trusted. */
+const vetoedByReason: Record<string, number> = {}
+/** Pasted-transcript lines, excluded from the vetoed pool (see below). */
+let transcriptVetoes = 0
 for (const stratum of Object.keys(SAMPLE) as Stratum[]) {
-  const pool = [...rows.values()].filter(
+  const eligible = [...rows.values()].filter(
     (row) => row.stratum === stratum && (onlyClass === '' || row.taskClass === onlyClass),
   )
+  // Transcript lines are excluded from the vetoed sample on purpose. They are 3,129
+  // sentences of pasted ASR interview text — by far the largest veto reason, and the
+  // person labelled 9 of them without a single "remember". Sampling 30 rows from a
+  // pool they dominate would spend the labelling budget confirming what is already
+  // known, and would crowd out the vetoes that are genuinely ambiguous
+  // (task-instruction, payload, noise, question, tool-failure-no-detail). Their count
+  // is still reported, because a screen that rejects thousands of sentences is a
+  // claim worth being able to check.
+  const pool =
+    stratum === 'vetoed' ? eligible.filter((row) => row.vetoReason !== 'transcript') : eligible
+  if (stratum === 'vetoed') {
+    transcriptVetoes = eligible.length - pool.length
+    for (const row of pool) vetoedByReason[row.vetoReason] = (vetoedByReason[row.vetoReason] ?? 0) + 1
+  }
   poolSizes[stratum] = pool.length
   chosen.push(...sample(pool, SAMPLE[stratum], SAMPLE_SEED))
 }
@@ -510,6 +528,17 @@ const lines = chosen.map((row, index) => {
 
 await writeFile(outFile, [header, ...lines].join('\n') + '\n', 'utf8')
 
+// Which version of the rules produced this batch, as a content hash of the two
+// modules that decide it. Without it, a batch drawn before a screen changed and one
+// drawn after look identical, and the difference is exactly what the person
+// labelling is being asked to judge.
+const ruleSource = await Promise.all(
+  ['../dsh/lib/signals.ts', '../dsh/lib/extract.ts'].map((name) =>
+    readFile(new URL(name, import.meta.url), 'utf8'),
+  ),
+)
+const rulesHash = createHash('sha256').update(ruleSource.join('\n')).digest('hex').slice(0, 12)
+
 // The snapshot is what makes a labelled batch reproducible: a later run can show
 // whether the pool moved, instead of the report quietly resting on a frame that no
 // longer exists. Row ids are recorded as hashes so the snapshot can be committed —
@@ -519,6 +548,8 @@ const snapshot = {
   generatedAt: new Date().toISOString(),
   frame: frame === 'legacy' ? 'legacy-only' : 'all-sessions',
   sampler: 'hash-rank-fnv1a',
+  /** sha256 of signals.ts + extract.ts: the rules that produced this batch. */
+  rulesHash,
   seed: SAMPLE_SEED,
   logs: Object.fromEntries(
     Object.entries(logsByGeneration).map(([generation, count]) => [`v${generation}`, count]),
@@ -537,7 +568,8 @@ const snapshot = {
       population.office +
       population.other,
   },
-  vetoes: { raw: rawVetoes, deduped: population.vetoed },
+  vetoes: { raw: rawVetoes, deduped: population.vetoed, transcriptExcluded: transcriptVetoes },
+  vetoedByReason,
   population,
   classPopulation,
   poolSizes,
@@ -553,6 +585,9 @@ const snapshot = {
 const frameFile = outFile.replace(/\.csv$/u, '.frame.json')
 await writeFile(frameFile, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8')
 
+if (transcriptVetoes > 0) {
+  console.log(`拼接转录被筛 ${transcriptVetoes} 行（不计入 vetoed 抽样池）；vetoed 池按原因：${Object.entries(vetoedByReason).map(([reason, count]) => `${reason} ${count}`).join('｜')}`)
+}
 console.log(`日志代数：${Object.entries(logsByGeneration).map(([gen, count]) => `v${gen} ${count} 个`).join('｜') || '无'}`)
 if (skippedUnreadableDirs > 0) console.log(`无法列出的会话目录 ${skippedUnreadableDirs} 个（已计入上方代数之外）`)
 if (skippedLoglessSessions > 0) console.log(`没有任何日志的会话目录 ${skippedLoglessSessions} 个`)

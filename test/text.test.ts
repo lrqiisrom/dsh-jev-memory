@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { blocksToText, clip, estimateTokens, hashText, looksInterrogative, normalize, splitSentences } from '../dsh/lib/text.ts'
-import { isNoise, matchTypeSignals, screenSentence, signatureOf } from '../dsh/lib/signals.ts'
+import { isNoise, isNoteworthyVeto, matchTypeSignals, screenSentence, signatureOf } from '../dsh/lib/signals.ts'
 
 test('blocksToText keeps only text blocks', () => {
   const content = [
@@ -155,4 +155,26 @@ test('a question phrased with 是什么 is still a question', () => {
   assert.equal(looksInterrogative('入口在哪里'), true)
   assert.equal(looksInterrogative('入口是 api/main.py。'), false)
   assert.equal(looksInterrogative('必须用 pnpm 管理依赖。'), false)
+})
+
+test('a pasted transcript line is not the user speaking', () => {
+  // Measured on the labelled corpus before this rule existed: 9 of 38 rows were
+  // transcript lines and the person marked all 9 "do not remember". The plugin was
+  // memorizing questions an interviewer had asked, inside an interview being
+  // rehearsed.
+  assert.deepEqual(screenSentence('面试官:我们就是做了假，假设啊，假设你当你是当时在设计这个方案嘛。'), {
+    keep: false,
+    reason: 'transcript',
+  })
+  assert.deepEqual(screenSentence('你:呃，collation呢，我们有一个指标是它的一个成功率的一个指标。'), {
+    keep: false,
+    reason: 'transcript',
+  })
+  assert.equal(isNoteworthyVeto('transcript'), true, 'a pasted batch is worth counting')
+
+  // A first-person statement is untouched: the label needs the colon to be a
+  // transcript marker, so an ordinary sentence that happens to start with 我 or a
+  // code label that reads like prose survives.
+  assert.deepEqual(screenSentence('我明确一下，语言不要选 Java，所以 DSH 的 Java Native 插件方案不做。'), { keep: true, reason: null })
+  assert.deepEqual(screenSentence('我认为：端口固定 8000 比较合适。'), { keep: true, reason: null })
 })
