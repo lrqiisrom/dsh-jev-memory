@@ -234,7 +234,7 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
 
     const signal = matchTypeSignals(sentence)
     const clipped = sentence.length > config.maxChars ? `${sentence.slice(0, config.maxChars - 1)}…` : sentence
-    const score = Math.min(1, 0.35 + signal.weight * 0.35 + emphasisWeight(sentence) + lengthBonus(sentence))
+    const score = candidateScore(sentence)
 
     out.push({
       kind: 'user',
@@ -284,11 +284,29 @@ function fromToolFailure(data: EventData | null | undefined, seq: number, callNa
     seq,
     quote: excerpt(detail || text, 200),
     hintedType: 'pitfall',
-    signalScore: 0.75,
+    signalScore: TOOL_FAILURE_SIGNAL_SCORE,
     signals: ['tool-error'],
     tool,
   }
 }
+
+/**
+ * Where a sentence lands in the extractor's own scoring.
+ *
+ * Exported because a harness that already holds a sentence — a labelled row in the
+ * evaluation CSV — must be scored *exactly* as a live turn would score it. A second
+ * copy of this formula is what let the write-precision harness quietly carry one
+ * (it had not drifted yet, which is luck rather than design).
+ *
+ * @param sentence - normalized sentence.
+ * @returns a score in 0..1.
+ */
+export function candidateScore(sentence: string): number {
+  return Math.min(1, 0.35 + matchTypeSignals(sentence).weight * 0.35 + emphasisWeight(sentence) + lengthBonus(sentence))
+}
+
+/** The score given to a reproducible-looking tool failure, above any threshold in use. */
+export const TOOL_FAILURE_SIGNAL_SCORE = 0.75
 
 /**
  * Longer statements carry more context, but the bonus saturates fast so a wall

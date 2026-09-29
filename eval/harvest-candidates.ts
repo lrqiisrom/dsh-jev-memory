@@ -45,37 +45,27 @@ import { join } from 'node:path'
 
 import { extractCandidates } from '../dsh/lib/extract.ts'
 import { signatureOf } from '../dsh/lib/signals.ts'
-
-/**
- * Workspaces where the user was *building software*. Everything else is a control
- * (study, interview prep, chat).
- *
- * The first version of this list was wrong and the data said so: EchoMind landed
- * in the control stratum while containing plain build decisions ("那先做 sqlite 吧",
- * "继续做 orchestration/ + agents/"). A control stratum with coding in it answers
- * nothing, so the list is now stated with the evidence in view rather than from
- * memory of which folders sounded like projects.
- */
-const CODING_WORKSPACES = new Set([
-  '/Users/rom/Documents/ProjectLab/interview',
-  '/Users/rom/Documents/projectSDK',
-  '/Users/rom/Documents/EchoMind所有代码+详细文档+简历',
-])
+import { taskClassOf, type TaskClass } from './lib/task-class.ts'
 
 /**
  * Sample sizes per stratum.
  *
- * The signal-bearing coding slice is nearly exhausted on purpose: 155 rows exist,
- * so labelling 120 measures that slice almost exactly instead of estimating it.
+ * Coding rows are split by whether they carry a type signal, because the two halves
+ * behave differently and the headline is their weighted combination. Study and
+ * office rows are not split: neither answers the primary question, they only show
+ * whether a rate differs by what the session was about.
  */
 const SAMPLE = {
   'coding-signal': 120,
-  'coding-plain': 40,
-  control: 50,
+  'coding-plain': 60,
+  study: 60,
+  office: 40,
+  other: 40,
   vetoed: 30,
 }
 
 type Stratum = keyof typeof SAMPLE
+
 
 /**
  * The sample seed. Fixed, so the same pool and seed always choose the same rows;
@@ -86,9 +76,12 @@ const SAMPLE_SEED = 20260928
 interface Row {
   key: string
   stratum: Stratum
+  taskClass: TaskClass
   workspace: string
   kind: string
   hinted: string
+  /** the extractor's own score, or '' for a screened-out sentence (no candidate). */
+  score: string
   vetoReason: string
   seen: number
   text: string
@@ -182,7 +175,9 @@ async function sessionFiles(): Promise<SessionLog[]> {
 }
 
 const rows = new Map<string, Row>()
-const population = { 'coding-signal': 0, 'coding-plain': 0, control: 0, vetoed: 0 } as Record<Stratum, number>
+const population = { 'coding-signal': 0, 'coding-plain': 0, study: 0, office: 0, other: 0, vetoed: 0 } as Record<Stratum, number>
+/** Deduped rows per task class, so the report can weight by what the corpus holds. */
+const classPopulation: Record<TaskClass, number> = { coding: 0, study: 0, office: 0, other: 0 }
 /** `legacy` = only pre-versioned logs; anything else = every session. */
 const frame = process.env.HARVEST_FRAME?.trim() ?? ''
 let turns = 0
@@ -217,7 +212,8 @@ for (const log of await sessionFiles()) {
   let workspace = '?'
   let turn: Array<{ seq: number; type: string; data: unknown }> = []
   let seq = 0
-  const isCoding = (): boolean => CODING_WORKSPACES.has(workspace)
+  /** The class of the session currently being read; `other` for an unlisted one. */
+  const taskClass = (): TaskClass => taskClassOf(workspace)
   const flush = () => {
     if (turn.length === 0) return
     turns += 1
@@ -231,12 +227,15 @@ for (const log of await sessionFiles()) {
           return
         }
         population.vetoed += 1
+        classPopulation[taskClass()] += 1
         rows.set(key, {
           key,
           stratum: 'vetoed',
+          taskClass: taskClass(),
           workspace,
           kind: 'vetoed',
           hinted: '',
+          score: '',
           vetoReason: reason ?? 'unknown',
           seen: 1,
           text: sentence,
@@ -250,14 +249,19 @@ for (const log of await sessionFiles()) {
         existing.seen += 1
         continue
       }
-      const stratum: Stratum = !isCoding() ? 'control' : candidate.hintedType ? 'coding-signal' : 'coding-plain'
+      const cls = taskClass()
+      const stratum: Stratum =
+        cls === 'coding' ? (candidate.hintedType ? 'coding-signal' : 'coding-plain') : cls
       population[stratum] += 1
+      classPopulation[cls] += 1
       rows.set(candidate.key, {
         key: candidate.key,
         stratum,
+        taskClass: cls,
         workspace,
         kind: candidate.kind,
         hinted: candidate.hintedType ?? '',
+        score: candidate.signalScore.toFixed(3),
         vetoReason: '',
         seen: 1,
         text: candidate.text,
@@ -395,9 +399,25 @@ function carriedLabels(text: string): Map<string, { label: string; note: string 
   return carried
 }
 
+/**
+ * `HARVEST_ONLY_CLASS=coding` draws the sample from one task class only.
+ *
+ * A batch restricted to coding exists because the classes are wildly uneven in this
+ * corpus: coding is about 40 rows while study is nearly 300, so one shared sample
+ * either drowns the primary metric in revision questions or spends the person's
+ * time on rows that do not answer it. A class-restricted batch is a census of what
+ * matters, and each batch keeps its own file.
+ */
+const onlyClass = process.env.HARVEST_ONLY_CLASS?.trim() ?? ''
+
 const chosen: Row[] = []
+/** How many rows the sample was actually drawn from, per stratum. */
+const poolSizes: Record<string, number> = {}
 for (const stratum of Object.keys(SAMPLE) as Stratum[]) {
-  const pool = [...rows.values()].filter((row) => row.stratum === stratum)
+  const pool = [...rows.values()].filter(
+    (row) => row.stratum === stratum && (onlyClass === '' || row.taskClass === onlyClass),
+  )
+  poolSizes[stratum] = pool.length
   chosen.push(...sample(pool, SAMPLE[stratum], SAMPLE_SEED))
 }
 
@@ -406,7 +426,7 @@ function field(value: string): string {
   return /[",\n]/u.test(value) ? `"${value.replace(/"/gu, '""')}"` : value
 }
 
-const header = 'row,stratum,workspace,kind,hinted_type,veto_reason,seen,id,text,label,note'
+const header = 'row,stratum,task_class,workspace,kind,hinted_type,signal_score,veto_reason,seen,id,text,label,note'
 
 // `HARVEST_OUT_DIR` exists so a test can harvest into a temporary directory
 // instead of writing under `eval/labels/`, where it would sit beside a real batch.
@@ -420,12 +440,42 @@ try {
 } catch {
   /* no previous file: nothing to carry */
 }
-const carried = carriedLabels(previous)
+/** Labels already in the target file. Losing one of these is what must never happen. */
+const own = carriedLabels(previous)
+/** Own labels plus imported ones; own wins on a conflict. */
+const carried = new Map(own)
+
+// Labels from sibling batches are imported opportunistically: a person may already
+// have judged the same sentence in `round1.csv`, and judging is the expensive part.
+// They are not protected the way this file's own labels are — a batch that does not
+// contain a row keeps that row's label in the file it came from.
+const importedFrom = (process.env.HARVEST_CARRY_FROM?.trim() ?? '')
+  .split(',')
+  .map((name) => name.trim())
+  .filter((name) => name !== '')
+const imported: string[] = []
+for (const name of importedFrom) {
+  let text = ''
+  try {
+    text = await readFile(join(outDir, name), 'utf8')
+  } catch {
+    continue
+  }
+  for (const [id, label] of carriedLabels(text)) {
+    if (carried.has(id)) continue
+    carried.set(id, label)
+    imported.push(id)
+  }
+}
 
 // A re-harvest is safe by construction: every label moves to the row with the same
 // id. A label whose row does not survive the new sample would be destroyed, and
 // that is the one thing this tool must never do quietly, so it stops instead.
-const orphaned = [...carried.keys()].filter((id) => !chosen.some((row) => row.key === id))
+//
+// Only this file's own labels are protected. A label imported from a sibling batch
+// stays in that batch, so a coding-only batch is not blocked by the study rows that
+// a previous batch happens to contain.
+const orphaned = [...own.keys()].filter((id) => !chosen.some((row) => row.key === id))
 if (orphaned.length > 0 && process.env.HARVEST_FORCE?.trim() !== '1') {
   console.error(`重抽后有 ${orphaned.length} 行已标注的句子不在样本里，继续会丢掉这些标注：`)
   for (const id of orphaned.slice(0, 10)) console.error(`  ${id}`)
@@ -433,14 +483,20 @@ if (orphaned.length > 0 && process.env.HARVEST_FORCE?.trim() !== '1') {
   process.exit(1)
 }
 
+/** How many of the sampled rows kept a label, from this file and from siblings. */
+const keptOwn = chosen.filter((row) => own.has(row.key)).length
+const keptImported = chosen.filter((row) => !own.has(row.key) && carried.has(row.key)).length
+
 const lines = chosen.map((row, index) => {
   const kept = carried.get(row.key)
   return [
     String(index + 1),
     row.stratum,
+    row.taskClass,
     row.workspace,
     row.kind,
     row.hinted,
+    row.score,
     row.vetoReason,
     String(row.seen),
     row.key,
@@ -474,12 +530,23 @@ const snapshot = {
   humanMessages,
   candidates: {
     raw: rawCandidates,
-    deduped: population['coding-signal'] + population['coding-plain'] + population.control,
+    deduped:
+      population['coding-signal'] +
+      population['coding-plain'] +
+      population.study +
+      population.office +
+      population.other,
   },
   vetoes: { raw: rawVetoes, deduped: population.vetoed },
   population,
+  classPopulation,
+  poolSizes,
   sample: SAMPLE,
+  ...(onlyClass === '' ? {} : { onlyClasses: onlyClass }),
+  importedFrom,
+  importedLabels: imported.length,
   labelledCarried: chosen.filter((row) => carried.has(row.key)).length,
+  ownLabelsCarried: keptOwn,
   /** sha256(signature)[:16] per sampled row, in CSV order. */
   rowHashes,
 }
@@ -490,16 +557,24 @@ console.log(`日志代数：${Object.entries(logsByGeneration).map(([gen, count]
 if (skippedUnreadableDirs > 0) console.log(`无法列出的会话目录 ${skippedUnreadableDirs} 个（已计入上方代数之外）`)
 if (skippedLoglessSessions > 0) console.log(`没有任何日志的会话目录 ${skippedLoglessSessions} 个`)
 console.log(`跳过子会话 ${skippedChildSessions} 个（父代理的提示词不是人的话）`)
-console.log(`回合 ${turns}｜人类消息 ${humanMessages}｜原始候选 ${rawCandidates} → 去重 ${population['coding-signal'] + population['coding-plain'] + population.control}｜原始被筛 ${rawVetoes} → 去重 ${population.vetoed}`)
+console.log(`回合 ${turns}｜人类消息 ${humanMessages}｜原始候选 ${rawCandidates} → 去重 ${population['coding-signal'] + population['coding-plain'] + population.study + population.office + population.other}｜原始被筛 ${rawVetoes} → 去重 ${population.vetoed}`)
 console.log('\n总体（去重后）与抽样：')
 for (const stratum of Object.keys(SAMPLE) as Stratum[]) {
-  console.log(`  ${stratum.padEnd(14)} 总体 ${String(population[stratum]).padStart(4)}  抽样 ${SAMPLE[stratum]}`)
+  console.log(
+    `  ${stratum.padEnd(14)} 总体 ${String(population[stratum]).padStart(4)}  可选 ${String(poolSizes[stratum] ?? 0).padStart(4)}  抽样 ${SAMPLE[stratum]}`,
+  )
 }
 const codingTotal = population['coding-signal'] + population['coding-plain']
 console.log(
   `\n编码组权重：带信号 ${(population['coding-signal'] / codingTotal * 100).toFixed(1)}%、不带信号 ${(population['coding-plain'] / codingTotal * 100).toFixed(1)}%（报告里按此加权）`,
 )
-const keptLabels = chosen.filter((row) => carried.has(row.key)).length
-if (carried.size > 0) console.log(`\n沿用已有标注 ${keptLabels}/${carried.size} 行（按句子 id 对齐）`)
+console.log(
+  `语料按任务类：${Object.entries(classPopulation).map(([cls, count]) => `${cls} ${count}`).join('｜')}`,
+)
+
+if (own.size > 0) console.log(`\n沿用本文件已有标注 ${keptOwn}/${own.size} 行`)
+if (imported.length > 0) {
+  console.log(`从 ${importedFrom.join('｜')} 导入标注 ${keptImported}/${imported.length} 行（按句子 id 对齐）`)
+}
 console.log(`\n已写出 ${outFile}`)
 console.log(`语料快照 ${frameFile}`)

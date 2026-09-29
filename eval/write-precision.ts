@@ -18,11 +18,11 @@
  * @module eval/write-precision
  */
 
+import { candidateScore } from '../dsh/lib/extract.ts'
 import { applyGate, createJudge, type Judgement } from '../dsh/lib/judge.ts'
 import { createJevClient } from '../dsh/lib/jev.ts'
 import { screenSentence, signatureOf } from '../dsh/lib/signals.ts'
 import { matchTypeSignals } from '../dsh/lib/signals.ts'
-import { emphasisWeight } from '../dsh/lib/signals.ts'
 
 /** One labelled candidate. `real` means it came out of a live session verbatim. */
 interface Case {
@@ -70,16 +70,16 @@ const CASES: Case[] = [
 
 const GATE = { types: ['constraint', 'pitfall', 'decision'], minImportance: 0.6, minRemember: 0.6, reviewOnConflict: true }
 
-/** Build the candidate shape the judge port expects, without the extractor. */
+/**
+ * Build the candidate shape the judge port expects.
+ *
+ * The score comes from the extractor itself rather than a copy of its formula, so
+ * this harness cannot measure a judge against different inputs than the plugin
+ * produces.
+ */
 function candidateOf(text: string) {
   const signals = matchTypeSignals(text)
-  return {
-    key: signatureOf(text),
-    text,
-    hintedType: signals.type,
-    signalScore: Math.min(1, 0.35 + signals.weight * 0.35 + emphasisWeight(text) + Math.min(0.15, text.length / 800)),
-    signals: signals.hits,
-  }
+  return { key: signatureOf(text), text, hintedType: signals.type, signalScore: candidateScore(text), signals: signals.hits }
 }
 
 interface Score {
@@ -151,10 +151,47 @@ async function evaluate(name: string, rows: Judgement[], thresholds: number[]) {
 await evaluate('heuristic judge', heuristic.heuristics(candidates), [GATE.minRemember])
 if (await jev.isAvailable()) {
   const judge = createJudge({ config: { judge: 'jev', types: GATE.types, judgeTimeoutMs: 5000 }, jev })
-  const started = Date.now()
-  const result = await judge.judge(candidates, { known: [], project: '/Users/rom/Documents/projectSDK/dsh-jev-memory' })
-  console.log(`Jev 判定耗时 ${Date.now() - started}ms，应答模型 ${result.model ?? '(未知)'}，降级=${result.degraded ?? '无'}\n`)
-  await evaluate('Jev judge', result.rows, [0.3, 0.5, 0.6, 0.7])
+  // The model judge is not deterministic, which a second run of this script made
+  // obvious: one candidate changed verdict between two identical runs, moving
+  // precision by six points on a sixteen-row set. A single run therefore reports a
+  // coin flip as a measurement, so repeats are supported and the flip rate is shown.
+  const repeats = Math.max(1, Number(process.env.WP_REPEAT ?? '1') || 1)
+  const runs: Judgement[][] = []
+  for (let index = 0; index < repeats; index += 1) {
+    const started = Date.now()
+    const result = await judge.judge(candidates, { known: [], project: '/Users/rom/Documents/projectSDK/dsh-jev-memory' })
+    console.log(
+      `Jev 第 ${index + 1}/${repeats} 次：耗时 ${Date.now() - started}ms，应答模型 ${result.model ?? '(未知)'}，降级=${result.degraded ?? '无'}`,
+    )
+    runs.push(result.rows)
+  }
+  console.log()
+  await evaluate('Jev judge', runs[0] ?? [], [0.3, 0.5, 0.6, 0.7])
+
+  if (repeats > 1) {
+    // A candidate sitting next to the threshold is the reason a single run is not a
+    // measurement: one candidate here scored 0.58 in one run and crossed 0.6 in
+    // another, which alone moved precision from 0.86 to 1.00. The spread is printed
+    // for every candidate rather than only the ones that happened to flip, because
+    // "did not flip in six runs" is not the same as "is stable".
+    console.log(`==== 判定稳定性（${repeats} 次，阈值 ${GATE.minRemember}）====`)
+    const spread = survivors.map((item, index) => {
+      const remembers = runs.map((rows) => rows[index]?.remember).filter((value): value is number => typeof value === 'number')
+      const writes = runs.map((rows) => applyGate(rows[index], GATE).write).filter(Boolean).length
+      const low = remembers.length > 0 ? Math.min(...remembers) : Number.NaN
+      const high = remembers.length > 0 ? Math.max(...remembers) : Number.NaN
+      return { item, low, high, width: high - low, writes }
+    })
+    spread.sort((left, right) => right.width - left.width)
+    for (const entry of spread.slice(0, 6)) {
+      console.log(
+        `  remember ${entry.low.toFixed(2)}–${entry.high.toFixed(2)}（波动 ${entry.width.toFixed(2)}）｜写入 ${entry.writes}/${repeats} 次｜${entry.item.text.slice(0, 34)}`,
+      )
+    }
+    const flips = spread.filter((entry) => entry.writes > 0 && entry.writes < repeats).length
+    const unstable = spread.filter((entry) => entry.width > 0).length
+    console.log(`  越过阈值次数不一致的候选 ${flips}/${survivors.length}；分数有波动的候选 ${unstable}/${survivors.length}\n`)
+  }
 } else {
   console.log('未配置 TYPESAFE_API_KEY：只跑了启发式与确定性筛查。')
 }

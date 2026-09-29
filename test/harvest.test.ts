@@ -178,7 +178,7 @@ test('a second run keeps the rows already chosen, and the labels on them', async
       assert.ok(after.includes(id), `already-chosen row ${id} survived the corpus growing`)
     }
     assert.match(await readFile(outFile, 'utf8'), /,1,looks useful/u, 'the label moved with its row')
-    assert.match(grown.stdout, /沿用已有标注 1\/1 行/u)
+    assert.match(grown.stdout, /沿用本文件已有标注 1\/1 行/u)
   } finally {
     await rm(home, { recursive: true, force: true })
     await rm(out, { recursive: true, force: true })
