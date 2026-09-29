@@ -7,6 +7,7 @@ import {
   CONFLICT_CHOICES,
   findConflictPartner,
   rankConflictPartners,
+  tokenList,
   tokenize,
 } from '../dsh/lib/conflict.ts'
 import type { MemoryRecord } from '../dsh/lib/store.ts'
@@ -107,4 +108,27 @@ test('the scorer is swappable, which is how an embedding path plugs in', () => {
   // number came from, which is what lets cosine similarity replace BM25 unchanged.
   const ranked = rankConflictPartners('随便', records, 1, (_incoming, record) => (record.id === 'y' ? 1 : 0))
   assert.deepEqual(ranked.map((entry) => entry.id), ['y'])
+})
+
+test('Chinese segmentation keeps a spurious token out of the ranking', () => {
+  // Measured before the tokenizer changed: raw bigrams turn `不要用` into `不要` + `要用`,
+  // and `要用` is then rare enough to lift "不要用 yarn" above the memory that is
+  // actually about the same thing. The runtime's segmenter cuts at `不要|用`, so the
+  // invented token never exists and the port memory wins.
+  const records = [
+    ...Array.from({ length: 8 }, (_, index) => memory(`f${index}`, `不要提交临时文件 ${index}`)),
+    memory('yarn', '不要用 yarn'),
+    memory('port', '服务端口用 8000'),
+  ]
+  assert.equal(rankConflictPartners('端口不要用 9000 了', records, 1)[0]?.id, 'port')
+})
+
+test('the tokenizer returns Chinese words when the runtime can segment', () => {
+  // `Intl.Segmenter` ships with Node, so this is a no-dependency capability — but a
+  // reduced-ICU build would answer in single characters, which is worse than bigrams,
+  // and `tokenList` falls back in that case rather than trusting it.
+  const tokens = tokenList('不要用 yarn')
+  assert.ok(tokens.includes('不要'), 'a word, not the bigram pair 不要 + 要用')
+  assert.ok(tokens.includes('yarn'))
+  assert.equal(tokens.includes('要用'), false, 'the invented bigram is gone')
 })

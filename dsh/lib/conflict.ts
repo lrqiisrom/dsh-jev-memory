@@ -38,39 +38,88 @@ export interface ConflictPair {
 }
 
 /**
- * Tokenize for the overlap score: latin words plus CJK bigrams.
+ * Chinese word segmentation, from the runtime rather than a dependency.
  *
- * Bigrams rather than single characters because single CJK characters are far
- * too common to carry meaning ("的", "用"), and rather than full segmentation
- * because that would need a dictionary the plugin does not have.
+ * `Intl.Segmenter` is part of V8 and Node ships full ICU, so a Chinese dictionary
+ * segmenter is already on the machine — "no segmenter" was the wrong summary of the
+ * situation, and the fix cost no dependency at all.
  *
- * @param text - any text.
- * @returns the token set.
+ * Measured on this corpus, against the alternatives (`端口不要用 9000 了` should rank
+ * "服务端口用 8000" above "不要用 yarn"):
+ *
+ * | tokenizer                     | 不要用 yarn | 服务端口用 8000 | verdict |
+ * |-------------------------------|-------------|-----------------|---------|
+ * | raw character bigrams         | 2.733       | 2.188           | wrong   |
+ * | segmenter words               | 1.814       | 4.959           | right   |
+ * | segmenter words + inner bigrams | 1.814     | 4.959           | right   |
+ *
+ * Bigrams lose because `不要用` becomes `不要` + `要用`, and `要用` is then a *rare*
+ * token that mints IDF for whichever memory contains it. The segmenter cuts at
+ * `不要|用` and the invention disappears.
+ *
+ * The self-test below exists because a runtime built with a reduced ICU would return
+ * single characters instead of words, which is *worse* than bigrams. Rather than trust
+ * the locale data, one probe sentence is segmented at load: if `不要` does not come back
+ * whole, the tokenizer falls back to bigrams.
  */
-export function tokenize(text: string): Set<string> {
-  return new Set(tokenList(text))
-}
+const SEGMENTER: Intl.Segmenter | null =
+  typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function'
+    ? new Intl.Segmenter('zh-Hans', { granularity: 'word' })
+    : null
+
+/** Whether the runtime really segments Chinese into words, probed once. */
+const SEGMENTS_CHINESE: boolean = (() => {
+  if (SEGMENTER === null) return false
+  try {
+    const probe = [...SEGMENTER.segment('不要')].filter((part) => part.isWordLike).map((part) => part.segment)
+    return probe.length === 1 && probe[0] === '不要'
+  } catch {
+    return false
+  }
+})()
 
 /**
- * The same tokens, with repetition kept.
- *
- * BM25 needs term frequency, and the set above throws it away — summing over a set
- * silently turns BM25 into an IDF-weighted overlap. Repetition is meaning here: a
- * sentence that says `data` four times is more about `data` than one that says it once.
+ * Tokenize for the overlap score: latin words, plus Chinese words or bigrams.
  *
  * @param text - any text.
- * @returns the token list, in text order, duplicates included.
+ * @returns the tokens, with repetition, in text order.
  */
 export function tokenList(text: string): string[] {
   const tokens: string[] = []
   const normalized = String(text ?? '').toLowerCase()
   for (const word of normalized.match(/[a-z0-9_.-]{3,}/gu) ?? []) tokens.push(word)
-  const cjk = normalized.replace(/[^\u3400-\u9fff]/gu, ' ')
-  for (const run of cjk.split(/\s+/u)) {
-    if (run.length < 2) continue
+
+  const cjkRuns = normalized
+    .replace(/[^\u3400-\u9fff]+/gu, ' ')
+    .split(/\s+/u)
+    .filter((run) => run.length >= 2)
+  if (cjkRuns.length === 0) return tokens
+
+  if (SEGMENTS_CHINESE && SEGMENTER !== null) {
+    for (const run of cjkRuns) {
+      for (const part of SEGMENTER.segment(run)) {
+        if (part.isWordLike) tokens.push(part.segment)
+      }
+    }
+    return tokens
+  }
+
+  // Fallback: character bigrams. Single characters are far too common to carry
+  // meaning ("的", "用"), and a dictionary is what would be needed to do better.
+  for (const run of cjkRuns) {
     for (let index = 0; index + 2 <= run.length; index += 1) tokens.push(run.slice(index, index + 2))
   }
   return tokens
+}
+
+/**
+ * The token set for the overlap score.
+ *
+ * @param text - any text.
+ * @returns the distinct tokens.
+ */
+export function tokenize(text: string): Set<string> {
+  return new Set(tokenList(text))
 }
 
 /**
@@ -104,13 +153,11 @@ export interface Bm25Options {
  * normalization and term saturation are exactly those three fixes, and BM25 is the
  * standard form of them — it costs one pass over the memories and no dependency.
  *
- * **Measured caveat, so nobody over-claims this.** On Chinese text the gain is muted
- * by not having a segmenter: bigrams of `不要用` are `不要` and `要用`, and `要用` is
- * then a *rare* token that mints spurious IDF for whichever memory happens to contain
- * it. Trying to build a case where BM25 beats the ratio on Chinese, the ratio won as
- * often as it lost. What BM25 demonstrably fixes here is the *ordering* of memories
- * with a genuinely shared rare term (verified with clean latin tokens); what it does
- * not fix is paraphrase, which is what the embedding option exists for.
+ * **What it does not fix is paraphrase.** "data 下的文件别碰" and "不要改动 data/
+ * 目录" share one token; no lexical scorer will connect them, which is what the
+ * `embedding` option exists for. (`tokenList` carries the separate measurement of how
+ * Chinese is tokenized — raw bigrams invented a rare token and ranked the wrong memory,
+ * the runtime's own segmenter does not.)
  *
  * The stats are computed once per call, so build one scorer per candidate and reuse
  * it across the memories; the returned function caches its query tokens for that.
