@@ -78,6 +78,13 @@ export interface MemoryRecord {
   /** 0..1, produced by the judgement layer. */
   importance: number
   /**
+   * The record this one replaced, when a person answered a conflict with "use the new
+   * one". Kept as a link rather than a deletion, on both sides.
+   */
+  supersedes?: string | null
+  /** The record that replaced this one; set together with `status: 'superseded'`. */
+  supersededBy?: string | null
+  /**
    * `needs-review` = suspected conflict, withheld from recall;
    * `superseded` = a human chose to replace it, kept for audit but never injected.
    */
@@ -372,6 +379,26 @@ export class MemoryStore {
    * @param id - record id.
    * @returns whether a record was removed.
    */
+  /**
+   * Mark a record as replaced by another, without deleting it.
+   *
+   * The question the person answers says the old memory is kept "for later reference".
+   * Deleting it made that a lie, and the comment above the old code path claimed
+   * `superseded` while calling `remove` — the record was gone and only its id survived
+   * in the ledger. A superseded record keeps its text, loses `active`, and stops being
+   * recalled or searched, which is what "no longer in use" should mean.
+   *
+   * @param id - the record being replaced.
+   * @param byId - the record that replaces it, or null when nothing does.
+   * @returns whether the record existed.
+   */
+  async supersede(id: string, byId: string | null = null): Promise<boolean> {
+    const record = this.#records.get(id)
+    if (!record) return false
+    await this.put({ ...record, status: 'superseded', supersededBy: byId, updatedAt: this.#now() })
+    return true
+  }
+
   async remove(id: string): Promise<boolean> {
     if (!this.#records.has(id)) return false
     this.#unindex(id)
@@ -537,6 +564,8 @@ export function normalizeRecord(record: unknown, now: number): MemoryRecord | nu
     cwd: typeof source.cwd === 'string' && source.cwd ? source.cwd : null,
     importance: clamp01(source.importance),
     status: normalizeStatus(source.status),
+    supersedes: typeof source.supersedes === 'string' ? source.supersedes : null,
+    supersededBy: typeof source.supersededBy === 'string' ? source.supersededBy : null,
     source: {
       sessionId: (sessionId ?? null) as string | null,
       seq: Number.isFinite(provenance?.seq) ? Number(provenance?.seq) : null,

@@ -124,9 +124,8 @@ test('Chinese segmentation keeps a spurious token out of the ranking', () => {
 })
 
 test('the tokenizer returns Chinese words when the runtime can segment', () => {
-  // `Intl.Segmenter` ships with Node, so this is a no-dependency capability — but a
-  // reduced-ICU build would answer in single characters, which is worse than bigrams,
-  // and `tokenList` falls back in that case rather than trusting it.
+  // `Intl.Segmenter` ships with Node, so this is a no-dependency capability: the words
+  // come from the runtime's own dictionary rather than from a package we added.
   const tokens = tokenList('不要用 yarn')
   assert.ok(tokens.includes('不要'), 'a word, not the bigram pair 不要 + 要用')
   assert.ok(tokens.includes('yarn'))

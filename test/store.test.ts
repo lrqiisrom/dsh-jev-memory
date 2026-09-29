@@ -130,3 +130,27 @@ test('normalizeRecord tolerates a hand-edited file', () => {
   assert.equal(normalizeRecord({}, 1), null)
   assert.equal(normalizeRecord(null, 1), null)
 })
+
+test('superseding keeps the old record, unlike deleting it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dshmem-store-'))
+  const store = createMemoryStore({ root: dir })
+  await store.load()
+  await store.put({ ...record(), id: 'old', text: '可以随便改 data/ 目录下的文件' })
+  await store.put({ ...record(), id: 'new', text: '不要改动 data/ 目录下的任何文件' })
+
+  assert.equal(await store.supersede('old', 'new'), true)
+  assert.equal(await store.supersede('missing', 'new'), false)
+
+  const old = store.get('old')
+  assert.equal(old?.status, 'superseded')
+  assert.equal(old?.supersededBy, 'new')
+  assert.match(String(old?.text), /可以随便改/u, 'the earlier statement is still readable')
+
+  // It has to survive a reload too: an audit trail that only exists in memory is not one.
+  const reopened = createMemoryStore({ root: dir })
+  await reopened.load()
+  const persisted = reopened.get('old')
+  assert.equal(persisted?.status, 'superseded')
+  assert.equal(persisted?.supersededBy, 'new')
+  assert.match(String(persisted?.text), /可以随便改/u)
+})

@@ -193,6 +193,10 @@ export function searchMemories(records: RecallableRecord[], query: string, optio
   const matches: SearchHit[] = []
   for (const record of records) {
     if (!inScope(record, cwd)) continue
+    // A superseded memory is history, not current knowledge. It stays in the store and
+    // in the ledger so the earlier statement can be read back, but handing it to a model
+    // as if it still held would undo the point of asking which one wins.
+    if (record.status === 'superseded') continue
     const haystack = `${record.text} ${record.type}`.toLowerCase()
     let score = 0
     if (needle && haystack.includes(needle)) score += 1

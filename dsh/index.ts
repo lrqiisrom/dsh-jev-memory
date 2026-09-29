@@ -448,7 +448,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.10.0'
+export const version = '0.11.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -1025,11 +1025,20 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       return
     }
 
-    // `superseded` rather than deleted: the old record stays auditable, and a
-    // human who changes their mind can see what the previous statement was.
-    if (choice === 'replace') await store.remove(existing)
+    // `superseded` rather than deleted: the old record keeps its text so a human who
+    // changes their mind can read what the previous statement was — which is what the
+    // question promises them. This used to call `store.remove` under a comment that
+    // said exactly this, so the promise was being broken by the line below it.
+    if (choice === 'replace') await store.supersede(existing, incoming)
     const record = store.get(incoming)
-    if (record) await store.put({ ...record, status: 'active', updatedAt: Date.now() })
+    if (record) {
+      await store.put({
+        ...record,
+        status: 'active',
+        supersedes: choice === 'replace' ? existing : (record.supersedes ?? null),
+        updatedAt: Date.now(),
+      })
+    }
     void store.ledger({
       kind: 'conflict-resolved',
       id: incoming,

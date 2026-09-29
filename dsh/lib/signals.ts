@@ -317,6 +317,37 @@ export const TRANSCRIPT_PATTERNS: RegExp[] = [
 ]
 
 /**
+ * A pasted fragment with no sentence of its own: a line of code, or structural
+ * markdown that survived the paste.
+ *
+ * Measured on the 38 labelled sentences pattern by pattern before shipping. Every
+ * pattern below rejects at least one row and **none of them rejects a row marked
+ * "remember"**:
+ *
+ * | pattern                                  | rows | marked remember |
+ * |------------------------------------------|------|-----------------|
+ * | code comment at the start (`//…`)        | 3    | 0               |
+ * | trailing semicolon                       | 3    | 0               |
+ * | code keyword at the start (`if`, `class`) | 1    | 0               |
+ * | markdown structure at the start (`**`, `---`, `#`, `|`) | 1 | 0 |
+ *
+ * **Two patterns I expected to ship are deliberately absent**, because the measurement
+ * said no: a leading `\end{itemize}` and an ephemeral path (`/var/folders/...`) both
+ * appear on sentences the person marked as worth remembering. Those rows are keepers
+ * with a dirty prefix — the fix for them is cleaning the text, not dropping it, and
+ * dropping them would have destroyed exactly the memories the plugin exists for.
+ */
+export const FRAGMENT_PATTERNS: RegExp[] = [
+  // A line of code, not a statement about the project.
+  /^\s*(?:\/\/|\/\*|\*\/|#!)/u,
+  /^\s*(?:if|else|for|while|switch|return|const|let|var|function|class|public|private|protected|package|import|export|void|int|string|def|func|struct|impl)\b/u,
+  /;\s*$/u,
+  // Structural markdown with no sentence around it. `#{1,6}\s` needs the space, so a
+  // reference like `#83` is not matched.
+  /^\s*(?:\*\*|---+|#{1,6}\s|\|\s)/u,
+]
+
+/**
  * Decide whether one sentence may become a memory at all.
  *
  * Returns a reason instead of a boolean so the ledger can record *why* a
@@ -339,6 +370,7 @@ export function screenSentence(sentence: string): ScreenDecision {
     return { keep: false, reason: 'task-instruction' }
   }
   if (PAYLOAD_PATTERNS.some((pattern) => pattern.test(sentence))) return { keep: false, reason: 'payload' }
+  if (FRAGMENT_PATTERNS.some((pattern) => pattern.test(sentence))) return { keep: false, reason: 'fragment' }
   // Chatter and questions live here rather than in the extractor, so there is one
   // screen entry point: the write-precision harness runs the same screens the
   // plugin does, and a sentence cannot be screened in one path but not the other.
@@ -361,6 +393,7 @@ export function isNoteworthyVeto(reason: string | null): boolean {
     reason === 'secret' ||
     reason === 'task-instruction' ||
     reason === 'payload' ||
+    reason === 'fragment' ||
     // A transcript line is dropped in bulk, but it is worth counting: a batch of
     // them means the user pasted a dialogue, which is a different situation from a
     // sentence that merely looked like chatter.

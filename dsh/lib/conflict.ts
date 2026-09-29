@@ -40,43 +40,31 @@ export interface ConflictPair {
 /**
  * Chinese word segmentation, from the runtime rather than a dependency.
  *
- * `Intl.Segmenter` is part of V8 and Node ships full ICU, so a Chinese dictionary
- * segmenter is already on the machine — "no segmenter" was the wrong summary of the
- * situation, and the fix cost no dependency at all.
+ * `Intl.Segmenter` is part of V8 and Node has shipped full ICU by default since v13
+ * (`process.config.variables.icu_small` is `false` on the official builds), so a Chinese
+ * dictionary segmenter is already on the machine — "no segmenter" was the wrong summary
+ * of the situation, and the fix cost no dependency at all.
  *
- * Measured on this corpus, against the alternatives (`端口不要用 9000 了` should rank
- * "服务端口用 8000" above "不要用 yarn"):
+ * Measured against raw character bigrams on the case they get wrong, ranking
+ * `端口不要用 9000 了` (the memory about ports should beat the one about yarn):
  *
- * | tokenizer                     | 不要用 yarn | 服务端口用 8000 | verdict |
- * |-------------------------------|-------------|-----------------|---------|
- * | raw character bigrams         | 2.733       | 2.188           | wrong   |
- * | segmenter words               | 1.814       | 4.959           | right   |
- * | segmenter words + inner bigrams | 1.814     | 4.959           | right   |
+ * | tokenizer                       | 不要用 yarn | 服务端口用 8000 | verdict |
+ * |---------------------------------|-------------|-----------------|---------|
+ * | raw character bigrams           | 2.733       | 2.188           | wrong   |
+ * | segmenter words                 | 1.814       | 4.959           | right   |
  *
- * Bigrams lose because `不要用` becomes `不要` + `要用`, and `要用` is then a *rare*
- * token that mints IDF for whichever memory contains it. The segmenter cuts at
- * `不要|用` and the invention disappears.
+ * Bigrams lose because `不要用` becomes `不要` + `要用`, and `要用` is then a *rare* token
+ * that mints IDF for whichever memory contains it. The segmenter cuts at `不要|用`.
  *
- * The self-test below exists because a runtime built with a reduced ICU would return
- * single characters instead of words, which is *worse* than bigrams. Rather than trust
- * the locale data, one probe sentence is segmented at load: if `不要` does not come back
- * whole, the tokenizer falls back to bigrams.
+ * There was a load-time probe here for a while, to fall back to bigrams on a reduced-ICU
+ * build that would answer in single characters. It was removed: the case cannot happen on
+ * an official build, and a fallback that fires silently is its own kind of surprise. The
+ * bigram path now only covers a runtime without `Intl.Segmenter` at all.
  */
 const SEGMENTER: Intl.Segmenter | null =
   typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function'
     ? new Intl.Segmenter('zh-Hans', { granularity: 'word' })
     : null
-
-/** Whether the runtime really segments Chinese into words, probed once. */
-const SEGMENTS_CHINESE: boolean = (() => {
-  if (SEGMENTER === null) return false
-  try {
-    const probe = [...SEGMENTER.segment('不要')].filter((part) => part.isWordLike).map((part) => part.segment)
-    return probe.length === 1 && probe[0] === '不要'
-  } catch {
-    return false
-  }
-})()
 
 /**
  * Tokenize for the overlap score: latin words, plus Chinese words or bigrams.
@@ -95,7 +83,7 @@ export function tokenList(text: string): string[] {
     .filter((run) => run.length >= 2)
   if (cjkRuns.length === 0) return tokens
 
-  if (SEGMENTS_CHINESE && SEGMENTER !== null) {
+  if (SEGMENTER !== null) {
     for (const run of cjkRuns) {
       for (const part of SEGMENTER.segment(run)) {
         if (part.isWordLike) tokens.push(part.segment)

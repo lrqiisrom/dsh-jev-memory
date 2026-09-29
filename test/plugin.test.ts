@@ -467,8 +467,22 @@ test('a suspected conflict is put to the human and the answer decides', async ()
 
     const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
     const found = await search.execute({ query: 'data' }, { agent: { session } })
-    assert.equal(found.matches.length, 1, 'the replaced memory must be gone')
+    assert.equal(found.matches.length, 1, 'the replaced memory must no longer be offered')
     assert.match(found.matches[0].text, /不要改动/)
+
+    // It is gone from use, not from the record. The question told the person their earlier
+    // statement would be kept "供以后查证", and until now the code deleted it, so that
+    // promise had nothing behind it.
+    const document = JSON.parse(await readFile(join(root, 'memory.json'), 'utf8')) as {
+      records?: Array<Record<string, unknown>>
+    } | Array<Record<string, unknown>>
+    const records = Array.isArray(document) ? document : (document.records ?? [])
+    const old = records.find((entry) => String(entry.text).includes('可以随便改'))
+    assert.ok(old, 'the superseded memory is still stored')
+    assert.equal(old.status, 'superseded')
+    assert.equal(old.supersededBy, found.matches[0].id)
+    const replacement = records.find((entry) => String(entry.text).includes('不要改动'))
+    assert.equal(replacement?.supersedes, old.id)
 
     await settle()
     const ledger = await readFile(join(root, 'ledger.jsonl'), 'utf8')
@@ -876,5 +890,37 @@ test('an embedding provider that is down falls back to lexical and still writes'
     await assert.rejects(readFile(join(root, 'embeddings.json'), 'utf8'))
   } finally {
     globalThis.fetch = original
+  }
+})
+
+// Superseding is not forgetting. `memory_forget` is the person saying "remove this", and
+// keeping a copy of something they asked to delete would be a different kind of lie.
+test('forgetting a superseded memory really removes it', async () => {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = jevStub()
+  try {
+    const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } }, undefined, (c) => {
+      c.askAnswer = [CONFLICT_CHOICES.replace]
+    })
+    const session = fakeSession({ events: [] })
+    const write = toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write')
+    const seeded = await write.execute({ text: '可以随便改 data/ 目录下的文件', type: 'constraint' }, { agent: { session } })
+
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: CONFLICTING_TURN }) },
+      turn: 1,
+      signal: undefined,
+    })
+
+    const forget = toolFor<ForgetArgs, MemoryForgetResult>(captured, 'memory_forget')
+    assert.deepEqual(await forget.execute({ id: seeded.id }, { agent: { session } }), { removed: [seeded.id], count: 1 })
+
+    const document = JSON.parse(await readFile(join(root, 'memory.json'), 'utf8')) as {
+      records?: Array<Record<string, unknown>>
+    }
+    const records = document.records ?? []
+    assert.equal(records.some((entry) => String(entry.text).includes('可以随便改')), false)
+  } finally {
+    globalThis.fetch = realFetch
   }
 })

@@ -178,3 +178,30 @@ test('a pasted transcript line is not the user speaking', () => {
   assert.deepEqual(screenSentence('我明确一下，语言不要选 Java，所以 DSH 的 Java Native 插件方案不做。'), { keep: true, reason: null })
   assert.deepEqual(screenSentence('我认为：端口固定 8000 比较合适。'), { keep: true, reason: null })
 })
+
+test('a pasted code line or markdown remnant is refused as a fragment', () => {
+  // Each of these was measured against the labelled rows first: every one rejects at
+  // least one row and none of them rejects a row marked "remember".
+  assert.deepEqual(screenSentence('// volatile 不能省！'), { keep: false, reason: 'fragment' })
+  assert.equal(screenSentence('if (instance == null) { // 必须有人调用才进这里').keep, false)
+  assert.equal(screenSentence('const cache = new Map<string, number>()').keep, false)
+  assert.equal(screenSentence('** --- # 六、注意：captured 和 committed 不是一回事').keep, false)
+  assert.equal(isNoteworthyVeto('fragment'), true, 'a pasted fragment is worth counting')
+})
+
+test('the two fragment rules the measurement rejected stay out', () => {
+  // Both of these are labelled "remember" in the corpus. They are keepers with a dirty
+  // prefix, so the answer is to clean the text rather than to drop the memory — and a
+  // rule that dropped them would have destroyed exactly what the plugin is for.
+  assert.deepEqual(screenSentence('\\end{itemize} 请你按照这个格式去写简历，测试部分的先不要说'), { keep: true, reason: null })
+  assert.equal(
+    screenSentence('此外这个agent框架 还有一个sandbox的封装（dsl coding没用到），如图： /var/folders/6t/x').keep,
+    true,
+  )
+
+  // And the ordinary sentences must survive the boundary cases: a `#` reference is not
+  // a markdown heading, and a colon is not a code line.
+  assert.deepEqual(screenSentence('参考 #83 那条，端口固定 8000。'), { keep: true, reason: null })
+  assert.deepEqual(screenSentence('必须用 pnpm 管理依赖，不要用 npm。'), { keep: true, reason: null })
+  assert.deepEqual(screenSentence('提交前必须保证 node --test test/*.test.ts 全绿。'), { keep: true, reason: null })
+})
