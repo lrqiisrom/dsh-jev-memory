@@ -2,7 +2,14 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { blocksToText, clip, estimateTokens, hashText, looksInterrogative, normalize, splitSentences } from '../dsh/lib/text.ts'
-import { isNoise, isNoteworthyVeto, matchTypeSignals, screenSentence, signatureOf } from '../dsh/lib/signals.ts'
+import {
+  isNoise,
+  isNoteworthyVeto,
+  matchTypeSignals,
+  screenSentence,
+  signatureOf,
+  stripPastedPrefixes,
+} from '../dsh/lib/signals.ts'
 
 test('blocksToText keeps only text blocks', () => {
   const content = [
@@ -204,4 +211,27 @@ test('the two fragment rules the measurement rejected stay out', () => {
   assert.deepEqual(screenSentence('参考 #83 那条，端口固定 8000。'), { keep: true, reason: null })
   assert.deepEqual(screenSentence('必须用 pnpm 管理依赖，不要用 npm。'), { keep: true, reason: null })
   assert.deepEqual(screenSentence('提交前必须保证 node --test test/*.test.ts 全绿。'), { keep: true, reason: null })
+})
+
+test('a pasted prefix is stripped, and it no longer decides the verdict', () => {
+  // The content behind the residue is real — that is why this is cleaning, not a screen.
+  assert.equal(stripPastedPrefixes('\\end{itemize} 此外这个agent框架 还有一个sandbox的封装'), '此外这个agent框架 还有一个sandbox的封装')
+  assert.equal(stripPastedPrefixes('\\item 端口固定 8000'), '端口固定 8000')
+  // An ephemeral path becomes the placeholder the signature already uses, so the text
+  // still shows that something was elided. A general path is left alone: a config file
+  // path can be the whole point of a memory.
+  assert.equal(
+    stripPastedPrefixes('如图： /var/folders/6t/abc/T/modlens-dsh-paste-Ulvt1u/paste.png 你可以分析一下'),
+    '如图： <path> 你可以分析一下',
+  )
+  assert.equal(stripPastedPrefixes('配置在 /etc/app/config.yaml'), '配置在 /etc/app/config.yaml')
+
+  // The half that matters: with the residue gone, the existing task-instruction screen
+  // can finally see the sentence for what it is. Before this, `\end{itemize}` in front of
+  // a one-off instruction *changed* the screen's verdict, which is the prefix deciding
+  // policy rather than the sentence.
+  assert.deepEqual(
+    screenSentence('请你按照这个格式去写简历，测试部分的先不要说，我后面会补评测，先只说技术亮点'),
+    { keep: false, reason: 'task-instruction' },
+  )
 })

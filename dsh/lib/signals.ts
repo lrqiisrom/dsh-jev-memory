@@ -348,6 +348,40 @@ export const FRAGMENT_PATTERNS: RegExp[] = [
 ]
 
 /**
+ * Strip garbage that a paste left in front of, or inside, a real sentence.
+ *
+ * Why this is cleaning and not screening: measured against the labelled corpus, the two
+ * families below appear on sentences the person marked as worth remembering. Dropping
+ * them would have destroyed the memories the plugin exists for; what is wrong with them
+ * is the prefix, not the content.
+ *
+ *  - **Structural residue from a pasted LaTeX/markdown block** (`\end{itemize}`,
+ *    `\item`, `\textbf`) — the sentence behind it is real, and the residue is why the
+ *    sentence used to slip past the task-instruction screen: `请你按照这个格式去写简历
+ *    …` is a one-off task instruction, and a `\end{itemize}` in front of it changed the
+ *    verdict. There is a test that pins both halves of that.
+ *  - **Ephemeral paths** (`/var/folders/...`, `/tmp/...`, a paste staging directory).
+ *    They point at a file that no longer exists, so a later session can do nothing with
+ *    them. Deliberately *not* general paths: a path to a config file can be the whole
+ *    point of a memory.
+ *
+ * The replacement is the `<path>` placeholder the signature already uses, rather than
+ * deletion, so the text still shows that something was there.
+ */
+export function stripPastedPrefixes(sentence: string): string {
+  return String(sentence ?? '')
+    .replace(/^\s*\\+(?:end|begin)\{[^}]*\}\s*/u, '')
+    .replace(/^\s*\\+(?:item|hline)\b[\s\d.]*/u, '')
+    .replace(/^\s*\\+(?:textbf|textit|emph|texttt)\{([^}]*)\}\s*/u, '$1')
+    .replace(
+      /\/private\/var\/folders\/\S+|\/var\/folders\/\S+|\/tmp\/\S+|modlens-dsh-paste-\S+/gu,
+      '<path>',
+    )
+    .replace(/\s{2,}/gu, ' ')
+    .trim()
+}
+
+/**
  * Decide whether one sentence may become a memory at all.
  *
  * Returns a reason instead of a boolean so the ledger can record *why* a

@@ -26,7 +26,14 @@
  */
 
 import { excerpt, normalize, splitSentences } from './text.ts'
-import { emphasisWeight, isNoteworthyVeto, matchTypeSignals, screenSentence, signatureOf } from './signals.ts'
+import {
+  emphasisWeight,
+  isNoteworthyVeto,
+  matchTypeSignals,
+  screenSentence,
+  signatureOf,
+  stripPastedPrefixes,
+} from './signals.ts'
 
 /**
  * A loosely typed session-event payload. Only the fields listed here are read
@@ -221,7 +228,10 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
   if (!text) return []
 
   const out: Candidate[] = []
-  for (const sentence of splitSentences(text)) {
+  for (const raw of splitSentences(text)) {
+    // Screen the cleaned sentence, not the raw one: a `\end{itemize}` in front of a task
+    // instruction used to change the verdict, which is the prefix deciding policy.
+    const sentence = stripPastedPrefixes(raw)
     if (sentence.length < config.minChars) continue
     const screen = screenSentence(sentence)
     if (!screen.keep) {
@@ -233,15 +243,25 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
     }
 
     const signal = matchTypeSignals(sentence)
-    const clipped = sentence.length > config.maxChars ? `${sentence.slice(0, config.maxChars - 1)}…` : sentence
     const score = candidateScore(sentence)
+
+    // Two texts, on purpose. `key` is the sentence's identity, computed from **what the
+    // person actually wrote** — the same input as before this cleaning existed, so no
+    // existing row's id changes and every label stays attached to its sentence. `text` is
+    // what gets stored and injected, with a pasted prefix removed so the memory reads as
+    // the sentence it is. Getting this backwards is easy and the test caught it once
+    // already: the comment claimed the raw sentence while the code passed the cleaned one.
+    const clip = (value: string): string =>
+      value.length > config.maxChars ? `${value.slice(0, config.maxChars - 1)}…` : value
+    const identity = clip(raw)
+    const stored = clip(sentence)
 
     out.push({
       kind: 'user',
-      text: clipped,
-      key: signatureOf(clipped),
+      text: stored,
+      key: signatureOf(identity),
       seq,
-      quote: excerpt(sentence, 200),
+      quote: excerpt(raw, 200),
       hintedType: signal.type,
       signalScore: score,
       signals: signal.hits,

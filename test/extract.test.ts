@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
+import { signatureOf } from '../dsh/lib/signals.ts'
 import { extractCandidates } from '../dsh/lib/extract.ts'
 import type { TurnEvent } from '../dsh/lib/extract.ts'
 
@@ -134,4 +135,18 @@ test('a failure that explains itself is still remembered', () => {
   const failure = extractCandidates(events).find((candidate) => candidate.kind === 'tool-failure')
   assert.ok(failure, 'a failure with a cause is a pitfall worth keeping')
   assert.match(failure.text, /磁盘配额用尽/u)
+})
+
+test('cleaning changes the stored text but never the sentence identity', () => {
+  // The whole reason cleaning is safe mid-evaluation: the label table joins on `id`, which
+  // is the signature of what the person actually wrote (clipped). Cleaning must therefore
+  // not touch it, or every label already given would be orphaned.
+  const raw = '\\end{itemize} 端口固定 8000，不要改，否则部署会连不上。'
+  const events: TurnEvent[] = [
+    { seq: 1, type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: raw }] } },
+  ]
+  const [candidate] = extractCandidates(events)
+  assert.ok(candidate, 'the sentence survives the screens once the residue is gone')
+  assert.equal(candidate.text, '端口固定 8000，不要改，否则部署会连不上。', 'stored text is cleaned')
+  assert.equal(candidate.key, signatureOf(raw), 'identity still comes from the original sentence')
 })
