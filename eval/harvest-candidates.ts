@@ -37,8 +37,21 @@ import { join } from 'node:path'
 import { extractCandidates } from '../dsh/lib/extract.ts'
 import { signatureOf } from '../dsh/lib/signals.ts'
 
-/** Workspaces the user identified as coding work. Everything else is a control. */
-const CODING_WORKSPACES = new Set(['/Users/rom/Documents/ProjectLab/interview', '/Users/rom/Documents/projectSDK'])
+/**
+ * Workspaces where the user was *building software*. Everything else is a control
+ * (study, interview prep, chat).
+ *
+ * The first version of this list was wrong and the data said so: EchoMind landed
+ * in the control stratum while containing plain build decisions ("那先做 sqlite 吧",
+ * "继续做 orchestration/ + agents/"). A control stratum with coding in it answers
+ * nothing, so the list is now stated with the evidence in view rather than from
+ * memory of which folders sounded like projects.
+ */
+const CODING_WORKSPACES = new Set([
+  '/Users/rom/Documents/ProjectLab/interview',
+  '/Users/rom/Documents/projectSDK',
+  '/Users/rom/Documents/EchoMind所有代码+详细文档+简历',
+])
 
 /**
  * Sample sizes per stratum.
