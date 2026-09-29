@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["dsh/**/*.ts", "test/**/*.ts"]
+  "include": ["dsh/**/*.ts", "test/**/*.ts", "eval/**/*.ts"]
 }
