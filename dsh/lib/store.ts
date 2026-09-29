@@ -374,12 +374,6 @@ export class MemoryStore {
   }
 
   /**
-   * Remove one record permanently.
-   *
-   * @param id - record id.
-   * @returns whether a record was removed.
-   */
-  /**
    * Mark a record as replaced by another, without deleting it.
    *
    * The question the person answers says the old memory is kept "for later reference".
@@ -399,6 +393,12 @@ export class MemoryStore {
     return true
   }
 
+  /**
+   * Remove one record permanently.
+   *
+   * @param id - record id.
+   * @returns whether a record was removed.
+   */
   async remove(id: string): Promise<boolean> {
     if (!this.#records.has(id)) return false
     this.#unindex(id)

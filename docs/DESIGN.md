@@ -224,3 +224,54 @@
 
 `zilliztech/memsearch` 已经**原生支持 DSH**（`plugins/dsh/`，npm `@zilliz/memsearch-dsh`，同一个 patch 层、同样的 `agent/pre-step` 注入点）。所以"官方没有 memory 包"仍然成立，但生态里的位置已经有人占了。它和我们是**正交而非替代**：它解决"记得多"（每回合全量落盘、LLM 摘要、Milvus 语义检索），我们解决"记得准"（写入门槛、类型、冲突、逐条可审计、可撤销）。它的设计里**没有** type / importance / conflict / 召回计数 / 台账——不是没做，是它明确把"写入不判定"当卖点。细节见 `docs/memsearch-notes.md`。
 
+---
+
+## 8. 身份、去重与规范化：设计决定（2026-09-29，待实现）
+
+### 8.1 已确认的事实（不靠推断）
+
+| 事实 | 出处 |
+|---|---|
+| Jev 的 API 只有 `noul` / `choice` / `score` 三种原语，**无法输出文本** | `docs/jev-api.md` |
+| 宿主有完整的 `llm` 服务：`stream({provider, model, messages, system, signal, maxTokens})` | `ctx.get('llm')`（Cordis Inspect：Service `llm`） |
+| 路由不必硬编码：`agentDefaultModel.currentSelection()` 返回默认模型选择，"independently of any Host or transport" | Service `agentDefaultModel` |
+| memsearch 的 DSH 插件**不是原文落盘**：每回合渲染成 transcript（≤6000 字，工具输出省略）→ LLM 摘要成 **2–10 条第三人称 bullet** → 追加进按日 markdown；原文靠 L1/L2/L3 渐进展开可回查 | `docs/memsearch-notes.md`（2026-09-29 修正） |
+| OpenViking 把话语抽进**类型化 schema 文件**（11 个 YAML / 9 启用），字段带 `merge_op`（patch/replace/sum/immutable），profile 每条 bullet 带 `(as of YYYY-MM-DD)`，preferences 用 `user`+`topic` 当**不可变身份键** | `docs/industry-memory-notes.md` §写入路径 |
+
+### 8.2 现在的问题（都被实测过）
+
+1. **`<n>` 归一化让"只差数字"的两句同 id** → 第二条被 `store.has()` 判为 duplicate **静默丢弃**。合成例子成立（"端口固定 8000，不要改" vs "9000"），但**真实语料 912 个签名里 0 组冲突** —— 潜在风险，不是正在发生的 bug。
+2. **签名认不出改写** → "不要用 npm" 与 "不能用 npm 装包" 各存一条，召回重复注入。
+3. **原句照搬的弊端**（使用者的观察，成立）：错别字、口水话、表达差会原样进入注入文本。
+
+根因：**一个键干了两件事** —— ①记忆的身份 ②同一个机器失败的重复计数。第二件事需要数字归一化，第一件事最怕它。
+
+### 8.3 决定：三件事各归其位
+
+| 角色 | 由谁承担 |
+|---|---|
+| 预筛与重复计数 | 归一化签名（现状不变，`<n>` 归一化保留） |
+| 身份（是不是同一条） | **模型**：只在确定性失败处提问（见 8.4） |
+| 注入文本 | **规范形式**（模型规范化）+ 原句永远保留可查 |
+
+### 8.4 第一步：写入操作只问在确定性失败处
+
+- **触发条件**（确定性预筛）：候选签名与已有记录相同；或 BM25/embedding 取到 top-1 且分数 ≥ 阈值。
+- **问一个问题**（`choice`）：`same-update`（是同一件事，新说法更新它）/ `same-duplicate`（完全同义，丢掉新的）/ `different`（不同的规矩，各自保留）。问题里带上**那一条**已有记忆的原文 —— 一次只给一个配对，避免 20 标签的 choice。
+- **落地**：`update` → `supersede` 旧记录 + 写新记录 + 记 `supersedes`；`duplicate` → 记 `duplicate`（现状）；`different` → 新增（现状）。
+- **回退**：无模型 / 超时 / 无配对 → 完全退回今天的行为。
+- **顺带**：`conflict-suspected` 的台账口径不变，两者可交叉验证。
+
+### 8.5 第二步：规范形式（两层记忆）
+
+- **证据层**：原句，永不被模型改写；台账、`source.quote`、`memory_search` 都指向它。
+- **规范层**：用宿主的 `llm`（provider/model 取自 `agentDefaultModel.currentSelection()`，可被配置覆盖）把原句规范成第三人称、修正错别字、去口水话的一句陈述。**硬约束：不得新增任何事实**；做不到就返回原句。
+- **注入用规范层**，但原句随时可查（等价于 memsearch 的 L2/L3）。
+- **默认先只记录不注入**：规范化结果先写台账，注入仍用原句，看过样例再打开。
+
+### 8.6 验收方式（避免"模型改写"变成不可控）
+
+1. 规范化前后"该不该记"在已标注的 38 句上**不得翻转**（标注针对主张，不针对措辞）——可自动跑；
+2. 抽查"是否引入原句没有的信息"（第二个模型或人工）；
+3. 操作选择的准确率用真实冲突/重复样本核对；
+4. 任何一步失败都退回今天的行为（fail-open），行为不变。
