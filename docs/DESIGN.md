@@ -179,6 +179,20 @@
 - **`askedCount` 必须同时更新内存**：重问的判据是"问过但没问够"，而这个计数从台账推导、只在启动时装载。只写台账不更新内存，同一进程里的重问会读到 0 而拒绝重问——测试一次就抓到了。
 - **配不上也要留痕**：两级都配不上时记一条 `conflict-unpaired`。否则那条记忆会安静地从召回里消失，而台账什么都不说——"静默失败"正是这个项目一直在防的东西。
 
+### 预设会静默关掉运行时上下文（已修，0.7.0）
+
+**这是个真洞，而且是别人先发现的**：OpenViking 官方的 DSH 记忆插件刻意不走 system prompt。我在 DSH 源码里核对了机制，结论比它 README 写的更精确：
+
+- `complete: true`（`minimal` 预设的 persona 段）**只收窄 `sections`**——`dsh-system-prompt/lib/index.js:355` 换成 `[completeSection]`，而 `:356` 的 `contexts` 原样保留。所以"声明 complete 就丢掉别的贡献"对 **section** 成立、对 **context** 不成立；
+- 真正让我们的注入消失的是 **`includeRuntimeContext: false`**（`minimal/agent.cordis.yml:14`）→ `dsh-persona` 调 `suppressRuntimeContext()` → `:344` 直接 `contexts: runtimeContextSuppressed ? [] : …`。**注意 `:344` 是"抑制就不去遍历注册表"，所以我们的回调根本不会被调用**——插件既不报错、也不写台账，完全静默。
+- 四个 preset 里只有 `minimal` 这么设；`standard`/`ptc`/`cordis` 都保留运行时上下文（所以此前看到的注入都是真的）。
+
+修法是**检测 + 换一种投递方式**，而不是放弃 context：
+
+1. **检测**：注册 `system-prompt/assemble`（官方描述为"专家级 waterfall，可读写装配结果"）。抑制只影响构建 contexts 数组，waterfall 照跑，所以在 `next()` 之后看自己的 context 名在不在，就是**证据**——而且它同时是那个"我确实有话要说"的探针（没内容可注入的会话不该被误判成坏了）。
+2. **投递**：`agent/pre-step` 的 waterfall **可以替换进入这一步的消息**（`PreStepDecision = {kind:'reject'} | {kind:'enter', messages}`），所以在同一轮把召回块作为一条 `source: {kind:'plugin', plugin:'jev-memory', form:'recall'}` 的消息追加进去即可。`form:'recall'` 是宿主自己为这种情况定义的标记，而带插件来源这点是**关键**——否则这条记忆看起来就像用户说的话，下一轮会被自己重新记一遍。
+3. 两条路共用同一个 `renderRecallFor()`（选择、渲染、计数、台账），`via` 字段区分投递方式；一轮只投一次（消息留在该轮历史里，后续步骤自然可见）；被别的监听器 `reject` 的步骤不追加（不复活不该跑的步骤）。
+
 ### 运行时坑（都在源码里留了注释）
 
 - **Cordis HMR 能重挂载插件行，但不能让 ESM 重新求值 `lib/*.ts`**：改 `cordis.patch.yml` 的注释不改变解析后的 patch 列表（`entry.update` 等价 → 不重挂）；**给行加 `config` 这类语义变更会重挂，但入口模块仍从 ESM 缓存返回**——这条是实测的：一次语义变更后新起的 `start` 台账里 `version` 还是旧值、也没有新加字段。所以 `start` 台账里带 `version`，用来判断"跑的是哪份代码"。**换一个行名指向新文件路径可以强制换一整套模块 URL**（从 `.js` 迁到 `.ts` 就是这么让修复上线的）；否则要重启进程。

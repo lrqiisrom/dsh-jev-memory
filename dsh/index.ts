@@ -38,6 +38,7 @@
  * @module dsh-jev-memory
  */
 
+import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -74,6 +75,8 @@ export interface SessionHeader {
   id?: string
   cwd?: string | null
   delegationDepth?: number
+  /** the preset that composed this session, recorded when suppression is detected. */
+  agentPreset?: string
   [key: string]: unknown
 }
 
@@ -88,6 +91,77 @@ export interface SessionLike {
 export interface AgentLike {
   id?: string
   session?: SessionLike | null
+  /** queue model-facing context for the next pre-step (used by the fallback path). */
+  inject?(message: RecallMessage): void
+}
+
+/** A user-role message carrying plugin-supplied context. */
+export interface RecallMessage {
+  id: string
+  role: 'user'
+  content: Array<{ type: 'text'; text: string }>
+  source: { kind: 'plugin'; plugin: string; form: 'recall' }
+}
+
+/** The part of a prompt assembly this plugin inspects. */
+export interface PromptAssemblyLike {
+  contexts?: ReadonlyArray<{ name?: string; text?: string }>
+}
+
+/** The `agent/pre-step` decision this plugin returns. */
+export type PreStepDecisionLike =
+  | { kind: 'reject' }
+  | { kind: 'enter'; messages: RecallMessage[]; startsRequestSeries?: true }
+
+/** The name this plugin registers its runtime context under. */
+export const RECALL_CONTEXT_NAME = 'jev-memory:recall'
+
+/**
+ * The session id behind an agent, or null when it cannot be read.
+ *
+ * @param agent - the agent handle.
+ * @returns the id, or null.
+ */
+export function sessionIdOf(agent: AgentLike | null | undefined): string | null {
+  const id = agent?.session?.header?.id ?? agent?.id
+  return typeof id === 'string' && id !== '' ? id : null
+}
+
+/**
+ * Narrow a pre-step decision to the "enter a step" variant.
+ *
+ * The harness hands the decision back as `unknown` through this plugin's reduced
+ * `on` signature, so the shape is checked rather than asserted: a listener that
+ * guessed wrong here would either drop somebody else's veto or corrupt the batch.
+ *
+ * @param value - whatever `next()` returned.
+ * @returns whether the value is an enter decision with a message list.
+ */
+export function isEnterDecision(
+  value: unknown,
+): value is { kind: 'enter'; messages: RecallMessage[]; startsRequestSeries?: true } {
+  const record = value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : null
+  return record?.kind === 'enter' && Array.isArray(record.messages)
+}
+
+/**
+ * Build the plugin-sourced message that carries a recall block.
+ *
+ * `form: 'recall'` is the harness's own tag for exactly this case, and the source
+ * keeps it distinguishable from anything the user typed — the difference the
+ * whole fallback depends on, since a memory that looked like a user message would
+ * be memorised again on the next turn.
+ *
+ * @param text - the rendered recall block.
+ * @returns a user-role message the agent can queue.
+ */
+export function recallMessage(text: string): RecallMessage {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'plugin', plugin: 'jev-memory', form: 'recall' },
+  }
 }
 
 /** The payload of `agent/turn-stopping`. */
@@ -347,7 +421,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.6.0'
+export const version = '0.7.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -654,12 +728,23 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   /** last injected id-set per session, to avoid ledger spam. */
   const lastRecall = new Map<string, string>()
 
-  const recallText = (assembleCtx: AssembleContext): string => {
-    if (!ready || !config.recall.enabled) return ''
+  /**
+   * The recall block for one agent, plus the identities it covered.
+   *
+   * Extracted from the prompt-context callback because the block is now delivered
+   * two ways — as runtime context normally, and as a plain message when a preset
+   * suppresses runtime context — and both must select, render, count and audit
+   * identically. A second copy of this logic would drift within a week.
+   *
+   * @param agent - the agent whose session is being served.
+   * @param via - how this block will be delivered, recorded in the ledger.
+   * @returns the rendered block ('' when there is nothing to say) and the ids.
+   */
+  const renderRecallFor = (agent: AgentLike | null | undefined, via: 'context' | 'message'): { text: string; ids: string[] } => {
+    if (!ready || !config.recall.enabled) return { text: '', ids: [] }
     try {
-      const agent = assembleCtx?.agent
       const header = agent?.session?.header
-      if (config.recall.skipSubagents && (header?.delegationDepth ?? 0) > 0) return ''
+      if (config.recall.skipSubagents && (header?.delegationDepth ?? 0) > 0) return { text: '', ids: [] }
       const cwd = header?.cwd ?? null
       const chosen = selectMemories(store.all(), {
         cwd,
@@ -668,34 +753,92 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         maxTokens: config.recall.maxTokens,
         now: Date.now(),
       })
-      if (chosen.length === 0) return ''
+      if (chosen.length === 0) return { text: '', ids: [] }
 
       const sessionId = String(header?.id ?? agent?.id ?? 'unknown')
-      const signature = chosen.map((entry) => entry.record.id).join(',')
+      const ids = chosen.map((entry) => entry.record.id)
+      const signature = `${via}:${ids.join(',')}`
       if (lastRecall.get(sessionId) !== signature) {
         lastRecall.set(sessionId, signature)
-        store.noteRecalled(chosen.map((entry) => entry.record.id))
+        store.noteRecalled(ids)
         void store.ledger({
           kind: 'recall',
           sessionId,
           cwd,
-          ids: chosen.map((entry) => entry.record.id),
+          via,
+          ids,
           tokens: estimateTokens(renderRecall(chosen, { includeHelp: false })),
         })
       }
-      return renderRecall(chosen)
+      return { text: renderRecall(chosen), ids }
     } catch (error) {
       log('warn', 'recall failed; injecting nothing', { error: String(error) })
-      return ''
+      return { text: '', ids: [] }
     }
   }
 
+  const recallText = (assembleCtx: AssembleContext): string => renderRecallFor(assembleCtx?.agent, 'context').text
+
   ctx.inject(['systemPrompt'], (scope) => {
     scope.systemPrompt.context({
-      name: 'jev-memory:recall',
+      name: RECALL_CONTEXT_NAME,
       order: config.contextOrder,
       text: recallText,
     })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Fallback: a preset can silently switch the runtime context off.
+  //
+  // Measured in the harness source, not guessed: with `includeRuntimeContext:
+  // false` (the shipped `minimal` preset) `SystemPrompt.assemble` builds an empty
+  // contexts array and never calls the callbacks — so this plugin would inject
+  // nothing, log nothing, and report nothing. Silent, which is the one failure
+  // mode this project keeps refusing to accept.
+  //
+  // Detection is a fact about the assembly, so it is read from the assembly: the
+  // `system-prompt/assemble` waterfall still runs when contexts are suppressed
+  // (the suppression only shapes the array), and seeing our own name absent while
+  // we do have something to say is proof. Delivery then moves to a plugin-sourced
+  // message on the same pre-step waterfall the competitors use.
+  // ---------------------------------------------------------------------------
+  /** Sessions proven to be running without runtime context. */
+  const suppressedSessions = new Set<string>()
+  /** The last turn a message-delivered block was queued for, per session. */
+  const lastMessageTurn = new Map<string, number>()
+
+  // The local PluginContext narrows `on` to the shapes the plugin registers
+  // elsewhere; this event hands three arguments, so the listener is re-typed here
+  // rather than widening that shared shape for one consumer.
+  const onAssemble = ctx.on as unknown as (
+    event: string,
+    handler: (assembly: PromptAssemblyLike, context: AssembleContext, next: () => Promise<PromptAssemblyLike>) => unknown,
+  ) => unknown
+  onAssemble('system-prompt/assemble', async (assembly, context, next) => {
+    const result = await next()
+    try {
+      if (!ready || !config.recall.enabled) return result
+      const present = Array.isArray(result?.contexts) && result.contexts.some((entry) => entry?.name === RECALL_CONTEXT_NAME)
+      if (present) return result
+      const agent = context?.agent
+      const sessionId = sessionIdOf(agent)
+      if (sessionId === null || suppressedSessions.has(sessionId)) return result
+      // Only a session that actually has something to inject is worth warning
+      // about; an empty store must not look like a broken prompt.
+      if (renderRecallFor(agent, 'message').text === '') return result
+      suppressedSessions.add(sessionId)
+      const preset = agent?.session?.header?.agentPreset ?? null
+      log('warn', 'runtime context is suppressed for this session; recall moves to message injection', { sessionId, preset })
+      void store.ledger({
+        kind: 'context-suppressed',
+        sessionId,
+        agentPreset: preset,
+        hint: 'a preset set includeRuntimeContext:false, so systemPrompt.context contributions never run',
+      })
+    } catch (error) {
+      log('warn', 'recall suppression check failed (fail-open)', { error: String(error) })
+    }
+    return result
   })
 
   // ---------------------------------------------------------------------------
@@ -1038,7 +1181,30 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     } catch (error) {
       log('warn', `conflict retry skipped (fail-open): ${String(error)}`)
     }
-    return next()
+
+    const decision = await next()
+    try {
+      if (!ready || !config.recall.enabled) return decision
+      const agent = payload?.agent
+      const sessionId = sessionIdOf(agent)
+      // Only sessions *proven* to run without runtime context take this path, so
+      // the normal case keeps the cheaper system-prompt delivery.
+      if (sessionId === null || !suppressedSessions.has(sessionId)) return decision
+      // Once per turn: the message then stays in the history for that turn's later
+      // steps, which is the cadence the runtime context had anyway.
+      const turn = payload?.turn ?? 0
+      if (lastMessageTurn.get(sessionId) === turn) return decision
+      const block = renderRecallFor(agent, 'message')
+      if (block.text === '') return decision
+      // A rejected step is somebody else's veto; attaching context to it would be
+      // resurrecting a step that is not going to run.
+      if (!isEnterDecision(decision)) return decision
+      lastMessageTurn.set(sessionId, turn)
+      return { ...decision, messages: [...decision.messages, recallMessage(block.text)] }
+    } catch (error) {
+      log('warn', `recall fallback injection failed (fail-open): ${String(error)}`)
+      return decision
+    }
   })
 
   // ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { apply, collectTurnEvents, resolveConfig, resolveStoreRoot, withDeadline } from '../dsh/index.ts'
+import { apply, collectTurnEvents, RECALL_CONTEXT_NAME, resolveConfig, resolveStoreRoot, withDeadline } from '../dsh/index.ts'
 import type {
   AskQuestionItem,
   ForgetArgs,
@@ -25,7 +25,7 @@ import type { TurnEvent } from '../dsh/lib/extract.ts'
 /** What the fake context recorded, so a test can drive the plugin's hooks by hand. */
 interface Captured {
   contexts: PromptContextDefinition[]
-  listeners: Map<string, (payload: TurnStoppingPayload) => unknown>
+  listeners: Map<string, (...args: unknown[]) => unknown>
   /** Registered definitions, kept as `unknown`: each test picks the one it drives. */
   tools: Map<string, unknown>
   disposers: Array<() => void>
@@ -80,9 +80,11 @@ function fakeContext(): { ctx: PluginContext; captured: Captured } {
       callback(scope)
     },
     on: (event, handler) => {
-      // Stored with the same two-parameter shape the plugin registers: a waterfall
-      // listener needs `next`, and dropping it here would hide that contract.
-      captured.listeners.set(event, (payload) => handler(payload, async () => undefined))
+      // Stored verbatim rather than pre-applied: waterfall listeners differ in
+      // arity (`system-prompt/assemble` takes three arguments), and a wrapper that
+      // hard-coded one shape would hide exactly that contract.
+      const raw = handler as unknown as (...args: unknown[]) => unknown
+      captured.listeners.set(event, (...args: unknown[]) => raw(...args))
       return () => {}
     },
     tools: {
@@ -99,8 +101,20 @@ function fakeContext(): { ctx: PluginContext; captured: Captured } {
   return { ctx, captured }
 }
 
-/** The handler the plugin registered for one event. */
+/**
+ * A listener the tests can call with just the payload.
+ *
+ * `next` defaults to "enter this step with no messages", which is what the harness
+ * does when nothing intervenes; a test that cares about a different decision uses
+ * {@link rawListener} and supplies its own.
+ */
 function listenerFor(captured: Captured, event: string): (payload: TurnStoppingPayload) => unknown {
+  const handler = rawListener(captured, event)
+  return (payload) => handler(payload, async () => ({ kind: 'enter', messages: [] }))
+}
+
+/** The listener exactly as registered, for tests that drive `next` themselves. */
+function rawListener(captured: Captured, event: string): (...args: unknown[]) => unknown {
   const handler = captured.listeners.get(event)
   if (!handler) throw new Error(`no listener was registered for ${event}`)
   return handler
@@ -663,4 +677,84 @@ test('pairing falls back to lexical overlap when the model cannot answer', async
   } finally {
     globalThis.fetch = realFetch
   }
+})
+
+/** One assembly result, with or without this plugin's runtime context. */
+function assembly(includeRecall: boolean): { sections: unknown[]; contexts: Array<{ name: string; text: string }>; tools: unknown[]; variables: Record<string, string> } {
+  return { sections: [], contexts: includeRecall ? [{ name: RECALL_CONTEXT_NAME, text: '记忆块' }] : [], tools: [], variables: {} }
+}
+
+/** Seed one memory so recall has something to say. */
+async function seedMemory(captured: Captured, text = '必须用 pnpm 管理依赖。'): Promise<SessionLike> {
+  const session = fakeSession({ events: [] })
+  await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute({ text, type: 'constraint' }, { agent: { session } })
+  return session
+}
+
+// The normal path must stay untouched: when the assembly contains our context, the
+// plugin has nothing to complain about and nothing extra to inject.
+test('an assembly that carries the recall context is left alone', async () => {
+  const { root, captured } = await mount()
+  const session = await seedMemory(captured)
+  const assemble = rawListener(captured, 'system-prompt/assemble')
+  const result = await assemble(assembly(true), { agent: { session } }, async () => assembly(true))
+  assert.deepEqual(result, assembly(true))
+
+  const decision = await rawListener(captured, 'agent/pre-step')(
+    { agent: { session }, turn: 1, step: 1, signal: undefined },
+    async () => ({ kind: 'enter', messages: [] }),
+  )
+  assert.deepEqual(decision, { kind: 'enter', messages: [] })
+  await settle()
+  assert.doesNotMatch(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /context-suppressed/)
+})
+
+// Measured against the harness source: with `includeRuntimeContext: false` the
+// assembler builds an empty contexts array and never calls the callbacks, so the
+// plugin would inject nothing, log nothing and warn nobody.
+test('a suppressed runtime context moves recall to a plugin-sourced message', async () => {
+  const { root, captured } = await mount()
+  const session = await seedMemory(captured)
+  const assemble = rawListener(captured, 'system-prompt/assemble')
+  await assemble(assembly(false), { agent: { session } }, async () => assembly(false))
+  await settle()
+  const ledger = await readFile(join(root, 'ledger.jsonl'), 'utf8')
+  assert.match(ledger, /"kind":"context-suppressed"/)
+  assert.match(ledger, /"kind":"recall".*"via":"message"/)
+
+  const decision = (await rawListener(captured, 'agent/pre-step')(
+    { agent: { session }, turn: 1, step: 1, signal: undefined },
+    async () => ({ kind: 'enter', messages: [] }),
+  )) as { kind: string; messages: Array<{ source: { kind: string; plugin?: string; form?: string }; content: Array<{ text: string }> }> }
+  assert.equal(decision.kind, 'enter')
+  assert.equal(decision.messages.length, 1)
+  assert.equal(decision.messages[0].source.plugin, 'jev-memory')
+  assert.equal(decision.messages[0].source.form, 'recall')
+  assert.match(decision.messages[0].content[0].text, /必须用 pnpm/)
+
+  // The message stays in the turn's history, so one delivery per turn is enough.
+  const second = (await rawListener(captured, 'agent/pre-step')(
+    { agent: { session }, turn: 1, step: 2, signal: undefined },
+    async () => ({ kind: 'enter', messages: [] }),
+  )) as { messages: unknown[] }
+  assert.equal(second.messages.length, 0)
+})
+
+test('the fallback never resurrects a rejected step', async () => {
+  const { captured } = await mount()
+  const session = await seedMemory(captured)
+  await rawListener(captured, 'system-prompt/assemble')(assembly(false), { agent: { session } }, async () => assembly(false))
+  const decision = await rawListener(captured, 'agent/pre-step')(
+    { agent: { session }, turn: 1, step: 1, signal: undefined },
+    async () => ({ kind: 'reject' }),
+  )
+  assert.deepEqual(decision, { kind: 'reject' })
+})
+
+test('an empty store is never mistaken for a suppressed prompt', async () => {
+  const { root, captured } = await mount()
+  const session = fakeSession({ events: [] })
+  await rawListener(captured, 'system-prompt/assemble')(assembly(false), { agent: { session } }, async () => assembly(false))
+  await settle()
+  assert.doesNotMatch(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /context-suppressed/)
 })
