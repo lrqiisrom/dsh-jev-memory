@@ -482,7 +482,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.15.0'
+export const version = '0.16.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -888,9 +888,10 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       if (typeof record.canonical === 'string' && (record.canonicalAt ?? 0) >= record.updatedAt) continue
       const canonical = await normalizer.normalize(record.text, signal)
       if (canonical === null) {
-        // Refused by the gate, or the call failed: both mean the sentence stands, and both
-        // are worth counting because a high refusal rate means the prompt needs work.
-        void store.ledger({ kind: 'normalize', id, ok: false, reason: 'refused' })
+        // The reason travels with the failure: a refusal rate that cannot be attributed is
+        // a number nobody can act on, and "the gate is too strict" and "the model keeps
+        // answering the wrong shape" are different problems with different fixes.
+        void store.ledger({ kind: 'normalize', id, ok: false, reason: normalizer.lastReason() })
         continue
       }
       const current = store.get(id)

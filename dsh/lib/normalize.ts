@@ -99,9 +99,12 @@ export function buildNormalizePrompt(text: string): string {
     '要求：',
     '1. 只做整理：修正明显的错别字与口语、补全省略但明确的主语、去掉无意义的填充词。',
     '2. **绝对不能添加原句里没有的信息**，也不要推测、不要补充理由、不要解释、不要评论。',
-    '3. 保持原句的语言（中文就输出中文），保持它是「一条要求/约定/事实」的性质。',
-    '4. 只输出整理后的那一句话，不要引号、不要前缀、不要编号、不要换行说明。',
-    '5. 如果原句已经足够清楚，或你无法在不添加信息的前提下整理它，就原样输出。',
+    '3. **保持原句的语言**：原句是英文就输出英文，是中文就输出中文，不要翻译。',
+    '4. **数字、代码标识符、文件路径、以及 `→` `->` `=` `==` 这类符号关系要原样保留**，不要改写成词、不要补单位、不要补标点以外的字。',
+    '5. 只输出整理后的那一句话，不要引号、不要前缀、不要编号、不要换行说明。',
+    '6. 原句**措辞已经清楚时仍然要清掉格式残渣**：LaTeX/markdown 标记（`\\textbf{}`、`\\item`、`**`）、',
+    '   编号列表残留（开头的 `1.`、结尾孤立的 `2.`）、明显的截断尾巴。只有**既没有格式残渣、措辞也清楚**时才原样输出。',
+    '7. 如果无法在不添加信息的前提下整理它，就原样输出。',
   ].join('\n')
 }
 
@@ -122,23 +125,46 @@ export function acceptCanonical(
   output: string,
   settings: Pick<NormalizeSettings, 'maxRatio' | 'minOverlap'>,
 ): string | null {
+  return explainCanonical(input, output, settings).text
+}
+
+/**
+ * The same decision, with the reason it went the way it did.
+ *
+ * The reason exists because "refused" on its own is the kind of ledger line this project
+ * keeps having to fix: it says something happened without saying what, so a refusal rate of
+ * a quarter cannot be acted on. With the cause, a too-strict gate and a model that keeps
+ * answering the wrong shape are different problems.
+ *
+ * @param input - the verbatim sentence.
+ * @param output - what the model returned.
+ * @param settings - the ratio and overlap thresholds.
+ * @returns the usable text (or null) and the reason code.
+ */
+export function explainCanonical(
+  input: string,
+  output: string,
+  settings: Pick<NormalizeSettings, 'maxRatio' | 'minOverlap'>,
+): { text: string | null; reason: string } {
   let value = String(output ?? '').trim()
   // A model that wraps its answer in quotes or prefixes it with a label is common enough
   // to handle rather than reject.
   value = value.replace(/^["'“”「『]+/u, '').replace(/["'“”」』]+$/u, '').trim()
   value = value.replace(/^(整理后|整理|结果|输出)[:：]\s*/u, '').trim()
-  if (value.length < 2) return null
-  if (value === String(input ?? '').trim()) return null
-  if (/^(抱歉|对不起|无法|不能|sorry|cannot|i can)/iu.test(value)) return null
-  if (value.length > Math.max(20, String(input).length * settings.maxRatio)) return null
+  if (value.length < 2) return { text: null, reason: 'empty' }
+  if (value === String(input ?? '').trim()) return { text: null, reason: 'unchanged' }
+  if (/^(抱歉|对不起|无法|不能|sorry|cannot|i can)/iu.test(value)) return { text: null, reason: 'model-refused' }
+  if (value.length > Math.max(20, String(input).length * settings.maxRatio)) {
+    return { text: null, reason: 'too-long' }
+  }
 
   const inputTokens = tokenize(input)
   const outputTokens = tokenize(value)
-  if (outputTokens.size === 0) return null
+  if (outputTokens.size === 0) return { text: null, reason: 'no-tokens' }
   let shared = 0
   for (const token of outputTokens) if (inputTokens.has(token)) shared += 1
-  if (shared / outputTokens.size < settings.minOverlap) return null
-  return value
+  if (shared / outputTokens.size < settings.minOverlap) return { text: null, reason: 'low-overlap' }
+  return { text: value, reason: 'ok' }
 }
 
 /** The model-call surface this module needs, so tests can fake it without a network. */
@@ -157,6 +183,8 @@ export interface LlmStreamPort {
 export interface Normalizer {
   /** asked per call, so a route added later takes effect on the next write. */
   route(): Promise<{ provider: string; model: string } | null>
+  /** why the last `normalize` returned null; `'ok'` after a success. */
+  lastReason(): string
   /**
    * Produce the canonical form of one sentence.
    *
@@ -185,7 +213,9 @@ export function createNormalizer({
   resolveRoute: () => Promise<{ provider: string; model: string } | null>
   log?: LogSink
 }): Normalizer {
+  let lastReason = 'not-attempted'
   return {
+    lastReason: () => lastReason,
     route: async () => {
       if (!settings.enabled || llm === undefined) return null
       const route = await resolveRoute().catch(() => null)
@@ -194,7 +224,10 @@ export function createNormalizer({
 
     async normalize(text, signal) {
       const route = await this.route()
-      if (route === null) return null
+      if (route === null) {
+        lastReason = 'no-route'
+        return null
+      }
       const controller = new AbortController()
       const onAbort = (): void => controller.abort()
       signal?.addEventListener('abort', onAbort, { once: true })
@@ -213,17 +246,19 @@ export function createNormalizer({
           if (chunk.type === 'text-delta' && typeof chunk.text === 'string') output += chunk.text
           if (chunk.type === 'finish') break
         }
-        const accepted = acceptCanonical(text, output, settings)
-        if (accepted === null) {
-          log('warn', 'canonical form refused; the verbatim sentence stands', {
+        const decided = explainCanonical(text, output, settings)
+        lastReason = decided.reason
+        if (decided.text === null) {
+          log('warn', `canonical form refused (${decided.reason}); the verbatim sentence stands`, {
             input: text.slice(0, 60),
             output: output.slice(0, 60),
           })
           return null
         }
-        return { text: accepted, model: route.model }
+        return { text: decided.text, model: route.model }
       } catch (error) {
         // Fail-open in the only direction that is safe here: keep the sentence.
+        lastReason = `failed:${String(error).slice(0, 40)}`
         log('warn', 'normalization failed; the verbatim sentence stands', { error: String(error) })
         return null
       } finally {
