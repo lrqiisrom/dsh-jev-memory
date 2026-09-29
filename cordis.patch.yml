@@ -4,6 +4,18 @@
 # bare package name and a relative/file URL both work — that is what lets the
 # development copy mount straight from the workspace with `--patch` before it
 # is ever installed into a profile.
+# Optional, both default to off/lexical:
+#
+#   config:
+#     conflictRanking: embedding      # rank the conflict window by cosine similarity
+#     embedding:
+#       apiKeyEnv: ZHIPU_API_KEY      # credential goes in ~/.dsh/.credentials.yaml
+#       model: embedding-3            # Zhipu BigModel; 0.5 CNY per million tokens
+#       dimensions: 512
+#
+# Turning it on sends the stored sentences to that provider. Measured 2026-09-29:
+# 3 sentences in one request took 305ms; a paraphrase scored 0.77 and an unrelated
+# sentence 0.53, so it is used to *rank* candidates, never as an absolute threshold.
 - insert:
     - id: jev-memory
       name: 'dsh-jev-memory'

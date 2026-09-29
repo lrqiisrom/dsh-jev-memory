@@ -48,15 +48,159 @@ export interface ConflictPair {
  * @returns the token set.
  */
 export function tokenize(text: string): Set<string> {
-  const tokens = new Set<string>()
+  return new Set(tokenList(text))
+}
+
+/**
+ * The same tokens, with repetition kept.
+ *
+ * BM25 needs term frequency, and the set above throws it away — summing over a set
+ * silently turns BM25 into an IDF-weighted overlap. Repetition is meaning here: a
+ * sentence that says `data` four times is more about `data` than one that says it once.
+ *
+ * @param text - any text.
+ * @returns the token list, in text order, duplicates included.
+ */
+export function tokenList(text: string): string[] {
+  const tokens: string[] = []
   const normalized = String(text ?? '').toLowerCase()
-  for (const word of normalized.match(/[a-z0-9_.-]{3,}/gu) ?? []) tokens.add(word)
+  for (const word of normalized.match(/[a-z0-9_.-]{3,}/gu) ?? []) tokens.push(word)
   const cjk = normalized.replace(/[^\u3400-\u9fff]/gu, ' ')
   for (const run of cjk.split(/\s+/u)) {
     if (run.length < 2) continue
-    for (let index = 0; index + 2 <= run.length; index += 1) tokens.add(run.slice(index, index + 2))
+    for (let index = 0; index + 2 <= run.length; index += 1) tokens.push(run.slice(index, index + 2))
   }
   return tokens
+}
+
+/**
+ * A relevance score for one existing memory against an incoming sentence.
+ *
+ * Kept as a bare function so the ranking can be swapped without touching any caller:
+ * BM25 today, embeddings tomorrow (see `conflictRanking` in the plugin config). The
+ * contract is only "higher means more likely to be about the same thing" — it is a
+ * *candidate* ranking, never a verdict. Deciding whether two memories actually
+ * contradict each other is the judge's job or the person's, because similarity cannot
+ * answer it: "端口用 8000" and "端口改成 9000" are near-identical and incompatible,
+ * while "端口 8000" and "服务端口固定 8000，不要改" are near-identical and agree.
+ */
+export type ConflictScorer = (incoming: string, record: MemoryRecord) => number
+
+/** BM25's free parameters. Defaults are the standard ones. */
+export interface Bm25Options {
+  /** term-frequency saturation; higher means repetition keeps helping. */
+  k1?: number
+  /** length normalization; 0 disables it, 1 fully normalizes. */
+  b?: number
+}
+
+/**
+ * Build a BM25 scorer over a fixed set of memories.
+ *
+ * BM25 rather than the shared-token ratio it replaces because three things matter
+ * here and the ratio got all three wrong: it weighted a token that appears in every
+ * memory ("项目", "不要") the same as a rare one, it let a long memory win by sheer
+ * size, and it counted a term once however often it appeared. IDF, length
+ * normalization and term saturation are exactly those three fixes, and BM25 is the
+ * standard form of them — it costs one pass over the memories and no dependency.
+ *
+ * **Measured caveat, so nobody over-claims this.** On Chinese text the gain is muted
+ * by not having a segmenter: bigrams of `不要用` are `不要` and `要用`, and `要用` is
+ * then a *rare* token that mints spurious IDF for whichever memory happens to contain
+ * it. Trying to build a case where BM25 beats the ratio on Chinese, the ratio won as
+ * often as it lost. What BM25 demonstrably fixes here is the *ordering* of memories
+ * with a genuinely shared rare term (verified with clean latin tokens); what it does
+ * not fix is paraphrase, which is what the embedding option exists for.
+ *
+ * The stats are computed once per call, so build one scorer per candidate and reuse
+ * it across the memories; the returned function caches its query tokens for that.
+ *
+ * @param records - the memories (the corpus), not including the incoming sentence.
+ * @param options - BM25 parameters.
+ * @returns a scorer, 0 for no relation at all.
+ */
+export function createBm25Scorer(records: readonly MemoryRecord[], options: Bm25Options = {}): ConflictScorer {
+  const k1 = options.k1 ?? 1.2
+  const b = options.b ?? 0.75
+  const documents = records.map((record) => {
+    const tokens = tokenList(record.text)
+    const frequency = new Map<string, number>()
+    for (const token of tokens) frequency.set(token, (frequency.get(token) ?? 0) + 1)
+    return { id: record.id, frequency, length: tokens.length }
+  })
+  const documentFrequency = new Map<string, number>()
+  let totalLength = 0
+  for (const document of documents) {
+    totalLength += document.length
+    for (const token of document.frequency.keys()) {
+      documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1)
+    }
+  }
+  const count = documents.length
+  const averageLength = count === 0 ? 1 : totalLength / count || 1
+  const byId = new Map(documents.map((document) => [document.id, document]))
+
+  /** Robertson/Sparck-Jones IDF, smoothed so a term in every document still counts. */
+  const idf = (token: string): number => {
+    const frequency = documentFrequency.get(token) ?? 0
+    return Math.log(1 + (count - frequency + 0.5) / (frequency + 0.5))
+  }
+
+  let lastQuery = ''
+  let queryTokens: string[] = []
+  return (incoming, record) => {
+    if (incoming !== lastQuery) {
+      lastQuery = incoming
+      queryTokens = [...new Set(tokenList(incoming))]
+    }
+    const document = byId.get(record.id)
+    if (document === undefined) return 0
+    let score = 0
+    for (const token of queryTokens) {
+      const frequency = document.frequency.get(token)
+      if (frequency === undefined) continue
+      const norm = 1 - b + (b * document.length) / averageLength
+      score += (idf(token) * (frequency * (k1 + 1))) / (frequency + k1 * norm)
+    }
+    return score
+  }
+}
+
+/**
+ * The memories most likely to be about the same thing as an incoming sentence.
+ *
+ * Why this exists: the write path used to hand the judge the first twenty memories
+ * *in store order*, so a contradiction sitting at position twenty-one was invisible
+ * and the judge answered "no conflict" — a miss with no trace anywhere. Ranking by
+ * relevance is what makes the window mean "the twenty most likely", and the window
+ * still has to be filled: memories that share no token with the incoming sentence
+ * score 0 and are kept, newest first, because a semantic contradiction can look like
+ * nothing lexically.
+ *
+ * @param incoming - the new sentence.
+ * @param records - the memories to rank.
+ * @param limit - how many to keep.
+ * @param scorer - the relevance function; BM25 over `records` by default.
+ * @returns up to `limit` records, most relevant first.
+ */
+export function rankConflictPartners(
+  incoming: string,
+  records: readonly MemoryRecord[],
+  limit: number,
+  scorer?: ConflictScorer,
+): MemoryRecord[] {
+  if (records.length === 0 || limit <= 0) return []
+  const score = scorer ?? createBm25Scorer(records)
+  return records
+    .map((record) => ({ record, score: score(incoming, record) }))
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score
+      // Same relevance: the more recently touched memory is the likelier counterpart,
+      // since a rule that was just restated is the one a new statement tends to move.
+      return (right.record.updatedAt ?? 0) - (left.record.updatedAt ?? 0)
+    })
+    .slice(0, limit)
+    .map((entry) => entry.record)
 }
 
 /**

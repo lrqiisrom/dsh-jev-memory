@@ -758,3 +758,123 @@ test('an empty store is never mistaken for a suppressed prompt', async () => {
   await settle()
   assert.doesNotMatch(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /context-suppressed/)
 })
+
+/**
+ * A turn whose user message is `text`.
+ *
+ * @param text - what the person said.
+ * @returns the turn's events.
+ */
+function turnWith(text: string): TurnEvent[] {
+  return [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] } },
+    { type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [] } } },
+  ]
+}
+
+/** Every ledger entry, oldest first. */
+async function ledgerEntries(root: string): Promise<Array<Record<string, any>>> {
+  await settle()
+  return (await readFile(join(root, 'ledger.jsonl'), 'utf8'))
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line))
+}
+
+// Found by ranking the window rather than slicing it: the judge is asked "does this
+// contradict anything you know" about twenty memories, and when it answers no there is
+// nothing in the ledger to say whether the answer was checked against the right twenty.
+// This records the deterministic disagreement without interrupting anyone for it.
+test('a contradiction the judge did not raise is recorded, not swallowed', async () => {
+  const { root, captured } = await mount()
+  const session = fakeSession({ events: TURN_EVENTS })
+  await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+    { text: '服务端口固定 8000，不要改。', type: 'constraint' },
+    { agent: { session } },
+  )
+
+  const later = fakeSession({ events: turnWith('端口改成 9000 了，因为 8000 被占用了。') })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session: later }, turn: 1, signal: undefined })
+
+  const suspected = (await ledgerEntries(root)).filter((entry) => entry.kind === 'conflict-suspected')
+  assert.equal(suspected.length, 1, 'the lexical check disagreed with the judge and said so')
+  assert.match(String(suspected[0].id), /端口/u)
+  assert.ok(Number(suspected[0].score) > 0, 'the score is recorded so the threshold can be tuned later')
+})
+
+test('an enabled embedding path asks the provider, caches the vectors, and still writes', async () => {
+  const original = globalThis.fetch
+  const calls: Array<{ url: string; input: string[] }> = []
+  globalThis.fetch = (async (url: unknown, init: unknown) => {
+    const body = JSON.parse((init as { body: string }).body) as { input: string[] }
+    calls.push({ url: String(url), input: body.input })
+    return {
+      ok: true,
+      status: 200,
+      // One vector per input, deliberately reversed in `data` to prove index order wins.
+      json: async () => ({
+        data: body.input.map((_text, index) => ({ index, embedding: [index + 1, 1] })).reverse(),
+      }),
+    }
+  }) as unknown as typeof fetch
+
+  try {
+    const { root, captured } = await mount({ conflictRanking: 'embedding', embedding: { maxInputs: 16 } })
+    // Seed one memory first: ranking needs something to rank. On the very first write
+    // the store is empty, so the honest behaviour is to skip the provider entirely.
+    const session = await seedMemory(captured)
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: turnWith('端口改成 9000 了，因为 8000 被占用了。') }) },
+      turn: 1,
+      signal: undefined,
+    })
+
+    assert.ok(calls.length > 0, 'the provider was asked')
+    assert.match(calls[0]!.url, /\/api\/paas\/v4\/embeddings$/u)
+    assert.ok(calls[0]!.input.length > 0)
+
+    const cache = JSON.parse(await readFile(join(root, 'embeddings.json'), 'utf8')) as { vectors: Record<string, number[]> }
+    assert.ok(Object.keys(cache.vectors).length > 0, 'the vectors are kept as derived state beside the store')
+
+    const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+    const found = await search.execute({ query: 'pnpm' }, { agent: { session } })
+    assert.equal(found.matches.length, 1, 'a ranking failure must never cost the write')
+
+    const start = await startEntry(root)
+    assert.equal(start?.conflictRanking, 'embedding')
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('an embedding provider that is down falls back to lexical and still writes', async () => {
+  const original = globalThis.fetch
+  let attempts = 0
+  globalThis.fetch = (async () => {
+    attempts += 1
+    throw new Error('network down')
+  }) as unknown as typeof fetch
+  try {
+    const { root, captured } = await mount({ conflictRanking: 'embedding' })
+    const session = await seedMemory(captured)
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: turnWith('端口改成 9000 了，因为 8000 被占用了。') }) },
+      turn: 1,
+      signal: undefined,
+    })
+
+    const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+    assert.equal(
+      (await search.execute({ query: '端口' }, { agent: { session } })).matches.length,
+      1,
+      'the write still happened despite the provider being down',
+    )
+    assert.ok(attempts > 0, 'the embedding path was actually exercised, not silently skipped')
+    // Nothing was cached, because nothing came back: the fallback left no derived state
+    // behind that a later run could mistake for a real vector.
+    await assert.rejects(readFile(join(root, 'embeddings.json'), 'utf8'))
+  } finally {
+    globalThis.fetch = original
+  }
+})

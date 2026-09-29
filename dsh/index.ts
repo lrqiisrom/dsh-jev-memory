@@ -43,9 +43,26 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import { createCredentialFileReader } from './lib/credentials.ts'
-import { buildConflictQuestion, choiceFromAnswer, findConflictPartner, type ConflictPair } from './lib/conflict.ts'
+import {
+  buildConflictQuestion,
+  choiceFromAnswer,
+  createBm25Scorer,
+  findConflictPartner,
+  rankConflictPartners,
+  type ConflictPair,
+  type ConflictScorer,
+} from './lib/conflict.ts'
 import { extractCandidates, EXTRACT_DEFAULTS } from './lib/extract.ts'
 import { applyGate, createJudge, JUDGE_MODES, type Judgement } from './lib/judge.ts'
+import {
+  EMBEDDING_DEFAULTS,
+  cosineSimilarity,
+  createEmbeddingClient,
+  createVectorCache,
+  vectorKey,
+  type EmbeddingClient,
+  type EmbeddingSettings,
+} from './lib/embedding.ts'
 import { createJevClient, JEV_DEFAULTS } from './lib/jev.ts'
 import { DEFAULT_QUOTA, inScope, renderRecall, searchMemories, selectMemories } from './lib/recall.ts'
 import { signatureOf } from './lib/signals.ts'
@@ -309,6 +326,16 @@ export interface PluginConfig {
   writeTimeoutMs: number
   judgeTimeoutMs: number
   knownForConflict: number
+  /**
+   * How to rank the memories the conflict question draws on.
+   *
+   * `lexical` (default): BM25, no dependency, nothing leaves the machine.
+   * `embedding`: cosine similarity from an embedding provider — better on paraphrase,
+   * but the stored sentences are sent to that provider and a cache of derived vectors
+   * is kept beside the store. See `embedding` below.
+   */
+  conflictRanking: 'lexical' | 'embedding'
+  embedding: Partial<EmbeddingSettings>
   extract: Partial<ExtractOptions>
   recall: RecallConfig
   contextOrder: number
@@ -421,7 +448,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.9.0'
+export const version = '0.10.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -500,6 +527,8 @@ export const DEFAULT_CONFIG: PluginConfig = {
   judgeTimeoutMs: 1800,
   /** How many known memories are shown to the judge for the conflict question. */
   knownForConflict: 20,
+  conflictRanking: 'lexical',
+  embedding: {},
   /** Extraction overrides (see lib/extract.js). */
   extract: {},
   /** Recall (injection) settings. */
@@ -583,6 +612,17 @@ export function resolveConfig(raw: unknown): { config: PluginConfig; problems: s
   config.minImportance = Math.min(1, Math.max(0, config.minImportance))
   config.minRemember = Math.min(1, Math.max(0, config.minRemember))
   config.extract = { ...EXTRACT_DEFAULTS, ...((source.extract ?? {}) as Partial<ExtractOptions>) }
+  if (config.conflictRanking !== 'lexical' && config.conflictRanking !== 'embedding') {
+    problems.push(`conflictRanking: unknown value "${String(config.conflictRanking)}"; using lexical`)
+    config.conflictRanking = 'lexical'
+  }
+  for (const field of ['dimensions', 'timeoutMs', 'maxInputs'] as const) {
+    const value = config.embedding[field]
+    if (value !== undefined && !Number.isFinite(value)) {
+      problems.push(`embedding.${field}: not a finite number; using the default`)
+      delete config.embedding[field]
+    }
+  }
   config.recall.quota = { ...DEFAULT_QUOTA, ...((recallSource?.quota ?? {}) as Record<string, number>) }
   return { config, problems }
 }
@@ -686,6 +726,84 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     },
   })
   const judge: Judge = createJudge({ config: { ...config, judgeTimeoutMs: config.judgeTimeoutMs }, jev, log })
+
+  // The embedding path is optional and off by default. It exists because BM25 scores a
+  // paraphrase near zero, and the person running this asked for the semantic case to be
+  // coverable. Enabled, the stored sentences are sent to the provider below — that is
+  // the trade, so it is a deliberate switch rather than a default.
+  const embeddingRef = config.embedding.apiKeyEnv ?? EMBEDDING_DEFAULTS.apiKeyEnv
+  const embeddingCredentialFromFile = createCredentialFileReader({ home: resolveDshHome(), ref: embeddingRef })
+  const embedding: EmbeddingClient = createEmbeddingClient({
+    config: config.embedding,
+    log,
+    resolveApiKey: async () => {
+      try {
+        const resolved = await credentialOf()?.resolve(embeddingRef)
+        if (resolved?.value) return { key: resolved.value, source: `service:${resolved.source ?? 'unknown'}` }
+      } catch (error) {
+        log('warn', 'credential service lookup failed for embeddings; reading the credential document instead', {
+          error: String(error),
+        })
+      }
+      const fromFile = await embeddingCredentialFromFile()
+      return fromFile ? { key: fromFile, source: 'file' } : { key: undefined, source: 'missing' }
+    },
+  })
+  const vectorCache = createVectorCache({
+    file: join(store.root, 'embeddings.json'),
+    log,
+  })
+  void vectorCache.load()
+
+  /**
+   * Rank memories by cosine similarity, or give up and let BM25 do it.
+   *
+   * Returns null on any shortfall — no key, a provider error, a timeout, vectors that
+   * do not line up — because ranking is an optimisation and the write path must not
+   * depend on it. The caller falls back to lexical.
+   */
+  const embeddingRanker =
+    config.conflictRanking !== 'embedding'
+      ? undefined
+      : async (
+          incoming: string,
+          records: readonly MemoryRecord[],
+          limit: number,
+        ): Promise<MemoryRecord[] | null> => {
+          const settings: Partial<EmbeddingSettings> = { ...EMBEDDING_DEFAULTS, ...config.embedding }
+          await vectorCache.load()
+          const wanted = [incoming, ...records.map((record) => record.text)]
+          const missing: string[] = []
+          for (const text of wanted) {
+            if (vectorCache.get(vectorKey(settings as EmbeddingSettings, text)) === undefined && !missing.includes(text)) {
+              missing.push(text)
+            }
+          }
+          if (missing.length > 0) {
+            const fresh = await embedding.embed(missing)
+            if (fresh === null) return null
+            for (const [index, text] of missing.entries()) {
+              const vector = fresh[index]
+              if (vector === undefined) return null
+              vectorCache.set(vectorKey(settings as EmbeddingSettings, text), vector)
+            }
+            void vectorCache.persist()
+          }
+          const incomingVector = vectorCache.get(vectorKey(settings as EmbeddingSettings, incoming))
+          if (incomingVector === undefined) return null
+          const scored = records.map((record) => {
+            const vector = vectorCache.get(vectorKey(settings as EmbeddingSettings, record.text))
+            return { record, score: vector === undefined ? 0 : cosineSimilarity(incomingVector, vector) }
+          })
+          return scored
+            .sort((left, right) => {
+              if (right.score !== left.score) return right.score - left.score
+              return (right.record.updatedAt ?? 0) - (left.record.updatedAt ?? 0)
+            })
+            .slice(0, limit)
+            .map((entry) => entry.record)
+        }
+
   let ready = false
 
   void store
@@ -695,12 +813,19 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const jevState = await jev.describe()
       log('info', `ready: ${loaded} memories from ${store.root}${recovered ? ' (corrupt document was set aside)' : ''}`, {
         judge: jevState.ready ? 'jev' : judge.kind,
+        conflictRanking: config.conflictRanking,
         types: config.types,
       })
+      const embeddingState =
+        config.conflictRanking === 'embedding'
+          ? await embedding.describe()
+          : { mode: 'lexical', note: 'BM25 over the memories; nothing leaves the machine' }
       return store.ledger({
         kind: 'start',
         version,
         judge: judge.kind,
+        conflictRanking: config.conflictRanking,
+        embedding: embeddingState,
         // `source` is the field whose absence cost a debugging round: `ready:false`
         // alone cannot distinguish a wrong ref name from an unreachable service.
         jev: jevState,
@@ -966,6 +1091,42 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
    * @param signal - the turn's abort signal.
    * @returns the pairing plus how it was chosen, or null when nothing can be named.
    */
+  /**
+   * Rank the memories a conflict question may draw on.
+   *
+   * Two implementations behind one call, chosen by `conflictRanking`:
+   *
+   *  - `lexical` (default): BM25 over the memories. No dependency, no network, no
+   *    stored state, and nothing leaves the machine.
+   *  - `embedding`: cosine similarity from an embedding provider. Better at
+   *    paraphrase ("data 下的文件别碰" vs "不要改动 data/ 目录"), which BM25 scores
+   *    near zero — at the cost of a provider, a key, a cache of derived vectors, and
+   *    sending the stored sentences to that provider.
+   *
+   * Both are *candidate* rankings. Whether two memories actually contradict each other
+   * is still the judge's question or the person's; similarity cannot answer it.
+   *
+   * Any failure in the embedding path falls back to lexical rather than failing the
+   * turn: a write hook that cannot rank must still write.
+   *
+   * @param incoming - the sentence(s) the window should be relevant to.
+   * @param records - the memories in scope.
+   * @param limit - how many to keep.
+   * @returns up to `limit` memories, most relevant first.
+   */
+  async function rankPartners(
+    incoming: string,
+    records: readonly MemoryRecord[],
+    limit: number,
+  ): Promise<MemoryRecord[]> {
+    if (records.length === 0 || limit <= 0) return []
+    if (config.conflictRanking === 'embedding') {
+      const ranked = await embeddingRanker?.(incoming, records, limit)
+      if (ranked) return ranked
+    }
+    return rankConflictPartners(incoming, records, limit)
+  }
+
   async function pairConflict(
     incoming: string,
     partners: readonly MemoryRecord[],
@@ -974,7 +1135,8 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   ): Promise<{ pair: ConflictPair; via: 'jev' | 'overlap' } | null> {
     if (partners.length === 0) return null
 
-    const known = partners.slice(0, config.knownForConflict)
+    const ranked = await rankPartners(incoming, partners, config.knownForConflict)
+    const known = rankConflictPartners(incoming, ranked, config.knownForConflict)
     const picked = await judge.choosePartner(
       incoming,
       known.map((record) => record.text),
@@ -1068,13 +1230,45 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
 
       const header = session?.header
       const cwd = header?.cwd ?? null
-      const known = store
-        .all()
-        .filter((record) => inScope(record, cwd))
-        .slice(0, config.knownForConflict)
-        .map((record) => `[${record.type}] ${record.text}`)
+      // Ranked, not sliced: `slice(0, 20)` handed the judge the first twenty memories
+      // in store order, so a contradiction at position twenty-one was invisible and
+      // the judge answered "no conflict" with nothing in the ledger to show for it.
+      const inScopeRecords = store.all().filter((record) => inScope(record, cwd))
+      const activePartners = inScopeRecords.filter((record) => record.status === 'active')
+      // One window for the whole turn, ranked against every candidate's text: the
+      // judge sees a single `known` list, so it should hold whatever any of this
+      // turn's sentences might contradict.
+      const shown = await rankPartners(
+        fresh.map((candidate) => candidate.text).join('\n'),
+        inScopeRecords,
+        config.knownForConflict,
+      )
+      const known = shown.map((record) => `[${record.type}] ${record.text}`)
 
       const { rows, model, degraded } = await judge.judge(fresh, { known, signal, project: cwd })
+
+      // The judge is asked "does this contradict anything you know" about a window of
+      // memories. When it answers no, check the same question deterministically and
+      // record what it finds — but do not interrupt the person for it: the point is to
+      // learn how often the window and the model miss a contradiction, and only then
+      // decide whether it deserves a question. Two sources of miss are covered, the
+      // window (a partner outside the twenty) and the model (a pair it did not see).
+      for (const candidate of fresh) {
+        const judgement = rows.find((row) => row.key === candidate.key)
+        if (judgement?.conflict === 'yes') continue
+        const suspected = findConflictPartner(candidate.text, activePartners)
+        if (!suspected) continue
+        void store.ledger({
+          kind: 'conflict-suspected',
+          id: candidate.key,
+          with: suspected.existing.id,
+          score: Number(suspected.score.toFixed(3)),
+          shared: suspected.shared.slice(0, 8),
+          by: judgement?.by ?? 'none',
+          model,
+          note: 'the judge answered no; the lexical check disagrees',
+        })
+      }
       // A candidate the judge did not answer is judged heuristically instead. That
       // is a silent quality drop, so it is recorded rather than left to be inferred
       // from a `remember=null` row: the harness found it only by inspecting rows

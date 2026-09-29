@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { buildConflictQuestion, choiceFromAnswer, CONFLICT_CHOICES, findConflictPartner, tokenize } from '../dsh/lib/conflict.ts'
+import {
+  buildConflictQuestion,
+  choiceFromAnswer,
+  CONFLICT_CHOICES,
+  findConflictPartner,
+  rankConflictPartners,
+  tokenize,
+} from '../dsh/lib/conflict.ts'
 import type { MemoryRecord } from '../dsh/lib/store.ts'
 
 /** A minimal record for pairing tests. */
@@ -66,4 +73,38 @@ test('choiceFromAnswer maps labels back and refuses to guess', () => {
   assert.equal(choiceFromAnswer({ selected: [] }), null)
   assert.equal(choiceFromAnswer({ selected: ['随便写的自定义答案'] }), null)
   assert.equal(choiceFromAnswer(undefined), null)
+})
+
+test('IDF makes a rare shared term outrank a common one', () => {
+  // Latin tokens, where tokenization is clean and the property is the only thing
+  // being tested: `pnpm` appears in almost every memory, `redis` in one. A scorer
+  // that counted shared words equally would tie them.
+  const records = [
+    ...Array.from({ length: 11 }, (_, index) => memory(`f${index}`, `pnpm 管理依赖 ${index}`)),
+    memory('common', 'pnpm 装包要加 -D'),
+    memory('rare', 'redis 只当缓存层，不能当权威层'),
+  ]
+  assert.equal(rankConflictPartners('redis 和 pnpm 有什么区别', records, 1)[0]?.id, 'rare')
+})
+
+test('relevance beats recency, and the window never shrinks', () => {
+  // The bug this fixes: the write path handed the judge `slice(0, 20)` in store
+  // order, so a contradiction at position twenty-one was never shown and the model
+  // answered "no conflict" with nothing in the ledger to show for it.
+  const records = [
+    memory('old-but-relevant', '服务端口用 8000', 1),
+    ...Array.from({ length: 24 }, (_, index) => memory(`filler${index}`, `第 ${index} 条无关约定`, 2_000 + index)),
+  ]
+  const ranked = rankConflictPartners('端口改成 9000', records, 20)
+  assert.equal(ranked.length, 20, 'a full window is still filled')
+  assert.equal(ranked[0]?.id, 'old-but-relevant', 'the oldest memory wins on relevance alone')
+  assert.equal(ranked[1]?.id, 'filler23', 'the rest fall back to newest-first')
+})
+
+test('the scorer is swappable, which is how an embedding path plugs in', () => {
+  const records = [memory('x', '内存里的东西'), memory('y', '另一个东西', 1_700_000_000_001)]
+  // A scorer is any function of (incoming, record); ranking must not care where the
+  // number came from, which is what lets cosine similarity replace BM25 unchanged.
+  const ranked = rankConflictPartners('随便', records, 1, (_incoming, record) => (record.id === 'y' ? 1 : 0))
+  assert.deepEqual(ranked.map((entry) => entry.id), ['y'])
 })
