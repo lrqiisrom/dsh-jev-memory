@@ -64,6 +64,12 @@ import {
   type EmbeddingSettings,
 } from './lib/embedding.ts'
 import { createJevClient, JEV_DEFAULTS } from './lib/jev.ts'
+import {
+  createNormalizer,
+  NORMALIZE_DEFAULTS,
+  type LlmStreamPort,
+  type NormalizeSettings,
+} from './lib/normalize.ts'
 import { DEFAULT_QUOTA, inScope, renderRecall, searchMemories, selectMemories } from './lib/recall.ts'
 import { signatureOf } from './lib/signals.ts'
 import { createMemoryStore, MEMORY_TYPES, type MemoryRecord } from './lib/store.ts'
@@ -337,6 +343,13 @@ export interface PluginConfig {
   judgeTimeoutMs: number
   knownForConflict: number
   /**
+   * Cleaned rendering of each memory, for injection.
+   *
+   * Records by default, injects only when `normalize.inject` is turned on — the verbatim
+   * sentence is the evidence and this is a derived convenience on top of it.
+   */
+  normalize: NormalizeSettings
+  /**
    * Ask the model what a near-duplicate sentence is, instead of assuming.
    *
    * The signature can only say "these look alike". Whether that means a restatement,
@@ -416,6 +429,8 @@ export interface ForgetArgs {
 /** What the turn-end hook reports back to the ledger/log line. */
 interface TurnWriteOutcome {
   written: number
+  /** ids written this turn, for the asynchronous canonical pass. */
+  writtenIds: string[]
   candidates: number
   duplicates?: number
   model?: string | null
@@ -424,7 +439,6 @@ interface TurnWriteOutcome {
   pendingConflicts?: ConflictAsk[]
 }
 
-/** One suspected contradiction, waiting for a human's answer. */
 /**
  * One suspected contradiction, ready to be put to the human.
  *
@@ -468,7 +482,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.13.0'
+export const version = '0.14.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -548,6 +562,7 @@ export const DEFAULT_CONFIG: PluginConfig = {
   /** How many known memories are shown to the judge for the conflict question. */
   knownForConflict: 20,
   pairDecision: true,
+  normalize: { ...NORMALIZE_DEFAULTS },
   conflictRanking: 'lexical',
   embedding: {},
   /** Extraction overrides (see lib/extract.js). */
@@ -600,6 +615,7 @@ export function resolveConfig(raw: unknown): { config: PluginConfig; problems: s
     ...(source as Partial<PluginConfig>),
     recall: { ...DEFAULT_CONFIG.recall, ...((source.recall ?? {}) as Partial<RecallConfig>) },
     jev: { ...((source.jev ?? {}) as Partial<JevSettings>) },
+    normalize: { ...DEFAULT_CONFIG.normalize, ...((source.normalize ?? {}) as Partial<NormalizeSettings>) },
   }
 
   if (!Array.isArray(source.types)) config.types = [...DEFAULT_CONFIG.types]
@@ -825,6 +841,89 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
             .map((entry) => entry.record)
         }
 
+  // --- canonical form -------------------------------------------------------------
+  //
+  // Jev cannot do this: its API answers noul/choice/score and cannot emit text. So the
+  // harness's own `llm` service is used, and the route is asked for rather than hardcoded
+  // — the deployment owns which model is the default.
+  const llmPort = ctx.get?.('llm') as LlmStreamPort | undefined
+  const defaultModel = ctx.get?.('agentDefaultModel') as
+    | { currentSelection?: () => { provider?: unknown; model?: unknown } }
+    | undefined
+  const normalizer = createNormalizer({
+    llm: llmPort,
+    settings: config.normalize,
+    log,
+    resolveRoute: async () => {
+      if (config.normalize.provider !== '' && config.normalize.model !== '') {
+        return { provider: config.normalize.provider, model: config.normalize.model }
+      }
+      const selection = defaultModel?.currentSelection?.()
+      const provider = typeof selection?.provider === 'string' ? selection.provider : ''
+      const model = typeof selection?.model === 'string' ? selection.model : ''
+      return provider !== '' && model !== '' ? { provider, model } : null
+    },
+  })
+
+  /**
+   * Give the memories written this turn a canonical form.
+   *
+   * Deliberately outside the write deadline: the hook has 2500ms and its job is to persist
+   * what the person said. Cleaning text for injection is not worth risking that, so it runs
+   * afterwards, unbounded by the write budget but bounded by its own timeout, and a failure
+   * leaves the verbatim sentence in place.
+   *
+   * @param ids - the records written this turn.
+   * @param signal - the turn's abort signal.
+   */
+  async function normalizeWritten(ids: readonly string[], signal: AbortSignal | undefined): Promise<void> {
+    // Asked once per pass, and silence when there is no route: a deployment without the
+    // service would otherwise get a `normalize ok:false` line for every single write. The
+    // capability is reported once, on the `start` line, where the embedding state goes too.
+    if ((await normalizer.route()) === null) return
+    for (const id of ids) {
+      const record = store.get(id)
+      if (!record || record.status !== 'active') continue
+      // Stale means the sentence changed after it was cleaned, so it is redone.
+      if (typeof record.canonical === 'string' && (record.canonicalAt ?? 0) >= record.updatedAt) continue
+      const canonical = await normalizer.normalize(record.text, signal)
+      if (canonical === null) {
+        // Refused by the gate, or the call failed: both mean the sentence stands, and both
+        // are worth counting because a high refusal rate means the prompt needs work.
+        void store.ledger({ kind: 'normalize', id, ok: false, reason: 'refused' })
+        continue
+      }
+      const current = store.get(id)
+      if (!current || current.text !== record.text) continue
+      await store.put({ ...current, canonical: canonical.text, canonicalModel: canonical.model, canonicalAt: Date.now() })
+      void store.ledger({
+        kind: 'normalize',
+        id,
+        ok: true,
+        model: canonical.model,
+        from: excerpt(record.text, 160),
+        to: excerpt(canonical.text, 160),
+      })
+    }
+  }
+
+  /**
+   * Schedule the canonical pass for records just written, on whichever path wrote them.
+   *
+   * Fire-and-forget by design: the memory is already durable, and the cleaning is for
+   * injection, so it never delays a write or a tool result. A failure leaves the verbatim
+   * sentence standing, which is why `normalizeWritten` already swallows its own errors.
+   *
+   * @param ids - ids just written.
+   * @param signal - the caller's cancellation, when there is one.
+   */
+  function scheduleNormalize(ids: readonly string[], signal: AbortSignal | undefined): void {
+    if (ids.length === 0 || !config.normalize.enabled) return
+    void normalizeWritten(ids, signal).catch((error) =>
+      log('warn', 'normalization pass failed; verbatim sentences stand', { error: String(error) }),
+    )
+  }
+
   let ready = false
 
   void store
@@ -837,6 +936,14 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         conflictRanking: config.conflictRanking,
         types: config.types,
       })
+      const normalizeRoute = await normalizer.route()
+      const normalizeState = {
+        enabled: config.normalize.enabled,
+        inject: config.normalize.inject,
+        ready: normalizeRoute !== null,
+        provider: normalizeRoute?.provider ?? null,
+        model: normalizeRoute?.model ?? null,
+      }
       const embeddingState =
         config.conflictRanking === 'embedding'
           ? await embedding.describe()
@@ -847,6 +954,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         judge: judge.kind,
         conflictRanking: config.conflictRanking,
         embedding: embeddingState,
+        normalize: normalizeState,
         // `source` is the field whose absence cost a debugging round: `ready:false`
         // alone cannot distinguish a wrong ref name from an unreachable service.
         jev: jevState,
@@ -898,6 +1006,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         quota: config.recall.quota,
         maxTokens: config.recall.maxTokens,
         now: Date.now(),
+        preferCanonical: config.normalize.inject,
       })
       if (chosen.length === 0) return { text: '', ids: [] }
 
@@ -913,10 +1022,10 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           cwd,
           via,
           ids,
-          tokens: estimateTokens(renderRecall(chosen, { includeHelp: false })),
+          tokens: estimateTokens(renderRecall(chosen, { includeHelp: false, preferCanonical: config.normalize.inject })),
         })
       }
-      return { text: renderRecall(chosen), ids }
+      return { text: renderRecall(chosen, { preferCanonical: config.normalize.inject }), ids }
     } catch (error) {
       log('warn', 'recall failed; injecting nothing', { error: String(error) })
       return { text: '', ids: [] }
@@ -1067,6 +1176,9 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       choice,
       superseded: choice === 'replace' ? existing : null,
     })
+    // The record may have been written a turn earlier, so it is not in any turn's
+    // `writtenIds`; without this it would never get a canonical form.
+    scheduleNormalize([incoming], undefined)
     log('info', `conflict resolved by the user: ${choice}`)
   }
 
@@ -1202,6 +1314,8 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const outcome = await withDeadline(handleTurn(), config.writeTimeoutMs)
       pending = outcome?.pendingConflicts ?? []
       if (outcome?.written) log('info', `remembered ${outcome.written} item(s) from turn ${turn}`, { model: outcome.model })
+      // After the write, never inside its budget.
+      if (outcome) scheduleNormalize(outcome.writtenIds, signal)
     } catch (error) {
       log('warn', `turn-end write skipped (fail-open): ${String(error)}`)
       void store.ledger({ kind: 'hook-error', turn, error: String(error) })
@@ -1226,7 +1340,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         ...config.extract,
         onVeto: (sentence, reason) => void store.ledger({ kind: 'skip', reason: `veto:${reason}`, quote: excerpt(sentence, 120) }),
       })
-      if (candidates.length === 0) return { written: 0, candidates: 0 }
+      if (candidates.length === 0) return { written: 0, writtenIds: [], candidates: 0 }
 
       const header = session?.header
       const cwd = header?.cwd ?? null
@@ -1328,7 +1442,9 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         }
         fresh.push(candidate)
       }
-      if (fresh.length === 0) return { written: 0, candidates: candidates.length, duplicates: candidates.length }
+      if (fresh.length === 0) {
+        return { written: 0, writtenIds: [], candidates: candidates.length, duplicates: candidates.length }
+      }
 
       // Ranked, not sliced: `slice(0, 20)` handed the judge the first twenty memories
       // in store order, so a contradiction at position twenty-one was invisible and
@@ -1379,6 +1495,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         void store.ledger({ kind: 'degraded', reason: 'jev-missing-row', count: unanswered, cwd })
       }
       let written = 0
+      const writtenIds: string[] = []
       const pendingConflicts: ConflictAsk[] = []
       for (const candidate of fresh) {
         const judgement = rows.find((row) => row.key === candidate.key)
@@ -1473,9 +1590,18 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           await store.supersede(replaced, candidate.key)
           void store.ledger({ kind: 'pair-updated', id: candidate.key, superseded: replaced, inPlace: false })
         }
+        writtenIds.push(candidate.key)
         written += 1
       }
-      return { written, candidates: candidates.length, duplicates: candidates.length - fresh.length, model, degraded, pendingConflicts }
+      return {
+        written,
+        writtenIds,
+        candidates: candidates.length,
+        duplicates: candidates.length - fresh.length,
+        model,
+        degraded,
+        pendingConflicts,
+      }
     }
 
   })
@@ -1645,6 +1771,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         judge: { kind: 'explicit', confidence: null, conflict: 'unknown', mode: 'explicit' },
       })
       void store.ledger({ kind: 'write', id, type, by: 'explicit', cwd, quote: excerpt(normalized, 160) })
+      scheduleNormalize([id], undefined)
       return { id, stored: true, replaced }
     },
   })

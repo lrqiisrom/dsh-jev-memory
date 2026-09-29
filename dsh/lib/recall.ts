@@ -31,6 +31,8 @@ export interface RecallableRecord {
   importance: number
   status: string
   createdAt: number
+  /** cleaned rendering, used for injection when `preferCanonical` is on. */
+  canonical?: string | null
 }
 
 /** The one field the workspace-scope rule reads. */
@@ -62,6 +64,8 @@ export interface RecallOptions {
   now?: number
   /** whether suspected conflicts may enter. */
   includeNeedsReview?: boolean
+  /** inject the canonical rendering when a record has one. */
+  preferCanonical?: boolean
 }
 
 /** Ranking options for the on-demand search tool. */
@@ -93,6 +97,7 @@ export function selectMemories(records: RecallableRecord[], options: RecallOptio
     maxTokens = 600,
     now = Date.now(),
     includeNeedsReview = false,
+    preferCanonical = false,
   } = options
 
   const eligible: RecalledMemory[] = []
@@ -117,7 +122,7 @@ export function selectMemories(records: RecallableRecord[], options: RecallOptio
     const used = perType.get(entry.record.type) ?? 0
     const limit = quota[entry.record.type] ?? 0
     if (limit <= 0 || used >= limit) continue
-    const rendered = renderLine(entry)
+    const rendered = renderLine(entry, preferCanonical)
     const cost = estimateTokens(rendered)
     if (tokens + cost > maxTokens) continue
     perType.set(entry.record.type, used + 1)
@@ -140,9 +145,12 @@ export function selectMemories(records: RecallableRecord[], options: RecallOptio
  * @param options - rendering options.
  * @returns the prompt context text, or ''.
  */
-export function renderRecall(chosen: readonly RecalledMemory[] | null | undefined, options: { includeHelp?: boolean } = {}): string {
+export function renderRecall(
+  chosen: readonly RecalledMemory[] | null | undefined,
+  options: { includeHelp?: boolean; preferCanonical?: boolean } = {},
+): string {
   if (!chosen || chosen.length === 0) return ''
-  const lines = chosen.map((entry) => renderLine(entry))
+  const lines = chosen.map((entry) => renderLine(entry, options.preferCanonical === true))
   const header = '## 长期记忆（自动积累，按会话工作区召回）'
   const help = options.includeHelp === false ? '' : '\n（这些记忆由插件自动写入，可随时用 `memory_forget` 撤销或修正。）'
   return `${header}\n${lines.join('\n')}${help}`
@@ -154,9 +162,13 @@ export function renderRecall(chosen: readonly RecalledMemory[] | null | undefine
  * @param entry - one selection entry.
  * @returns the rendered line.
  */
-export function renderLine(entry: RecalledMemory): string {
+export function renderLine(entry: RecalledMemory, preferCanonical = false): string {
   const date = new Date(entry.record.createdAt).toISOString().slice(0, 10)
-  return `- [${entry.record.type}] ${entry.record.text} (${entry.record.id}, ${date})`
+  // The canonical form is a cleaned rendering of the same sentence; the verbatim one stays
+  // on the record and in the ledger either way.
+  const canonical = preferCanonical ? entry.record.canonical : null
+  const text = typeof canonical === 'string' && canonical !== '' ? canonical : entry.record.text
+  return `- [${entry.record.type}] ${text} (${entry.record.id}, ${date})`
 }
 
 /**

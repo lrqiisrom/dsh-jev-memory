@@ -32,6 +32,10 @@ interface Captured {
   injected?: string[]
   /** what the fake credentials service returns, when a test wires one. */
   credentialValue?: string
+  /** a fake `llm` service, when a test exercises the canonical pass. */
+  llmPort?: unknown
+  /** what the fake `agentDefaultModel` reports. */
+  defaultModelSelection?: { provider: string; model: string }
   /** questions the plugin put to the human, in order. */
   asked: Array<{ questions: AskQuestionItem[]; agent?: unknown }>
   /** labels the fake human replies with, when a test wires an answerer. */
@@ -92,6 +96,18 @@ function fakeContext(): { ctx: PluginContext; captured: Captured } {
         captured.tools.set(definition.name, definition)
         return () => {}
       },
+    },
+    // Optional services are read with `ctx.get`, and returning undefined here is what
+    // makes the canonical pass vanish rather than fail — which is the behaviour under
+    // test in the "no route" case.
+    get: (name: string) => {
+      if (name === 'llm') return captured.llmPort
+      if (name === 'agentDefaultModel') {
+        return captured.defaultModelSelection === undefined
+          ? undefined
+          : { currentSelection: () => captured.defaultModelSelection }
+      }
+      return undefined
     },
     effect: (factory) => {
       captured.disposers.push(factory())
@@ -1114,4 +1130,95 @@ test('a paraphrase called an update supersedes the old record by link', async ()
   } finally {
     globalThis.fetch = realFetch
   }
+})
+
+/** A fake `llm` service that answers with one fixed line. */
+function fakeLlm(line: string): unknown {
+  return {
+    stream: (options: { messages: Array<{ content: Array<{ text: string }> }> }) => {
+      void options
+      return (async function* () {
+        yield { type: 'text-delta', text: line }
+        yield { type: 'finish' }
+      })()
+    },
+  }
+}
+
+test('a written memory gains a canonical form, and the verbatim sentence stays', async () => {
+  const { root, captured } = await mount(
+    {},
+    undefined,
+    (c) => {
+      c.llmPort = fakeLlm('必须使用 pnpm 管理依赖。')
+      c.defaultModelSelection = { provider: 'p', model: 'test-model' }
+    },
+  )
+  const session = fakeSession({ events: TURN_EVENTS })
+  const write = toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write')
+  await write.execute({ text: '必须用 pnpm 管理依赖，这是团队约定。', type: 'constraint' }, { agent: { session } })
+  await settle()
+
+  const document = JSON.parse(await readFile(join(root, 'memory.json'), 'utf8')) as {
+    records?: Array<Record<string, unknown>>
+  }
+  const record = (document.records ?? [])[0]
+  assert.equal(record?.canonical, '必须使用 pnpm 管理依赖。', 'the cleaned form is stored beside it')
+  assert.equal(record?.canonicalModel, 'test-model')
+  assert.equal(record?.text, '必须用 pnpm 管理依赖，这是团队约定。', 'the evidence is untouched')
+
+  const normalizeLines = (await ledgerEntries(root)).filter((entry) => entry.kind === 'normalize')
+  assert.equal(normalizeLines.length, 1)
+  assert.equal(normalizeLines[0]?.ok, true)
+  assert.match(String(normalizeLines[0]?.from), /必须用 pnpm/u)
+  assert.match(String(normalizeLines[0]?.to), /必须使用 pnpm/u)
+})
+
+test('injection uses the canonical form only when it is switched on', async () => {
+  // Recording and injecting are separate decisions: the first is a convenience, the second
+  // changes what the model is shown, so it waits for a person to read samples.
+  const recorded = await mount({}, undefined, (c) => {
+    c.llmPort = fakeLlm('必须使用 pnpm 管理依赖。')
+    c.defaultModelSelection = { provider: 'p', model: 'test-model' }
+  })
+  const sessionA = fakeSession({ events: TURN_EVENTS })
+  await toolFor<WriteArgs, MemoryWriteResult>(recorded.captured, 'memory_write').execute(
+    { text: '必须用 pnpm 管理依赖，这是团队约定。', type: 'constraint' },
+    { agent: { session: sessionA } },
+  )
+  await settle()
+  const injected = recorded.captured.contexts[0]!.text({ agent: { session: sessionA } })
+  assert.match(injected, /必须用 pnpm/u, 'the verbatim sentence is what gets injected by default')
+  assert.doesNotMatch(injected, /必须使用 pnpm/u)
+
+  const injecting = await mount({ normalize: { inject: true } }, undefined, (c) => {
+    c.llmPort = fakeLlm('必须使用 pnpm 管理依赖。')
+    c.defaultModelSelection = { provider: 'p', model: 'test-model' }
+  })
+  const sessionB = fakeSession({ events: TURN_EVENTS })
+  await toolFor<WriteArgs, MemoryWriteResult>(injecting.captured, 'memory_write').execute(
+    { text: '必须用 pnpm 管理依赖，这是团队约定。', type: 'constraint' },
+    { agent: { session: sessionB } },
+  )
+  await settle()
+  assert.match(injecting.captured.contexts[0]!.text({ agent: { session: sessionB } }), /必须使用 pnpm/u)
+})
+
+test('with no route the canonical pass simply does not happen', async () => {
+  const { root, captured } = await mount()
+  const session = fakeSession({ events: TURN_EVENTS })
+  await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+    { text: '必须用 pnpm 管理依赖，这是团队约定。', type: 'constraint' },
+    { agent: { session } },
+  )
+  await settle()
+  const document = JSON.parse(await readFile(join(root, 'memory.json'), 'utf8')) as {
+    records?: Array<Record<string, unknown>>
+  }
+  assert.equal((document.records ?? [])[0]?.canonical ?? null, null)
+  assert.equal((await ledgerEntries(root)).filter((entry) => entry.kind === 'normalize').length, 0)
+  // Reported once at mount instead of once per write: a deployment without the service
+  // should not have to read a failure line for every memory it ever stores.
+  const start = await startEntry(root)
+  assert.deepEqual(start?.normalize, { enabled: true, inject: false, ready: false, provider: null, model: null })
 })

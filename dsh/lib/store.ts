@@ -85,6 +85,18 @@ export interface MemoryRecord {
   /** The record that replaced this one; set together with `status: 'superseded'`. */
   supersededBy?: string | null
   /**
+   * A cleaned rendering of `text`, produced by a model, for injection.
+   *
+   * Derived, never authoritative: `text` is what the person said and stays the evidence.
+   * Recomputed whenever `text` changes, which is why `canonicalAt` is compared against
+   * `updatedAt` instead of being trusted.
+   */
+  canonical?: string | null
+  /** which model produced the canonical form. */
+  canonicalModel?: string | null
+  /** when it was produced; older than `updatedAt` means stale. */
+  canonicalAt?: number | null
+  /**
    * `needs-review` = suspected conflict, withheld from recall;
    * `superseded` = a human chose to replace it, kept for audit but never injected.
    */
@@ -566,6 +578,9 @@ export function normalizeRecord(record: unknown, now: number): MemoryRecord | nu
     status: normalizeStatus(source.status),
     supersedes: typeof source.supersedes === 'string' ? source.supersedes : null,
     supersededBy: typeof source.supersededBy === 'string' ? source.supersededBy : null,
+    canonical: typeof source.canonical === 'string' ? source.canonical : null,
+    canonicalModel: typeof source.canonicalModel === 'string' ? source.canonicalModel : null,
+    canonicalAt: Number.isFinite(source.canonicalAt) ? Number(source.canonicalAt) : null,
     source: {
       sessionId: (sessionId ?? null) as string | null,
       seq: Number.isFinite(provenance?.seq) ? Number(provenance?.seq) : null,
