@@ -45,6 +45,7 @@ import { join } from 'node:path'
 
 import { extractCandidates } from '../dsh/lib/extract.ts'
 import { signatureOf } from '../dsh/lib/signals.ts'
+import { carriedLabels, csvField as field, parseCsv } from './lib/csv.ts'
 import { taskClassOf, type TaskClass } from './lib/task-class.ts'
 
 /**
@@ -233,7 +234,10 @@ for (const log of await sessionFiles()) {
           stratum: 'vetoed',
           taskClass: taskClass(),
           workspace,
-          kind: 'vetoed',
+          // The row keeps its real kind: writing `vetoed` here lost whether the line
+          // came from a person or from a tool, and the report needs that to re-run
+          // today's rules over a batch drawn under older ones.
+          kind: reason === 'tool-failure-no-detail' ? 'tool-failure' : 'user',
           hinted: '',
           score: '',
           vetoReason: reason ?? 'unknown',
@@ -328,82 +332,10 @@ function sample(pool: Row[], count: number, seed: number): Row[] {
 }
 
 /**
- * Parse CSV text into records of cells, honouring quotes.
- *
- * A sentence can contain commas, quotes and newlines, so neither splitting on `,`
- * nor on `\n` reads this file correctly: a naive split reported 240 labelled rows
- * where the true count was 3. Keeping the parser here keeps the tool
- * dependency-free, like the rest of the repository.
- *
- * @param text - the whole file.
- * @returns one array of cells per record.
- */
-function parseCsv(text: string): string[][] {
-  const records: string[][] = []
-  let cells: string[] = []
-  let cell = ''
-  let quoted = false
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index]
-    if (quoted) {
-      if (char !== '"') {
-        cell += char
-      } else if (text[index + 1] === '"') {
-        cell += '"'
-        index += 1
-      } else {
-        quoted = false
-      }
-      continue
-    }
-    if (char === '"') {
-      quoted = true
-    } else if (char === ',') {
-      cells.push(cell)
-      cell = ''
-    } else if (char === '\n') {
-      cells.push(cell)
-      records.push(cells)
-      cells = []
-      cell = ''
-    } else {
-      cell += char
-    }
-  }
-  if (cell !== '' || cells.length > 0) {
-    cells.push(cell)
-    records.push(cells)
-  }
-  return records
-}
-
-/**
- * The labels already present in a CSV, by row id.
- *
- * @param text - the previous file, or '' when there is none.
- * @returns row id → its label and note.
- */
-function carriedLabels(text: string): Map<string, { label: string; note: string }> {
-  const carried = new Map<string, { label: string; note: string }>()
-  const records = parseCsv(text)
-  const header = records[0] ?? []
-  const idAt = header.indexOf('id')
-  const labelAt = header.indexOf('label')
-  const noteAt = header.indexOf('note')
-  if (idAt < 0 || labelAt < 0) return carried
-  for (const cells of records.slice(1)) {
-    const id = (cells[idAt] ?? '').trim()
-    const label = (cells[labelAt] ?? '').trim()
-    if (id !== '' && label !== '') carried.set(id, { label, note: (cells[noteAt] ?? '').trim() })
-  }
-  return carried
-}
-
-/**
  * `HARVEST_ONLY_CLASS=coding` draws the sample from one task class only.
  *
  * A batch restricted to coding exists because the classes are wildly uneven in this
- * corpus: coding is about 40 rows while study is nearly 300, so one shared sample
+ * corpus: coding is about 150 rows while study is over 800, so one shared sample
  * either drowns the primary metric in revision questions or spends the person's
  * time on rows that do not answer it. A class-restricted batch is a census of what
  * matters, and each batch keeps its own file.
@@ -437,11 +369,6 @@ for (const stratum of Object.keys(SAMPLE) as Stratum[]) {
   }
   poolSizes[stratum] = pool.length
   chosen.push(...sample(pool, SAMPLE[stratum], SAMPLE_SEED))
-}
-
-/** One CSV field, quoted when it contains a comma, a quote or a newline. */
-function field(value: string): string {
-  return /[",\n]/u.test(value) ? `"${value.replace(/"/gu, '""')}"` : value
 }
 
 const header = 'row,stratum,task_class,workspace,kind,hinted_type,signal_score,veto_reason,seen,id,text,label,note'

@@ -266,6 +266,20 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
  * @returns the candidate, or null when this is not a failure.
  */
 /**
+ * Whether a tool-failure sentence would still be extracted, given only its text.
+ *
+ * Exported for the report, which re-runs today's rules over rows drawn under older
+ * ones. It parses the same `工具名 失败：detail` shape `fromToolFailure` writes, so
+ * the report cannot drift from the extractor about which failures survive.
+ *
+ * @param text - a line like `edit 失败：FS_AMBIGUOUS_EDIT`.
+ * @returns true when the failure carries a diagnostic.
+ */
+export function toolFailureKept(text: string): boolean {
+  return hasDiagnostic(text.replace(/^[^:：]*[:：]\s*/u, ''))
+}
+
+/**
  * Whether a failure says anything beyond its own name.
  *
  * A bare error code is not a memory. "edit 失败：FS_AMBIGUOUS_EDIT" names a condition

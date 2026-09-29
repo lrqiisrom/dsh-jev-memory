@@ -1,8 +1,8 @@
 {
-  "generatedAt": "2026-09-29T10:24:33.085Z",
+  "generatedAt": "2026-09-29T10:28:22.093Z",
   "frame": "all-sessions",
   "sampler": "hash-rank-fnv1a",
-  "rulesHash": "a82507723d3d",
+  "rulesHash": "f141229bc001",
   "seed": 20260928,
   "logs": {
     "v0": 8,
@@ -62,9 +62,9 @@
     "round1.csv",
     "round2.csv"
   ],
-  "importedLabels": 29,
+  "importedLabels": 28,
   "labelledCarried": 10,
-  "ownLabelsCarried": 9,
+  "ownLabelsCarried": 10,
   "rowHashes": [
     "c8d65ddd5dd28e47",
     "eeb247289594e019",
