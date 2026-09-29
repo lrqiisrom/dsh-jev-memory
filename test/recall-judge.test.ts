@@ -142,7 +142,8 @@ test('judge with mode off writes nothing and never calls the model', async () =>
   let called = 0
   const judge = createJudge({
     config: { judge: 'off', types: ['constraint'] },
-    jev: { isAvailable: async () => true, choosePartner: async () => ({ index: null, confidence: null, model: null }), decide: async () => { called += 1; return { rows: [], model: null } } },
+    jev: { isAvailable: async () => true, choosePartner: async () => ({ index: null, confidence: null, model: null }),
+    decidePair: async () => ({ decision: null, confidence: null, model: null }), decide: async () => { called += 1; return { rows: [], model: null } } },
   })
   assert.equal(judge.kind, 'off')
   const result = await judge.judge([{ key: 'k', hintedType: 'constraint', signalScore: 1, signals: [] }])
@@ -160,6 +161,7 @@ test('an explicit heuristic mode never consults the model, even with a key avail
     config: { judge: 'heuristic', types: ['constraint'] },
     jev: {
       isAvailable: async () => true, choosePartner: async () => ({ index: null, confidence: null, model: null }),
+    decidePair: async () => ({ decision: null, confidence: null, model: null }),
       decide: async () => {
         called += 1
         return { rows: [], model: null }
@@ -176,7 +178,8 @@ test('judge falls back to the heuristic when the model fails', async () => {
   const warnings: string[] = []
   const judge = createJudge({
     config: { judge: 'jev', types: ['constraint'], judgeTimeoutMs: 10 },
-    jev: { isAvailable: async () => true, choosePartner: async () => ({ index: null, confidence: null, model: null }), decide: async () => { throw new Error('timeout') } },
+    jev: { isAvailable: async () => true, choosePartner: async () => ({ index: null, confidence: null, model: null }),
+    decidePair: async () => ({ decision: null, confidence: null, model: null }), decide: async () => { throw new Error('timeout') } },
     log: (level, message) => warnings.push(`${level}:${message}`),
   })
   const { rows, degraded } = await judge.judge([{ key: 'k', hintedType: 'constraint', signalScore: 0.7, signals: [] }])
@@ -191,6 +194,7 @@ test('judge maps model rows onto candidates and rejects types outside the config
     config: { judge: 'jev', types: ['constraint', 'pitfall'] },
     jev: {
       isAvailable: async () => true, choosePartner: async () => ({ index: null, confidence: null, model: null }),
+    decidePair: async () => ({ decision: null, confidence: null, model: null }),
       decide: async () => ({
         model: 'jev-1.13.0',
         rows: [{ key: 'k', type: 'fact', importance: 0.95, remember: 0.9, conflict: 'yes', confidence: 0.8 }],

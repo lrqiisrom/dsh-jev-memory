@@ -198,6 +198,16 @@ export interface AssembleContext {
   agent?: AgentLike | null
 }
 
+/**
+ * How much token overlap makes two sentences "the same kind of thing" worth asking about.
+ *
+ * Half the shorter sentence: high enough that a shared word or two does not trigger the
+ * question, low enough to catch a paraphrase whose wording was rearranged. The score is
+ * `findConflictPartner`'s normalised overlap, so the number means something independent
+ * of corpus size — unlike a raw BM25 score.
+ */
+const NEAR_DUPLICATE_MIN = 0.5
+
 /** A `systemPrompt.context` definition. */
 export interface PromptContextDefinition {
   name: string
@@ -327,6 +337,16 @@ export interface PluginConfig {
   judgeTimeoutMs: number
   knownForConflict: number
   /**
+   * Ask the model what a near-duplicate sentence is, instead of assuming.
+   *
+   * The signature can only say "these look alike". Whether that means a restatement,
+   * a correction, or two different rules is a judgement, and getting it wrong loses
+   * something the person said (dropped as a duplicate) or leaves two memories for one
+   * rule. So the model is asked — but only where determinism has already failed, and
+   * only about one named memory, so the common path pays nothing.
+   */
+  pairDecision: boolean
+  /**
    * How to rank the memories the conflict question draws on.
    *
    * `lexical` (default): BM25, no dependency, nothing leaves the machine.
@@ -448,7 +468,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.12.0'
+export const version = '0.13.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -527,6 +547,7 @@ export const DEFAULT_CONFIG: PluginConfig = {
   judgeTimeoutMs: 1800,
   /** How many known memories are shown to the judge for the conflict question. */
   knownForConflict: 20,
+  pairDecision: true,
   conflictRanking: 'lexical',
   embedding: {},
   /** Extraction overrides (see lib/extract.js). */
@@ -1207,11 +1228,83 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       })
       if (candidates.length === 0) return { written: 0, candidates: 0 }
 
+      const header = session?.header
+      const cwd = header?.cwd ?? null
+      const inScopeRecords = store.all().filter((record) => inScope(record, cwd))
+      const activePartners = inScopeRecords.filter((record) => record.status === 'active')
+      /** candidate key → the same-identity record whose text this replaces in place. */
+      const updates = new Map<string, string>()
+      /** candidate key → a different-identity record this one supersedes. */
+      const replacements = new Map<string, string>()
+
       const fresh: Candidate[] = []
       for (const candidate of candidates) {
-        if (store.has(candidate.key)) {
+        const exact = store.get(candidate.key)
+        // Byte-identical to something stored: no judgement in it, no model call.
+        if (exact && exact.text === candidate.text) {
           void store.ledger({ kind: 'skip', reason: 'duplicate', id: candidate.key, quote: candidate.quote })
           continue
+        }
+        // The signature matched but the words differ (`<n>` folds 8000 and 9000 into
+        // one), or most tokens are shared (a paraphrase). Both are places where the
+        // deterministic key is the wrong authority, so the model is asked which of the
+        // three relationships it is. Without the model, behaviour is what it was: a
+        // signature match is still treated as a duplicate.
+        const near = exact ?? findConflictPartner(candidate.text, activePartners, NEAR_DUPLICATE_MIN)?.existing
+        let decision: string | null = null
+        let asked = false
+        if (near && config.pairDecision) {
+          const verdict = await judge.decidePair(candidate.text, near.text, { project: cwd, signal })
+          decision = verdict.decision
+          // `pair-decision` means "the model was asked". The offline judge answers nothing
+          // by construction, and recording a question nobody was asked would make the
+          // ledger unreadable: the collision line below already tells that story.
+          asked = verdict.by === 'jev'
+          if (asked) {
+            void store.ledger({
+              kind: 'pair-decision',
+              id: candidate.key,
+              with: near.id,
+              decision: verdict.decision ?? 'unknown',
+              by: verdict.by,
+              model: verdict.model,
+              confidence: verdict.confidence,
+              overlap: Number((findConflictPartner(candidate.text, [near], 0)?.score ?? 0).toFixed(3)),
+              quote: excerpt(candidate.quote, 120),
+            })
+          }
+        }
+        if (decision === 'same-duplicate') {
+          void store.ledger({ kind: 'skip', reason: 'pair-duplicate', id: candidate.key, with: near?.id ?? null, quote: excerpt(candidate.quote, 120) })
+          continue
+        }
+        if (near) {
+          // Two shapes, and which one this is decided by the identity, not by the model.
+          //
+          // When the id matches, old and new *are* the same record by construction: the
+          // signature folds 8000 and 9000 into `<n>`. Writing a "new" record therefore
+          // overwrote the old one and then superseded what it had just written, which left
+          // the memory unreachable — worse than either behaviour. The record is updated in
+          // place instead, with the previous text in the ledger: the rule keeps its identity
+          // across a corrected number, which is what identity should mean.
+          //
+          // A model that cannot answer changes nothing here: the person's latest words win,
+          // and the collision is recorded rather than dropped in silence.
+          if (near.id === candidate.key) {
+            updates.set(candidate.key, near.id)
+            if (decision === null) {
+              void store.ledger({
+                kind: 'signature-collision',
+                id: candidate.key,
+                from: excerpt(near.text, 160),
+                to: excerpt(candidate.text, 160),
+                reason: !config.pairDecision ? 'pair-decision-disabled' : 'judge-unavailable',
+              })
+            }
+          } else if (decision === 'same-update') {
+            // Different identity, same rule: the old record is superseded and linked.
+            replacements.set(candidate.key, near.id)
+          }
         }
         // A tool failure is only a *pitfall* once it repeats. One sandbox denial is
         // an event; the same denial three times is a lesson. Observations are
@@ -1237,13 +1330,9 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       }
       if (fresh.length === 0) return { written: 0, candidates: candidates.length, duplicates: candidates.length }
 
-      const header = session?.header
-      const cwd = header?.cwd ?? null
       // Ranked, not sliced: `slice(0, 20)` handed the judge the first twenty memories
       // in store order, so a contradiction at position twenty-one was invisible and
       // the judge answered "no conflict" with nothing in the ledger to show for it.
-      const inScopeRecords = store.all().filter((record) => inScope(record, cwd))
-      const activePartners = inScopeRecords.filter((record) => record.status === 'active')
       // One window for the whole turn, ranked against every candidate's text: the
       // judge sees a single `known` list, so it should hold whatever any of this
       // turn's sentences might contradict.
@@ -1312,7 +1401,12 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         // taken to the human. Writing first means an unanswered question leaves the
         // system exactly where it is today — the record exists, and it is withheld
         // from recall — instead of losing what the user said.
-        if (gate.review && config.askOnConflict && pendingConflicts.length === 0) {
+        const updated = updates.get(candidate.key)
+        const replaced = replacements.get(candidate.key)
+        // A candidate the pair question already resolved as an update is not a
+        // contradiction: asking the person to arbitrate it would be asking them to
+        // re-decide what the model just decided, with less context.
+        if (gate.review && config.askOnConflict && replaced === undefined && updated === undefined && pendingConflicts.length === 0) {
           const partners = store.all().filter((record) => record.status === 'active' && inScope(record, cwd))
           const paired = await pairConflict(candidate.text, partners, cwd, signal)
           if (paired) {
@@ -1331,13 +1425,17 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           }
         }
         const now = Date.now()
+        // Read the previous text *before* the put: afterwards the record already holds the
+        // new one, and the ledger line would claim the old text was the new text.
+        const previousText = updated === undefined ? '' : (store.get(updated)?.text ?? '')
         await store.put({
           id: candidate.key,
           type: judgement.type,
           text: candidate.text,
           cwd,
           importance: judgement.importance,
-          status: gate.review ? 'needs-review' : 'active',
+          status: gate.review && replaced === undefined && updated === undefined ? 'needs-review' : 'active',
+          supersedes: replaced ?? null,
           source: { sessionId: header?.id ?? agent?.id ?? null, seq: candidate.seq, quote: candidate.quote, at: now },
           createdAt: now,
           updatedAt: now,
@@ -1354,12 +1452,27 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           by: judgement.by,
           model,
           conflict: judgement.conflict,
-          status: gate.review ? 'needs-review' : 'active',
+          status: gate.review && replaced === undefined && updated === undefined ? 'needs-review' : 'active',
+          supersedes: replaced ?? null,
           cwd,
           source: { sessionId: header?.id ?? null, seq: candidate.seq, quote: excerpt(candidate.quote, 160) },
           signals: judgement.signals,
           note: judgement.note,
         })
+        if (updated !== undefined) {
+          // In place: `store.put` already preserves createdAt, recalls and lastRecalledAt.
+          void store.ledger({
+            kind: 'pair-updated',
+            id: candidate.key,
+            inPlace: true,
+            from: excerpt(previousText, 160),
+            to: excerpt(candidate.text, 160),
+          })
+        }
+        if (replaced !== undefined) {
+          await store.supersede(replaced, candidate.key)
+          void store.ledger({ kind: 'pair-updated', id: candidate.key, superseded: replaced, inPlace: false })
+        }
         written += 1
       }
       return { written, candidates: candidates.length, duplicates: candidates.length - fresh.length, model, degraded, pendingConflicts }

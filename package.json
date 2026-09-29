@@ -1,6 +1,6 @@
 {
   "name": "dsh-jev-memory",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "private": true,
   "description": "Typed, auditable long-term memory for the DeepSeek Harness: a turn-end write hook, a judgement layer (Jev or a deterministic fallback), a local store, and per-session recall injection.",
   "type": "module",

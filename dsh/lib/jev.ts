@@ -186,6 +186,29 @@ export interface JevPartnerResult {
   model: string | null
 }
 
+/** The three answers a pair question can carry. */
+export type PairDecision = 'same-update' | 'same-duplicate' | 'different'
+
+/** Input for {@link JevClient.decidePair}. */
+export interface JevPairRequest {
+  /** the sentence just said. */
+  incoming: string
+  /** the stored memory it looks like. */
+  existing: string
+  /** the workspace, as framing. */
+  project?: string | null
+  timeoutMs?: number
+  signal?: AbortSignal
+}
+
+/** What the model said about a pair, or that it could not answer. */
+export interface JevPairResult {
+  /** null when the answer was missing or unusable — never guessed. */
+  decision: PairDecision | null
+  confidence: number | null
+  model: string | null
+}
+
 /** One typed question in the request body. */
 export interface JevQuestion {
   type: string
@@ -242,6 +265,15 @@ export interface JevClient {
    * answer unless the plugin can name the other side.
    */
   choosePartner(request: JevPartnerRequest): Promise<JevPartnerResult>
+  /**
+   * Ask whether a new sentence is the same rule as one stored memory.
+   *
+   * A separate question from `choosePartner` on purpose. That one asks which known
+   * memory this contradicts, which presupposes a contradiction; this one asks what the
+   * relationship *is*, because the deterministic signature cannot tell a restatement
+   * from a change from a different rule.
+   */
+  decidePair(request: JevPairRequest): Promise<JevPairResult>
   endpoint: string
   decide(request: JevDecideRequest): Promise<JevDecideResult>
 }
@@ -384,6 +416,70 @@ export function createJevClient({
         model: typeof json?.model === 'string' ? json.model : null,
       }
     },
+    /**
+     * Ask what the relationship is between a new sentence and one stored memory.
+     *
+     * The question is deliberately about *content*, not wording: the two texts are
+     * already known to look alike — that is why it is being asked — so asking whether
+     * they look alike would be circular. It also spells out correction versus
+     * restatement, which is the distinction a signature cannot make.
+     *
+     * @param request - the two texts.
+     * @returns the decision, its confidence, and the responding model.
+     */
+    async decidePair(request: JevPairRequest): Promise<JevPairResult> {
+      const apiKey = (await resolveKey()).key
+      if (!apiKey) throw new Error('jev is not configured')
+      const body: JevRequestBody = {
+        state: { memory_system: MEMORY_CONTEXT, project: request.project ?? null, known_memories: [request.existing] },
+        model: settings.model,
+        questions: {
+          pair: {
+            type: 'choice',
+            instructions: {
+              incoming: request.incoming,
+              stored: request.existing,
+              question:
+                '`incoming` 是刚说的一句话，`stored` 是已经记下来的一条。它们措辞很像，但**措辞像不等于同一件事**。判断当前内容的关系：' +
+                '若 `incoming` 是同一条规矩更准或更新的说法（改了数字、改了限制、把话说清楚了），选 same-update；' +
+                '若只是同一句话换个说法、没有任何新信息，选 same-duplicate；' +
+                '若讲的是不同的规矩或不同的方面、两条都该留着，选 different。' +
+                '只看内容，不要因为用词相近就选 same-*。',
+            },
+            criteria: {
+              'same-update': '同一条规矩的新说法，应该用它替换旧的',
+              'same-duplicate': '完全同义，没有任何新信息',
+              different: '不同的规矩或不同的方面，两条都保留',
+            },
+          },
+        },
+      }
+
+      const response = await postWithRetry({
+        url: endpoint,
+        apiKey,
+        body,
+        timeoutMs:
+          typeof request.timeoutMs === 'number' && Number.isFinite(request.timeoutMs)
+            ? request.timeoutMs
+            : settings.timeoutMs,
+        maxRetries: settings.maxRetries,
+        retryStatuses: settings.retryStatuses,
+        fetchImpl,
+        signal: request.signal,
+        log,
+      })
+
+      const json = asRecord(response.json)
+      const answer = asRecord(asRecord(json?.answers)?.pair)
+      const label = typeof answer?.choice === 'string' ? answer.choice : null
+      const decision: PairDecision | null =
+        label === 'same-update' || label === 'same-duplicate' || label === 'different' ? label : null
+      const confidence = typeof answer?.confidence === 'number' ? clamp01(answer.confidence) : null
+      const model = typeof json?.model === 'string' ? json.model : null
+      return { decision, confidence, model }
+    },
+
     /**
      * Ask which of the known memories the incoming one contradicts.
      *

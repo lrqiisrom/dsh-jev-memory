@@ -26,7 +26,17 @@
 
 import { clamp01 } from './store.ts'
 import { MEMORY_TYPES } from './store.ts'
-import type { JevCandidate, JevDecideRequest, JevDecideResult, JevPartnerRequest, JevPartnerResult, JevRow } from './jev.ts'
+import type {
+  JevCandidate,
+  JevDecideRequest,
+  JevDecideResult,
+  JevPairRequest,
+  JevPairResult,
+  JevPartnerRequest,
+  JevPartnerResult,
+  JevRow,
+  PairDecision,
+} from './jev.ts'
 
 /** Host logger signature, repeated per module so no module imports another for it. */
 export type LogSink = (level: string, message: string, detail?: unknown) => void
@@ -92,6 +102,8 @@ export interface JudgeModelPort {
   decide(request: JevDecideRequest): Promise<JevDecideResult | JevRow[]>
   /** which known memory a new one contradicts; see `Judge.choosePartner`. */
   choosePartner(request: JevPartnerRequest): Promise<JevPartnerResult>
+  /** what the relationship is between a new sentence and a stored memory. */
+  decidePair(request: JevPairRequest): Promise<JevPairResult>
 }
 
 /** The judge handle the plugin mounts. */
@@ -113,6 +125,19 @@ export interface Judge {
     known: string[],
     context?: JudgeContext,
   ): Promise<{ index: number | null; confidence: number | null; via: 'jev' } | null>
+  /**
+   * Ask what the relationship is between a new sentence and one stored memory.
+   *
+   * `null` means the judge has no opinion — the offline judge always, and the model
+   * whenever it could not answer. The caller must then keep its deterministic
+   * behaviour rather than guess, because guessing here means either losing something
+   * the person said or overwriting a memory on a coin flip.
+   */
+  decidePair(
+    incoming: string,
+    existing: string,
+    context?: JudgeContext,
+  ): Promise<{ decision: PairDecision | null; confidence: number | null; by: 'jev' | 'heuristic'; model: string | null }>
 }
 
 /** The judgement fields the write gate reads. */
@@ -256,6 +281,41 @@ export function createJudge({ config, jev, log = () => {} }: { config: JudgeConf
         // would mean silently withholding a memory the user could have resolved.
         log('warn', 'partner choice failed; falling back to lexical pairing', { error: String(error) })
         return null
+      }
+    },
+
+    /**
+     * What the relationship is between a new sentence and one stored memory.
+     *
+     * `null` is the honest answer from a rule: no deterministic check can tell a
+     * restatement from a correction, which is exactly the judgement the signature
+     * fails at and the reason this question goes to a model. The caller keeps its
+     * deterministic path on null rather than guessing, because guessing here means
+     * either losing something the person said or overwriting a memory on a coin flip.
+     *
+     * @param incoming - the new sentence.
+     * @param existing - the stored memory it resembles.
+     * @param context - workspace framing and cancellation.
+     * @returns the decision, or null with `by: 'heuristic'` when nothing can answer.
+     */
+    async decidePair(
+      incoming: string,
+      existing: string,
+      context: JudgeContext = {},
+    ): Promise<{ decision: PairDecision | null; confidence: number | null; by: 'jev' | 'heuristic'; model: string | null }> {
+      if (!(await jevReady())) return { decision: null, confidence: null, by: 'heuristic', model: null }
+      try {
+        const result = await jev!.decidePair({
+          incoming,
+          existing,
+          project: context.project ?? null,
+          timeoutMs: config.judgeTimeoutMs,
+          signal: context.signal,
+        })
+        return { decision: result.decision, confidence: result.confidence, by: 'jev', model: result.model }
+      } catch (error) {
+        log('warn', 'pair decision failed; keeping the deterministic behaviour', { error: String(error) })
+        return { decision: null, confidence: null, by: 'heuristic', model: null }
       }
     },
   }

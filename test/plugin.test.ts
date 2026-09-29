@@ -924,3 +924,194 @@ test('forgetting a superseded memory really removes it', async () => {
     globalThis.fetch = realFetch
   }
 })
+
+/** A Jev stub that answers the pair question with one fixed decision. */
+function jevPairStub(decision: string): typeof fetch {
+  return (async (_url: string, init?: { body?: unknown }) => {
+    const body = JSON.parse(String(init?.body ?? '{}'))
+    if (body?.questions?.pair) {
+      return new Response(
+        JSON.stringify({ model: 'jev-1.13.0', answers: { pair: { type: 'choice', choice: decision, confidence: 0.9 } } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    if (body?.questions?.partner) {
+      return new Response(
+        JSON.stringify({ model: 'jev-1.13.0', answers: { partner: { type: 'choice', choice: 'none-of-the-above', confidence: 0.9 } } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    return new Response(
+      JSON.stringify({
+        model: 'jev-1.13.0',
+        answers: {
+          'remember:0': { type: 'noul', noul: 0.9 },
+          'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
+          'importance:0': { type: 'score', score: 3, legend: {}, confidence: 0.9 },
+          'conflict:0': { type: 'noul', noul: 0.05 },
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )
+  }) as unknown as typeof fetch
+}
+
+// The two defects this exists for: the normalized signature folds 8000 and 9000 into
+// `<n>`, so the second sentence used to be dropped as a duplicate and the plugin kept
+// believing the old number. Whether that is a correction or a restatement is a
+// judgement, so it is asked — about one named memory, only here.
+test('a changed number updates the memory in place, with the old text in the ledger', async () => {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = jevPairStub('same-update')
+  try {
+    const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } })
+    const session = fakeSession({ events: [] })
+    const write = toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write')
+    await write.execute({ text: '服务端口固定 8000，不要改。', type: 'constraint' }, { agent: { session } })
+
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: turnWith('服务端口固定 9000，不要改。') }) },
+      turn: 1,
+      signal: undefined,
+    })
+
+    const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+    const found = await search.execute({ query: '端口' }, { agent: { session } })
+    assert.equal(found.matches.length, 1, 'one rule, one current memory')
+    assert.match(found.matches[0].text, /9000/u, 'the new number is what the plugin now believes')
+    assert.equal(found.matches[0].status, 'active', 'and it is reachable — not left superseded')
+
+    // In place, not a second record: the signature is the identity, and `<n>` folds both
+    // numbers into one id. Writing a second record overwrote the first and then superseded
+    // what it had just written, which left the memory unreachable.
+    const document = JSON.parse(await readFile(join(root, 'memory.json'), 'utf8')) as {
+      records?: Array<Record<string, unknown>>
+    }
+    const records = document.records ?? []
+    assert.equal(records.length, 1, 'one record, corrected')
+    assert.match(String(records[0]?.text), /9000/u)
+
+    const ledger = await ledgerEntries(root)
+    assert.equal(ledger.find((entry) => entry.kind === 'pair-decision')?.decision, 'same-update')
+    const applied = ledger.find((entry) => entry.kind === 'pair-updated')
+    assert.equal(applied?.inPlace, true)
+    assert.match(String(applied?.from), /8000/u, 'the previous text stays auditable')
+    assert.match(String(applied?.to), /9000/u)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test('a paraphrase the model calls a restatement is dropped, not stored twice', async () => {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = jevPairStub('same-duplicate')
+  try {
+    const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } })
+    const session = fakeSession({ events: [] })
+    await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+      { text: '必须用 pnpm 管理依赖，这是团队约定。', type: 'constraint' },
+      { agent: { session } },
+    )
+
+    // Different signature, most tokens shared: exactly the case a content key cannot
+    // judge, because it cannot tell "same thing, different words" from "different rule".
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: turnWith('这是团队约定：必须用 pnpm 管理依赖。') }) },
+      turn: 1,
+      signal: undefined,
+    })
+
+    const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+    assert.equal((await search.execute({ query: 'pnpm' }, { agent: { session } })).matches.length, 1)
+    const ledger = await ledgerEntries(root)
+    assert.equal(ledger.find((entry) => entry.kind === 'pair-decision')?.decision, 'same-duplicate')
+    assert.ok(ledger.some((entry) => entry.reason === 'pair-duplicate'), 'the skip says why')
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test('a different rule that merely looks alike is kept as its own memory', async () => {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = jevPairStub('different')
+  try {
+    const { captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } })
+    const session = fakeSession({ events: [] })
+    await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+      { text: '必须用 pnpm 管理依赖，这是团队约定。', type: 'constraint' },
+      { agent: { session } },
+    )
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: turnWith('提交前必须保证测试全绿，这是团队约定。') }) },
+      turn: 1,
+      signal: undefined,
+    })
+    const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+    assert.equal(
+      (await search.execute({ query: '团队约定' }, { agent: { session } })).matches.length,
+      2,
+      'two rules both survive — the deterministic key would have been wrong either way',
+    )
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test('without a model a signature collision is recorded, not dropped in silence', async () => {
+  // The offline judge has no opinion on this by construction. Falling back must not mean
+  // "drop what the person just said" — which is exactly the defect this work started from
+  // — so the latest words win and the collision is written down.
+  const { root, captured } = await mount({ judge: 'heuristic' })
+  const session = fakeSession({ events: [] })
+  await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+    { text: '服务端口固定 8000，不要改。', type: 'constraint' },
+    { agent: { session } },
+  )
+  await listenerFor(captured, 'agent/turn-stopping')({
+    agent: { id: 's1', session: fakeSession({ events: turnWith('服务端口固定 9000，不要改。') }) },
+    turn: 1,
+    signal: undefined,
+  })
+  const ledger = await ledgerEntries(root)
+  assert.equal(ledger.filter((entry) => entry.kind === 'pair-decision').length, 0, 'nobody was asked')
+  const collision = ledger.find((entry) => entry.kind === 'signature-collision')
+  assert.equal(collision?.reason, 'judge-unavailable')
+  assert.match(String(collision?.from), /8000/u)
+  assert.match(String(collision?.to), /9000/u)
+
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+  assert.match((await search.execute({ query: '端口' }, { agent: { session } })).matches[0]?.text ?? '', /9000/u)
+})
+
+// A paraphrase the model calls an update has a *different* signature, so there the old
+// record is superseded and linked — the other shape of the same decision.
+test('a paraphrase called an update supersedes the old record by link', async () => {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = jevPairStub('same-update')
+  try {
+    const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } })
+    const session = fakeSession({ events: [] })
+    const first = await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+      { text: '必须用 pnpm 管理依赖，这是团队约定。', type: 'constraint' },
+      { agent: { session } },
+    )
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: turnWith('这是团队约定：必须用 pnpm 管理依赖。') }) },
+      turn: 1,
+      signal: undefined,
+    })
+
+    const document = JSON.parse(await readFile(join(root, 'memory.json'), 'utf8')) as {
+      records?: Array<Record<string, unknown>>
+    }
+    const records = document.records ?? []
+    assert.equal(records.length, 2, 'two identities, so two records')
+    const old = records.find((entry) => entry.id === first.id)
+    assert.equal(old?.status, 'superseded')
+    const fresh = records.find((entry) => entry.id !== first.id)
+    assert.equal(fresh?.supersedes, first.id)
+    assert.ok((await ledgerEntries(root)).some((entry) => entry.kind === 'pair-updated' && entry.inPlace === false))
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
