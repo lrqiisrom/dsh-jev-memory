@@ -38,7 +38,7 @@
  * @module eval/report
  */
 
-import { readFile, writeFile } from 'node:fs/promises'
+import { readdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { TOOL_FAILURE_SIGNAL_SCORE, candidateScore, toolFailureKept } from '../dsh/lib/extract.ts'
@@ -66,10 +66,20 @@ const SHIPPED_JUDGE_TIMEOUT_MS = 1800
 /** Set when the run swaps the gate question, so the report says which one it used. */
 const questionOverride = process.env.REPORT_REMEMBER_QUESTION?.trim() ?? ''
 const labelDir = process.env.REPORT_DIR?.trim() || new URL('./labels/', import.meta.url).pathname
-const batches = (process.env.REPORT_BATCHES?.trim() || 'round1.csv,round2.csv,round3.csv')
-  .split(',')
-  .map((name) => name.trim())
-  .filter((name) => name !== '')
+// Every batch in the directory unless told otherwise. The list used to be hardcoded, so
+// a batch added later was silently left out of the report — the numbers would look fine
+// and simply not include the rows someone had just labelled.
+const batches =
+  process.env.REPORT_BATCHES?.trim() !== undefined && process.env.REPORT_BATCHES?.trim() !== ''
+    ? String(process.env.REPORT_BATCHES)
+        .split(',')
+        .map((name) => name.trim())
+        .filter((name) => name !== '')
+    : (await readdir(labelDir).catch(() => [] as string[]))
+        // `round<N>.csv` exactly: `round1.orphaned-labels.csv` is a safety copy, not a batch,
+        // and pulling it in would double-count its rows and show a batch with no frame.
+        .filter((name) => /^round\d+\.csv$/u.test(name))
+        .sort()
 const maxCandidates = Number(process.env.REPORT_MAX_CANDIDATES ?? SHIPPED_MAX_CANDIDATES) || SHIPPED_MAX_CANDIDATES
 const repeats = Math.max(1, Number(process.env.REPORT_REPEAT ?? '3') || 3)
 
