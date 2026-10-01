@@ -69,6 +69,30 @@ export interface RecallOptions {
   preferCanonical?: boolean
 }
 
+/**
+ * A token that looks like a *name* rather than an ordinary word.
+ *
+ * Used to decide when a query is quoting something — a file, a symbol, an error code. The
+ * shape test matters: `replace` and `intended` also occur once in the store, and treating them
+ * as names made the first version of the identifier probe set measure nothing.
+ */
+export const NAME_LIKE = /\b[A-Za-z][A-Za-z0-9_.-]{4,}\b/gu
+
+/**
+ * How much one verbatim name match is worth on top of BM25.
+ *
+ * Swept against both probe kinds at once, because a bonus big enough to fix identifier queries
+ * can drown the prose score. On 36 paraphrase probes and 22 identifier probes: 0 → identifier
+ * MRR 0.31 / Hit@1 0%; 4 → 0.55 / 14%; 8 → 0.95 / 91%; **12 and above → 1.00 / 100%**, with the
+ * paraphrase numbers unchanged at 0.71 / 67% for every weight up to 128. 16 sits inside that
+ * plateau rather than on its edge.
+ *
+ * It exists because replacing the substring matcher with BM25 fixed paraphrase and *broke*
+ * this: on a quoted name the old matcher scored 0.97 and BM25 scored 0.31, since an identifier
+ * is one token among many and `memory` or `json` carry little IDF.
+ */
+const NAME_MATCH_BONUS = 16
+
 /** Ranking options for the on-demand search tool. */
 export interface SearchOptions {
   /** session working directory. */
@@ -222,9 +246,11 @@ export function searchMemories(records: RecallableRecord[], query: string, optio
   // before, which meant a query containing the word "constraint" surfaced every constraint
   // regardless of what it said.
   const scorer = createBm25Scorer(scoped)
+  const named = [...new Set(needle.match(NAME_LIKE) ?? [])]
   const matches: SearchHit[] = []
   for (const record of scoped) {
-    const score = scorer(needle, record)
+    let score = scorer(needle, record)
+    for (const name of named) if (record.text.includes(name)) score += NAME_MATCH_BONUS
     if (score > 0) matches.push({ record, score })
   }
   // Importance only breaks exact ties: as a multiplier it lets a memory that merely scored

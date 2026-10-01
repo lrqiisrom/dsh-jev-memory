@@ -32,7 +32,7 @@ import { join } from 'node:path'
 import { createBm25Scorer } from '../dsh/lib/conflict.ts'
 import { cosineSimilarity, createEmbeddingClient, createVectorCache, vectorKey } from '../dsh/lib/embedding.ts'
 import { estimateTokens } from '../dsh/lib/text.ts'
-import { searchMemories, selectMemories, renderRecall } from '../dsh/lib/recall.ts'
+import { NAME_LIKE, searchMemories, selectMemories, renderRecall } from '../dsh/lib/recall.ts'
 import { buildCorpus, recordsOf } from './lib/recall-corpus.ts'
 import { parseCsvRecords } from './lib/csv.ts'
 
@@ -287,7 +287,7 @@ say('| 检索方式 | 问法 | Hit@1 | Hit@3 | Hit@5 | Hit@10 | MRR | 完全找�
 say('|---|---|---|---|---|---|---|---|')
 const tallies = new Map<string, Tally>()
 const rankers: Array<[string, Ranker]> = [
-  ['**`memory_search`（现在的实现：BM25）**', searchRanker],
+  ['**`memory_search`（现在的实现：BM25 + 名字精确命中加成）**', searchRanker],
   ['旧版子串匹配（已弃用，留作对照）', legacyRanker],
 ]
 if (embeddingReady) {
@@ -307,6 +307,105 @@ for (const [name, ranker] of rankers) {
 say('')
 say('（MRR = 相关那条排在第几的倒数，第 1 位记 1.0、第 2 位记 0.5，再取平均。越高说明越靠前。）')
 say('')
+
+// Identifier probes, generated mechanically rather than by a model, because the two probe
+// kinds above both test the same thing from different angles: how well a retriever copes when
+// the words differ. There is a third kind where the words are identical and *must* match —
+// somebody asking about `memory.json` or an error code — and it is the case lexical search
+// wins. None of the model-written probes covered it, which made "embeddings strictly dominate"
+// a claim about one kind of question.
+//
+// The rule is mechanical so nothing is cherry-picked: take every identifier that appears in
+// exactly one memory (document frequency 1) and is long enough to be a name, and ask about it.
+const IDENTIFIER = NAME_LIKE
+const documentFrequency = new Map<string, number>()
+for (const record of records) {
+  for (const identifier of new Set(record.text.match(IDENTIFIER) ?? [])) {
+    documentFrequency.set(identifier, (documentFrequency.get(identifier) ?? 0) + 1)
+  }
+}
+const identifierProbes: Probe[] = []
+for (const entry of corpus.entries) {
+  const record = entry.record
+  const unique = [...new Set(record.text.match(IDENTIFIER) ?? [])].filter(
+    (identifier) =>
+      documentFrequency.get(identifier) === 1 &&
+      // Must look like a *name*, not an ordinary English word that happens to occur once.
+      // Without this the probe set filled up with `replace`, `intended` and `constraint`,
+      // which measure nothing: a person does not ask about those by quoting them.
+      /[._\-0-9]/u.test(identifier) || /[a-z][A-Z]/u.test(identifier),
+  )
+  if (unique.length === 0) continue
+  const chosen = unique.sort((a, b) => b.length - a.length)[0]!
+  identifierProbes.push({
+    queryId: `id-${identifierProbes.length + 1}`,
+    query: `${chosen} 这块是怎么定的？`,
+    closeness: 'identifier',
+    targetId: record.id,
+  })
+}
+
+say('### 标识符探针（机械生成：只出现在一条记忆里的名字）')
+say('')
+if (identifierProbes.length === 0) {
+  say('这批记忆里没有"只出现在一条记忆里"的标识符，跳过。')
+  say('')
+} else {
+  say(
+    `规则：取每条记忆里**只在这一条里出现过**、长度 ≥ 5、而且长得像名字（含 \`.\`/\`_\`/\`-\`/数字，或驼峰）的标识符，拼成一句问话。共 ${identifierProbes.length} 个探针，没有人工挑选。` +
+      '目标既可能是真记忆也可能是垃圾行——这一组量的是"词面能不能对上"，不是记忆质量。',
+  )
+  say('')
+  say('| 检索方式 | Hit@1 | Hit@3 | Hit@5 | MRR |')
+  say('|---|---|---|---|---|')
+  for (const [name, ranker] of rankers) {
+    const tally = tallyOf(ranker, identifierProbes)
+    tallies.set(`${name}|标识符`, tally)
+    say(
+      `| ${name} | ${percent(tally.at1 / tally.total)} | ${percent(tally.at3 / tally.total)} | ${percent(tally.at5 / tally.total)} | ${(tally.reciprocal / tally.total).toFixed(2)} |`,
+    )
+  }
+  say('')
+  const sample = identifierProbes.slice(0, 5).map((probe) => probe.query).join('｜')
+  say(`探针样例：${sample}`)
+  say('')
+
+  // Replacing the substring matcher with BM25 fixed paraphrase and broke this. Substring
+  // matching was never good in general, but on a quoted name it is nearly perfect, and BM25
+  // throws that away: an identifier is one token among many, and `memory` and `json` are
+  // common enough that IDF barely rewards them.
+  //
+  // The fix is not a fusion of rankers but a bonus inside the score: a query that names
+  // something verbatim should say so. The weight is swept against both probe kinds at once,
+  // because a bonus big enough to fix identifiers can drown the prose score.
+  say('**给 BM25 加"精确命中"加成，权重扫描**（两个探针集一起看，避免按下葫芦浮起瓢）：')
+  say('')
+  say('| 精确命中加成 | 近+远 探针 MRR | 近+远 Hit@1 | 标识符 MRR | 标识符 Hit@1 | 标识符 Hit@5 |')
+  say('|---|---|---|---|---|---|')
+  for (const weight of [0, 1, 4, 8, 12, 16, 24, 32, 64, 128]) {
+    const withBonus: Ranker = (query) => {
+      const named = [...new Set(query.match(IDENTIFIER) ?? [])]
+      return records
+        .map((record) => {
+          let score = bm25(query, record)
+          for (const identifier of named) if (record.text.includes(identifier)) score += weight
+          return { id: record.id, score }
+        })
+        .filter((entry) => entry.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .map((entry) => entry.id)
+    }
+    const prose = tallyOf(withBonus, all)
+    const names = tallyOf(withBonus, identifierProbes)
+    say(
+      `| ${weight === 0 ? '0（现状）' : weight} | ${(prose.reciprocal / prose.total).toFixed(2)} | ${percent(prose.at1 / prose.total)} | ${(names.reciprocal / names.total).toFixed(2)} | ${percent(names.at1 / names.total)} | ${percent(names.at5 / names.total)} |`,
+    )
+  }
+  say('')
+  const exactHit = [...new Set(identifierProbes.map((probe) => probe.query.match(IDENTIFIER)?.[0] ?? ''))]
+  say(`（"精确命中"的定义：查询里出现的名字，在记忆原文里**逐字出现**。本批共 ${exactHit.length} 个不同的名字。）`)
+  say('')
+}
 
 say('## 自动注入：不看问题的那条路')
 say('')
@@ -395,6 +494,7 @@ const baseline = {
     ]),
   ),
   injection: { covered: injectedHits, total: all.length, tokens: injectedTokens, maxTokens },
+  identifierProbes: identifierProbes.length,
 }
 
 const writeBaseline = process.env.RECALL_BASELINE_OUT?.trim()

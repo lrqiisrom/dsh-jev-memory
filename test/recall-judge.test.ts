@@ -116,6 +116,30 @@ test('searchMemories finds a memory the question does not quote', () => {
   assert.equal(hits[0]?.record.id, 'port', 'the memory about ports must win without the exact phrase')
 })
 
+test('searchMemories lets a quoted name outrank a stronger prose match', () => {
+  // Replacing the substring matcher with BM25 fixed paraphrase and broke this case: on a quoted
+  // name the old matcher scored MRR 0.97 and plain BM25 scored 0.31, because `memory` and `json`
+  // are common tokens that carry little IDF. Measured over 22 machine-generated identifier
+  // probes, the bonus takes it to 1.00 while leaving the 36 paraphrase probes at 0.71.
+  const records = [memory({ id: 'names' }), memory({ id: 'prose' })]
+  records[0].text = '简历里不要带 memory.json 这种自定义文件名'
+  records[1].text = '简历里不要带自定义文件名也不要带仓库之外的东西，注意措辞要简洁'
+  // The prose memory shares far more tokens with the question; only the name is decisive.
+  const hits = searchMemories(records, 'memory.json 这个文件名有什么要求？', { cwd: '/work/a' })
+  assert.equal(hits[0]?.record.id, 'names')
+})
+
+test('searchMemories does not treat an ordinary word as a name', () => {
+  // `replace` and `intended` also occur exactly once in the store. Treating them as names made
+  // the first identifier probe set measure nothing, and would let any long English word in a
+  // question trigger the bonus.
+  const records = [memory({ id: 'a' }), memory({ id: 'b' })]
+  records[0].text = '必须用 pnpm 管理依赖'
+  records[1].text = '依赖装完要跑一遍构建'
+  const hits = searchMemories(records, 'dependencies 这块是怎么定的？', { cwd: '/work/a' })
+  assert.equal(hits.length, 0, 'no shared token and no name means no result')
+})
+
 test('searchMemories returns nothing when nothing is related', () => {
   // The `score > 0` cutoff is part of the contract: a search tool that always returns its
   // whole store is worse than one that admits it found nothing. Making importance an additive
