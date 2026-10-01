@@ -11,3 +11,5 @@ node_modules/
 
 # 标注数据里是真实会话原文，默认不入库（需要版本化时 git add -f）
 eval/labels/*.csv
+# 读取侧的探针是拿真实记忆生成的问题，同样带项目原文；报告和基线只含汇总结论，入库
+eval/labels/*.probes.json

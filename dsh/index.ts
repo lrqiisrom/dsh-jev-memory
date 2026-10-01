@@ -368,6 +368,16 @@ export interface PluginConfig {
    * is kept beside the store. See `embedding` below.
    */
   conflictRanking: 'lexical' | 'embedding'
+  /**
+   * How the `memory_search` tool ranks its hits.
+   *
+   * `lexical` (default): BM25 over the whole store, local, no dependency. Since 2026-10-01
+   * this replaced a substring matcher — see `searchMemories` for the measurement.
+   * `embedding`: cosine similarity instead, which measured much better on questions that do
+   * not reuse the memory's words (MRR 0.71 → 0.90 overall, 0.46 → 0.83 on those). It sends
+   * the query and every stored sentence to the provider, so it is not the default.
+   */
+  searchRanking: 'lexical' | 'embedding'
   embedding: Partial<EmbeddingSettings>
   extract: Partial<ExtractOptions>
   recall: RecallConfig
@@ -577,6 +587,7 @@ export const DEFAULT_CONFIG: PluginConfig = {
   pairDecision: true,
   normalize: { ...NORMALIZE_DEFAULTS },
   conflictRanking: 'lexical',
+  searchRanking: 'lexical',
   embedding: {},
   /** Extraction overrides (see lib/extract.js). */
   extract: {},
@@ -665,6 +676,10 @@ export function resolveConfig(raw: unknown): { config: PluginConfig; problems: s
   if (config.conflictRanking !== 'lexical' && config.conflictRanking !== 'embedding') {
     problems.push(`conflictRanking: unknown value "${String(config.conflictRanking)}"; using lexical`)
     config.conflictRanking = 'lexical'
+  }
+  if (config.searchRanking !== 'lexical' && config.searchRanking !== 'embedding') {
+    problems.push(`searchRanking: unknown value "${String(config.searchRanking)}"; using lexical`)
+    config.searchRanking = 'lexical'
   }
   for (const field of ['dimensions', 'timeoutMs', 'maxInputs'] as const) {
     const value = config.embedding[field]
@@ -806,11 +821,44 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   void vectorCache.load()
 
   /**
+   * Vectorize texts through the cache, fetching only what is missing.
+   *
+   * Returns null on any shortfall — no key, a provider error, a timeout, vectors that do not
+   * line up — because every caller treats the embedding path as an optimisation. Factored out
+   * when search needed the same table as conflict ranking: two copies of this loop is two
+   * places for the index/vector pairing to drift.
+   */
+  const ensureVectors = async (texts: readonly string[]): Promise<Map<string, number[]> | null> => {
+    const settings = { ...EMBEDDING_DEFAULTS, ...config.embedding } as EmbeddingSettings
+    await vectorCache.load()
+    const missing: string[] = []
+    for (const text of texts) {
+      if (vectorCache.get(vectorKey(settings, text)) === undefined && !missing.includes(text)) missing.push(text)
+    }
+    if (missing.length > 0) {
+      const fresh = await embedding.embed(missing)
+      if (fresh === null) return null
+      for (const [index, text] of missing.entries()) {
+        const vector = fresh[index]
+        if (vector === undefined) return null
+        vectorCache.set(vectorKey(settings, text), vector)
+      }
+      void vectorCache.persist()
+    }
+    const vectors = new Map<string, number[]>()
+    for (const text of texts) {
+      const vector = vectorCache.get(vectorKey(settings, text))
+      if (vector === undefined) return null
+      vectors.set(text, vector)
+    }
+    return vectors
+  }
+
+  /**
    * Rank memories by cosine similarity, or give up and let BM25 do it.
    *
-   * Returns null on any shortfall — no key, a provider error, a timeout, vectors that
-   * do not line up — because ranking is an optimisation and the write path must not
-   * depend on it. The caller falls back to lexical.
+   * Returns null on any shortfall, because ranking is an optimisation and the write path must
+   * not depend on it. The caller falls back to lexical.
    */
   const embeddingRanker =
     config.conflictRanking !== 'embedding'
@@ -820,36 +868,46 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           records: readonly MemoryRecord[],
           limit: number,
         ): Promise<MemoryRecord[] | null> => {
-          const settings: Partial<EmbeddingSettings> = { ...EMBEDDING_DEFAULTS, ...config.embedding }
-          await vectorCache.load()
-          const wanted = [incoming, ...records.map((record) => record.text)]
-          const missing: string[] = []
-          for (const text of wanted) {
-            if (vectorCache.get(vectorKey(settings as EmbeddingSettings, text)) === undefined && !missing.includes(text)) {
-              missing.push(text)
-            }
-          }
-          if (missing.length > 0) {
-            const fresh = await embedding.embed(missing)
-            if (fresh === null) return null
-            for (const [index, text] of missing.entries()) {
-              const vector = fresh[index]
-              if (vector === undefined) return null
-              vectorCache.set(vectorKey(settings as EmbeddingSettings, text), vector)
-            }
-            void vectorCache.persist()
-          }
-          const incomingVector = vectorCache.get(vectorKey(settings as EmbeddingSettings, incoming))
+          const vectors = await ensureVectors([incoming, ...records.map((record) => record.text)])
+          if (vectors === null) return null
+          const incomingVector = vectors.get(incoming)
           if (incomingVector === undefined) return null
-          const scored = records.map((record) => {
-            const vector = vectorCache.get(vectorKey(settings as EmbeddingSettings, record.text))
-            return { record, score: vector === undefined ? 0 : cosineSimilarity(incomingVector, vector) }
-          })
-          return scored
+          return records
+            .map((record) => ({ record, score: cosineSimilarity(incomingVector, vectors.get(record.text) ?? []) }))
             .sort((left, right) => {
               if (right.score !== left.score) return right.score - left.score
               return (right.record.updatedAt ?? 0) - (left.record.updatedAt ?? 0)
             })
+            .slice(0, limit)
+            .map((entry) => entry.record)
+        }
+
+  /**
+   * Rank search hits by cosine similarity, or null to keep the lexical result.
+   *
+   * Measured before it was wired: on 36 probes derived from labelled memories, BM25 ranked the
+   * answering memory at MRR 0.71 overall and 0.46 for probes that phrased the need in other
+   * words; cosine ranked it 0.90 and 0.83. Across the whole set there was **not one probe where
+   * BM25 found the target in the top 5 and embeddings missed it**, and 7 where the reverse
+   * held. Hence a ranking *mode* rather than a fusion: the naive normalized sum measured worse
+   * than embeddings alone (0.74), because BM25 scores 1.0 for its own top hit whatever that hit
+   * is, and RRF recovered only part of the gap (0.83).
+   *
+   * Opt-in, not the default, because it sends the query and every stored sentence to a
+   * provider. `lexical` keeps search local.
+   */
+  const embeddingSearchRanker =
+    config.searchRanking !== 'embedding'
+      ? undefined
+      : async (query: string, records: readonly MemoryRecord[], limit: number): Promise<MemoryRecord[] | null> => {
+          const vectors = await ensureVectors([query, ...records.map((record) => record.text)])
+          if (vectors === null) return null
+          const queryVector = vectors.get(query)
+          if (queryVector === undefined) return null
+          return records
+            .map((record) => ({ record, score: cosineSimilarity(queryVector, vectors.get(record.text) ?? []) }))
+            .filter((entry) => entry.score > 0)
+            .sort((left, right) => right.score - left.score || right.record.importance - left.record.importance)
             .slice(0, limit)
             .map((entry) => entry.record)
         }
@@ -948,6 +1006,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       log('info', `ready: ${loaded} memories from ${store.root}${recovered ? ' (corrupt document was set aside)' : ''}`, {
         judge: jevState.ready ? 'jev' : judge.kind,
         conflictRanking: config.conflictRanking,
+        searchRanking: config.searchRanking,
         types: config.types,
       })
       const normalizeRoute = await normalizer.route()
@@ -967,6 +1026,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         version,
         judge: judge.kind,
         conflictRanking: config.conflictRanking,
+        searchRanking: config.searchRanking,
         embedding: embeddingState,
         normalize: normalizeState,
         // `source` is the field whose absence cost a debugging round: `ready:false`
@@ -1723,7 +1783,24 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     isConcurrencySafe: () => true,
     execute: async (args: SearchArgs, exec?: ToolExecContext): Promise<MemorySearchResult> => {
       const { query, type, limit } = args ?? {}
-      const hits = searchMemories(store.all(), String(query ?? ''), { cwd: cwdOf(exec), limit: limit ?? 20 })
+      const asked = String(query ?? '')
+      // Lexical first, then replaced when the embedding path answered: the fallback is the
+      // already-computed result rather than a second code path, so a provider outage degrades
+      // to BM25 instead of to an error.
+      let hits = searchMemories(store.all(), asked, { cwd: cwdOf(exec), limit: limit ?? 20 })
+      if (embeddingSearchRanker) {
+        const scoped = store
+          .all()
+          .filter((record) => inScope(record, cwdOf(exec)) && record.status !== 'superseded')
+        const ranked = await embeddingSearchRanker(asked, scoped, limit ?? 20)
+        if (ranked) {
+          hits = ranked.map((record) => ({
+            record,
+            score: 0,
+          }))
+        }
+      }
+      const matches = hits
         .filter((hit) => (type ? hit.record.type === type : true))
         .map((hit) => ({
           id: hit.record.id,
@@ -1733,7 +1810,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           createdAt: hit.record.createdAt,
           status: hit.record.status,
         }))
-      return { query: String(query ?? ''), matches: hits, total: store.stats().total }
+      return { query: asked, matches, total: store.stats().total }
     },
   })
 

@@ -121,7 +121,26 @@ export function tokenize(text: string): Set<string> {
  * answer it: "端口用 8000" and "端口改成 9000" are near-identical and incompatible,
  * while "端口 8000" and "服务端口固定 8000，不要改" are near-identical and agree.
  */
-export type ConflictScorer = (incoming: string, record: MemoryRecord) => number
+/**
+ * Scores one document against an incoming text; 0 means no relation.
+ *
+ * The parameter is `Bm25Document`, not `MemoryRecord`, so the same scorer serves conflict
+ * ranking (which has full records) and search (which is also handed records loaded from
+ * evaluation fixtures that carry only an id and a text).
+ */
+export type ConflictScorer = (incoming: string, record: Bm25Document) => number
+
+/**
+ * The minimum a record must expose to be scored.
+ *
+ * Narrower than `MemoryRecord` on purpose: BM25 reads the id and the text and nothing else,
+ * and the search path passes records loaded from a CSV that have no provenance fields. Asking
+ * for the full record there would mean inventing fields to satisfy a type.
+ */
+export interface Bm25Document {
+  id: string
+  text: string
+}
 
 /** BM25's free parameters. Defaults are the standard ones. */
 export interface Bm25Options {
@@ -154,7 +173,7 @@ export interface Bm25Options {
  * @param options - BM25 parameters.
  * @returns a scorer, 0 for no relation at all.
  */
-export function createBm25Scorer(records: readonly MemoryRecord[], options: Bm25Options = {}): ConflictScorer {
+export function createBm25Scorer(records: readonly Bm25Document[], options: Bm25Options = {}): ConflictScorer {
   const k1 = options.k1 ?? 1.2
   const b = options.b ?? 0.75
   const documents = records.map((record) => {

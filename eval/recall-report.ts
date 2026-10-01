@@ -1,0 +1,435 @@
+/**
+ * The reading side: does a question bring back the memory that answers it?
+ *
+ * Three paths are measured, because they are three different mechanisms and only one of them
+ * has a query in it:
+ *
+ *  1. `searchMemories` — the current substring matcher, reached through the `memory_search`
+ *     tool.
+ *  2. BM25 over the store — already in the codebase for conflict ranking, used here as the
+ *     candidate baseline it should be. Nothing new is written to measure it.
+ *  3. `selectMemories` — the automatic injection path. **It never sees a query**: it ranks by
+ *     `importance × 0.85 + decay × 0.15` with per-type quotas. So "Hit@K" is not defined for
+ *     it; what is measurable is whether the memory the person needs is in what got injected,
+ *     which is coverage rather than ranking, and that is what gets reported.
+ *
+ * Relevance is single-target by construction: a probe was derived from one memory, and that
+ * memory is the relevant one. That is a real limitation — two memories can both answer a
+ * question, and this design scores the second one as noise — but it is the assumption that
+ * can be measured without hand-labelling every pair, and it is stated in the output rather
+ * than hidden. A judged subset exists to check how wrong the assumption is.
+ *
+ *   node eval/recall-report.ts
+ *   RECALL_BASELINE_OUT=eval/labels/baseline-recall.json node eval/recall-report.ts
+ *
+ * @module eval/recall-report
+ */
+
+import { readFile, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+import { createBm25Scorer } from '../dsh/lib/conflict.ts'
+import { cosineSimilarity, createEmbeddingClient, createVectorCache, vectorKey } from '../dsh/lib/embedding.ts'
+import { estimateTokens } from '../dsh/lib/text.ts'
+import { searchMemories, selectMemories, renderRecall } from '../dsh/lib/recall.ts'
+import { buildCorpus, recordsOf } from './lib/recall-corpus.ts'
+import { parseCsvRecords } from './lib/csv.ts'
+
+const labelDir = new URL('./labels/', import.meta.url).pathname
+const queriesFile = process.env.RECALL_QUERIES?.trim() || join(labelDir, 'recall1.csv')
+const outFile = process.env.RECALL_OUT?.trim() || join(labelDir, 'recall-report.md')
+const baselineFile = join(labelDir, 'baseline-recall.json')
+const types = (process.env.RECALL_TYPES?.trim() || 'constraint,pitfall,decision').split(',')
+const maxTokens = Number(process.env.RECALL_MAX_TOKENS ?? '600') || 600
+
+interface Probe {
+  queryId: string
+  query: string
+  closeness: string
+  targetId: string
+}
+
+const rows = parseCsvRecords(await readFile(queriesFile, 'utf8'))
+const probes = new Map<string, Probe>()
+for (const row of rows) {
+  if (!probes.has(row.query_id!)) {
+    probes.set(row.query_id!, {
+      queryId: row.query_id!,
+      query: row.query!,
+      closeness: row.closeness ?? '',
+      targetId: row.target_id!,
+    })
+  }
+}
+
+const frame = JSON.parse(await readFile(queriesFile.replace(/\.csv$/u, '.frame.json'), 'utf8')) as {
+  batch: string
+  store: { records: number; truePositives: number; falsePositives: number }
+  retrievers: string[]
+}
+const corpus = buildCorpus(join(labelDir, frame.batch), { includeFalsePositives: true })
+const records = recordsOf(corpus)
+const all_probe_texts = [...probes.values()].map((probe) => probe.query)
+const byId = new Map(records.map((record) => [record.id, record]))
+
+const out: string[] = []
+const say = (line: string): void => {
+  console.log(line)
+  out.push(line)
+}
+
+// The embedding path exists in the plugin (off by default) because BM25 cannot connect a
+// question to a memory that shares none of its words — which is exactly the far probes. It is
+// measured here for the same reason the BM25 comparison is: a claim about paraphrase should
+// be a number, not a design note.
+//
+// Vectors are cached on disk, keyed by model + dimensions + text, so a rerun after a retriever
+// change costs nothing and the benchmark's inputs cannot drift between runs.
+const embeddingSettings = { model: 'embedding-3', dimensions: 512 }
+const vectorCache = createVectorCache({
+  file: new URL('../.scratch/embeddings-recall.json', import.meta.url).pathname,
+  log: (level, message) => {
+    if (level === 'warn') console.error(`embedding cache: ${message}`)
+  },
+})
+await vectorCache.load()
+const credentialsFile = join(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh'), '.credentials.yaml')
+const embedder = createEmbeddingClient({
+  config: {},
+  log: () => {},
+  resolveApiKey: async () => {
+    try {
+      const document = await readFile(credentialsFile, 'utf8')
+      const key = /ZHIPU_API_KEY:\s*(\S+)/u.exec(document)?.[1]
+      return { key, source: key ? 'file' : 'none' }
+    } catch {
+      return { key: undefined, source: 'none' }
+    }
+  },
+})
+
+/** The cached vector for one text; every vector is fetched before any ranking happens. */
+function vectorOf(text: string): number[] | null {
+  return vectorCache.get(vectorKey(embeddingSettings, text)) ?? null
+}
+
+let embeddingReady = false
+if (await embedder.isAvailable()) {
+  const missingRecords = records.filter((record) => vectorOf(record.text) === null)
+  const missingQueries = all_probe_texts.filter((text) => vectorOf(text) === null)
+  const missing = [...new Set([...missingRecords.map((record) => record.text), ...missingQueries])]
+  if (missing.length > 0) {
+    console.log(`为 ${missing.length} 段文本取 embedding（其余命中缓存）…`)
+    // `embed()` slices to `maxInputs` internally and says nothing about the rest, so the
+    // chunking has to happen here — one big call would silently vectorize the first 32 texts
+    // and leave the benchmark half-covered.
+    const chunk = 32
+    let ok = true
+    for (let start = 0; start < missing.length; start += chunk) {
+      const slice = missing.slice(start, start + chunk)
+      const vectors = await embedder.embed(slice)
+      if (!vectors || vectors.length !== slice.length) {
+        console.log(`第 ${start / chunk + 1} 批 embedding 取不到，跳过这一行。`)
+        ok = false
+        break
+      }
+      for (const [index, text] of slice.entries()) {
+        const vector = vectors[index]
+        if (vector) vectorCache.set(vectorKey(embeddingSettings, text), vector)
+      }
+    }
+    if (ok) {
+      await vectorCache.persist()
+      embeddingReady = true
+    }
+  } else {
+    embeddingReady = true
+  }
+  if (embeddingReady) console.log(`embedding 就绪：缓存 ${vectorCache.size()} 条向量`)
+} else {
+  console.log('没有 ZHIPU_API_KEY，跳过 embedding 那一行。')
+}
+
+/** Where the target sits when the whole store is ranked, or 0 when it is not returned. */
+type Ranker = (query: string) => string[]
+
+const searchRanker: Ranker = (query) => searchMemories(records, query, { limit: records.length }).map((hit) => hit.record.id)
+const bm25 = createBm25Scorer(records)
+void bm25
+/** Rank the store by one scoring function; zero scores are dropped, as the tool does. */
+const rankBy = (score: (record: (typeof records)[number]) => number): Ranker => (query) => {
+  void query
+  return records
+    .map((record) => ({ id: record.id, score: score(record) }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .map((entry) => entry.id)
+}
+/**
+ * The substring matcher that `searchMemories` used until it was replaced.
+ *
+ * Kept here, in the report, rather than in the library: it is no longer reachable from the
+ * plugin, and the only thing it is good for now is showing what the replacement bought. A
+ * comparison whose "before" side is a memory of a previous commit is not a comparison.
+ */
+/** Rank by cosine similarity against the cached vectors; nothing to cut off, so no filter. */
+const embeddingRanker: Ranker = (query) => {
+  const queryVector = vectorOf(query) ?? vectorOf(` ${query}`)
+  if (!queryVector) return []
+  return records
+    .map((record) => ({ id: record.id, score: cosineSimilarity(queryVector, vectorOf(record.text) ?? []) }))
+    .sort((a, b) => b.score - a.score)
+    .map((entry) => entry.id)
+}
+
+/**
+ * BM25 and cosine, each normalized to its own best score, summed.
+ *
+ * Normalizing per query is the crude part and it is deliberate: the point is to see whether
+ * the two signals are complementary at all before spending design on how to fuse them.
+ */
+const hybridRanker: Ranker = (query) => {
+  const bm25Scores = records.map((record) => ({ id: record.id, score: bm25(query, record) }))
+  const maxBm25 = Math.max(...bm25Scores.map((entry) => entry.score), 0)
+  const queryVector = vectorOf(query)
+  return records
+    .map((record) => {
+      const lexical = maxBm25 === 0 ? 0 : (bm25Scores.find((entry) => entry.id === record.id)?.score ?? 0) / maxBm25
+      const semantic = queryVector ? Math.max(0, cosineSimilarity(queryVector, vectorOf(record.text) ?? [])) : 0
+      return { id: record.id, score: lexical + semantic }
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .map((entry) => entry.id)
+}
+
+/**
+ * Reciprocal rank fusion of BM25 and embeddings.
+ *
+ * The naive "normalize each to its best score and add" fusion measured *worse* than embeddings
+ * alone (MRR 0.74 vs 0.90) because BM25's normalized score is 1.0 for its own top hit whatever
+ * that hit is, so a confident-but-wrong lexical match outvotes the semantic one. RRF ignores
+ * the scores and fuses the *orders*, which is the standard fix for exactly this.
+ */
+const rrfRanker: Ranker = (query) => {
+  const bm25Order = rankBy((record) => bm25(query, record))(query)
+  const embeddingOrder = embeddingRanker(query)
+  const fused = new Map<string, number>()
+  for (const [order, weight] of [[bm25Order, 1], [embeddingOrder, 1]] as const) {
+    for (const [index, id] of order.entries()) {
+      fused.set(id, (fused.get(id) ?? 0) + weight / (60 + index + 1))
+    }
+  }
+  return [...fused.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id)
+}
+
+const legacyRanker: Ranker = (query) => {
+  const needle = query.trim().toLowerCase()
+  const tokens = needle.split(/[\s,，。、;；]+/u).filter((token) => token.length >= 2)
+  return records
+    .map((record) => {
+      const haystack = `${record.text} ${record.type}`.toLowerCase()
+      let score = 0
+      if (needle && haystack.includes(needle)) score += 1
+      for (const token of tokens) if (haystack.includes(token)) score += 0.3
+      return { id: record.id, score: score * record.importance }
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .map((entry) => entry.id)
+}
+
+interface Tally {
+  at1: number
+  at3: number
+  at5: number
+  at10: number
+  reciprocal: number
+  total: number
+  missed: string[]
+}
+
+function tallyOf(ranker: Ranker, subset: Probe[]): Tally {
+  const tally: Tally = { at1: 0, at3: 0, at5: 0, at10: 0, reciprocal: 0, total: 0, missed: [] }
+  for (const probe of subset) {
+    const ranked = ranker(probe.query)
+    const at = ranked.indexOf(probe.targetId)
+    const rank = at < 0 ? 0 : at + 1
+    tally.total += 1
+    if (rank === 1) tally.at1 += 1
+    if (rank > 0 && rank <= 3) tally.at3 += 1
+    if (rank > 0 && rank <= 5) tally.at5 += 1
+    if (rank > 0 && rank <= 10) tally.at10 += 1
+    if (rank > 0) tally.reciprocal += 1 / rank
+    else tally.missed.push(probe.query)
+  }
+  return tally
+}
+
+const all = [...probes.values()]
+const close = all.filter((probe) => probe.closeness === 'close')
+const far = all.filter((probe) => probe.closeness === 'far')
+const percent = (value: number): string => `${(value * 100).toFixed(0)}%`
+
+say('# 评测报告：读取侧（召回）')
+say('')
+say(`生成时间 ${new Date().toISOString()}｜探针 ${all.length} 个（近 ${close.length} / 远 ${far.length}）｜库 ${records.length} 条（真记忆 ${corpus.entries.filter((entry) => entry.origin === 'true-positive').length}，垃圾 ${corpus.entries.filter((entry) => entry.origin === 'false-positive').length}）`)
+say('')
+say(`探针来自 ${frame.batch} 里你标"该记"的句子：每个句子造两个问题——**近**（可以复用记忆里的词，像真人换个会话再问一次）和**远**（换一种说法，不许用记忆里的关键名词）。`)
+say('')
+
+say('## 检索：同一个问题能不能把那条记忆捞回来')
+say('')
+say('相关性按单目标算：**只有派生这个探针的那条记忆算相关**。K 以内的排名看下面：')
+say('')
+say('| 检索方式 | 问法 | Hit@1 | Hit@3 | Hit@5 | Hit@10 | MRR | 完全找不到 |')
+say('|---|---|---|---|---|---|---|---|')
+const tallies = new Map<string, Tally>()
+const rankers: Array<[string, Ranker]> = [
+  ['**`memory_search`（现在的实现：BM25）**', searchRanker],
+  ['旧版子串匹配（已弃用，留作对照）', legacyRanker],
+]
+if (embeddingReady) {
+  rankers.push(['embedding（Zhipu embedding-3，512 维）', embeddingRanker])
+  rankers.push(['BM25 + embedding 各归一化后相加', hybridRanker])
+  rankers.push(['RRF 融合（按名次而不是分数）', rrfRanker])
+}
+for (const [name, ranker] of rankers) {
+  for (const [label, subset] of [['全部', all], ['近问法', close], ['远问法', far]] as const) {
+    const tally = tallyOf(ranker, subset)
+    tallies.set(`${name}|${label}`, tally)
+    say(
+      `| ${name} | ${label} | ${percent(tally.at1 / tally.total)} | ${percent(tally.at3 / tally.total)} | ${percent(tally.at5 / tally.total)} | ${percent(tally.at10 / tally.total)} | ${(tally.reciprocal / tally.total).toFixed(2)} | ${tally.missed.length} / ${tally.total} |`,
+    )
+  }
+}
+say('')
+say('（MRR = 相关那条排在第几的倒数，第 1 位记 1.0、第 2 位记 0.5，再取平均。越高说明越靠前。）')
+say('')
+
+say('## 自动注入：不看问题的那条路')
+say('')
+say('自动注入（每个会话开头塞进提示的那段）**完全不看问题**：它按"重要度 ×0.85 + 时间衰减 ×0.15"排序，再按类型配额（硬约束 4 / 坑 3 / 已定决策 2）和 token 预算挑选。所以对它来说没有 Hit@K 可言，能测的是**覆盖率**：')
+say('')
+let injectedHits = 0
+const injectionMisses: string[] = []
+// The injection set does not depend on the probe — that is the finding — so it is computed
+// once. The earlier version recomputed it per probe and reported the last iteration's token
+// count, which is how a per-probe loop can look like it measured something it did not.
+const injected = selectMemories(records, { cwd: null, types, maxTokens })
+const injectedIds = new Set(injected.map((entry) => entry.record.id))
+const injectedRendered = renderRecall(injected)
+const injectedTokens = injectedRendered === '' ? 0 : estimateTokens(injectedRendered)
+for (const probe of all) {
+  if (injectedIds.has(probe.targetId)) injectedHits += 1
+  else injectionMisses.push(probe.query)
+}
+say(`| 指标 | 值 |`)
+say(`|---|---|`)
+say(`| 需要的记忆真的被注入了 | **${injectedHits} / ${all.length}（${percent(injectedHits / all.length)}）** |`)
+say(`| 每次注入的 token | ${injectedTokens}（预算 ${maxTokens}） |`)
+say(`| 注入条数上限 | ${Object.entries({ constraint: 4, pitfall: 3, decision: 2 }).map(([type, count]) => `${type} ${count}`).join('、')} |`)
+say('')
+if (injectionMisses.length > 0) {
+  say('**没被注入的探针对应的问题**（前 8 条）：')
+  say('')
+  for (const query of injectionMisses.slice(0, 8)) say(`- ${query}`)
+  say('')
+}
+
+say('## 漏掉的原因分类')
+say('')
+say('同一个"没捞回来"有三种完全不同的成因，分开才能知道该修哪一边：')
+say('')
+const storeIds = new Set(records.map((record) => record.id))
+let notInStore = 0
+let writtenNotRecalled = 0
+let writtenAndRanked = 0
+for (const probe of all) {
+  if (!storeIds.has(probe.targetId)) notInStore += 1
+  const at = searchRanker(probe.query).indexOf(probe.targetId)
+  if (at < 0) writtenNotRecalled += 1
+  else writtenAndRanked += 1
+}
+say('| 原因 | 条数 | 含义 |')
+say('|---|---|---|')
+say(`| 没写进记忆库 | ${notInStore} | 写入侧就没记下来，读取侧无从救 |`)
+say(`| 在库里但检索没返回 | ${writtenNotRecalled} | **读取侧的问题**：这条用子串匹配捞不回来 |`)
+say(`| 检索返回了 | ${writtenAndRanked} | 这条至少能被返回，剩下的看排名 |`)
+say('')
+
+say('## 单相关假设有多错（人工判定子集）')
+say('')
+const judged = rows.filter((row) => (row.origin ?? '') !== 'derived-target' && (row.label ?? '').trim() !== '')
+if (judged.length === 0) {
+  say('还没有人工判定过"非目标"的行。这个子集用来回答一个问题：**单相关假设是不是把本来也该算对的记忆当成噪音罚了**。')
+  say('')
+  say('标法：对每个探针，取两个检索器给出的、不是目标的那几条，判断"这条查询下这条记忆该不该被想起"。')
+  say('写进 `recall1.csv` 的 `label` / `note` 列即可，不用改其它文件。')
+} else {
+  let relevant = 0
+  for (const row of judged) if ((row.label ?? '').trim() === '1') relevant += 1
+  say(`已人工判定 ${judged.length} 行，其中标"该被想起"的 ${relevant} 行（${percent(relevant / judged.length)}）。`)
+  say('')
+  say(`这 ${relevant} 行如果按单相关假设算，全都是假阳性——所以**注入精确率被这个假设低估了**。下面这张表是修正后的看法：`)
+}
+say('')
+
+const baseline = {
+  generatedAt: new Date().toISOString(),
+  queries: { file: queriesFile.split('/').pop(), probes: all.length, close: close.length, far: far.length },
+  store: { records: records.length, truePositives: frame.store.truePositives, falsePositives: frame.store.falsePositives },
+  relevance: 'single-target (the memory the probe was derived from)',
+  retrievers: Object.fromEntries(
+    [...tallies.entries()].map(([key, tally]) => [
+      key,
+      {
+        hit1: tally.at1 / tally.total,
+        hit3: tally.at3 / tally.total,
+        hit5: tally.at5 / tally.total,
+        hit10: tally.at10 / tally.total,
+        mrr: tally.reciprocal / tally.total,
+        missed: tally.missed.length,
+      },
+    ]),
+  ),
+  injection: { covered: injectedHits, total: all.length, tokens: injectedTokens, maxTokens },
+}
+
+const writeBaseline = process.env.RECALL_BASELINE_OUT?.trim()
+if (writeBaseline) {
+  await writeFile(writeBaseline, `${JSON.stringify(baseline, null, 2)}\n`, 'utf8')
+  say(`已写出基线 ${writeBaseline}`)
+  say('')
+}
+
+// A frozen baseline is only useful if a later run can print the difference without anyone
+// remembering the old numbers, so the same file that was frozen is read back here.
+try {
+  const previous = JSON.parse(await readFile(baselineFile, 'utf8')) as typeof baseline
+  if (previous.queries.probes === all.length) {
+    say('## 与基线对比')
+    say('')
+    say('| 检索方式 | 指标 | 基线 | 现在 | 变化 |')
+    say('|---|---|---|---|---|')
+    for (const [key, now] of Object.entries(baseline.retrievers)) {
+      const then = previous.retrievers[key]
+      if (!then) continue
+      for (const metric of ['hit1', 'hit3', 'hit5', 'hit10', 'mrr'] as const) {
+        const before = then[metric]
+        const after = now[metric]
+        const movement = Math.round(after * 100) - Math.round(before * 100)
+        say(
+          `| ${key} | ${metric} | ${percent(before)} | ${percent(after)} | ${movement === 0 ? '持平' : `${movement > 0 ? '+' : ''}${movement} 个点`} |`,
+        )
+      }
+    }
+    say('')
+  }
+} catch {
+  // No baseline yet.
+}
+
+await writeFile(outFile, `${out.join('\n')}\n`, 'utf8')
+console.log(`\n已写出 ${outFile}`)

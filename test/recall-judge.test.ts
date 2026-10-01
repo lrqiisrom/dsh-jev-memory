@@ -96,12 +96,41 @@ test('inScope treats a global memory as visible everywhere', () => {
   assert.equal(inScope({ cwd: '/work/a' }, null), false)
 })
 
-test('searchMemories matches substrings and stays inside the workspace', () => {
+test('searchMemories ranks by relevance and stays inside the workspace', () => {
   const records = [memory({ id: 'c1', cwd: '/work/a' }), memory({ id: 'c2', cwd: '/work/b' })]
   records[0].text = '必须用 pnpm 管理依赖'
   records[1].text = '必须用 pnpm 管理依赖'
   const hits = searchMemories(records, 'pnpm', { cwd: '/work/a' })
   assert.deepEqual(hits.map((hit) => hit.record.id), ['c1'])
+})
+
+test('searchMemories finds a memory the question does not quote', () => {
+  // The reason the substring matcher was replaced. Measured on 36 probes derived from
+  // labelled memories: substring matching ranked the answering memory at MRR 0.23 and
+  // returned nothing at all for 27 of them — 17 of the 18 probes that phrased the need in
+  // other words. BM25 scores the tokens instead of requiring the literal phrase.
+  const records = [memory({ id: 'port' }), memory({ id: 'yarn' })]
+  records[0].text = '服务端口固定用 8000，别乱改'
+  records[1].text = '前端依赖不要用 yarn'
+  const hits = searchMemories(records, '端口是多少来着，改端口有什么规矩吗', { cwd: '/work/a' })
+  assert.equal(hits[0]?.record.id, 'port', 'the memory about ports must win without the exact phrase')
+})
+
+test('searchMemories returns nothing when nothing is related', () => {
+  // The `score > 0` cutoff is part of the contract: a search tool that always returns its
+  // whole store is worse than one that admits it found nothing. Making importance an additive
+  // term instead of a tie-break would have destroyed this, since it makes every score positive.
+  const records = [memory({ id: 'a', importance: 1 })]
+  records[0].text = '必须用 pnpm 管理依赖'
+  assert.deepEqual(searchMemories(records, '面试安排在周四', { cwd: '/work/a' }), [])
+})
+
+test('searchMemories no longer matches on the type name', () => {
+  // `type` used to be concatenated into the haystack and worth 0.3 per token, so a query
+  // containing "constraint" surfaced every constraint whatever it said.
+  const records = [memory({ id: 'a', type: 'constraint' })]
+  records[0].text = '必须用 pnpm 管理依赖'
+  assert.deepEqual(searchMemories(records, 'constraint', { cwd: '/work/a' }), [])
 })
 
 test('heuristic judge labels type and importance from signals', () => {

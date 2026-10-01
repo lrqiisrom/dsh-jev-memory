@@ -1,0 +1,19 @@
+{
+  "batch": "round5.csv",
+  "generatedAt": "2026-10-01T21:32:27.003Z",
+  "queries": 36,
+  "probesPerMemory": 2,
+  "failures": 0,
+  "store": {
+    "records": 94,
+    "truePositives": 18,
+    "falsePositives": 76,
+    "screenedOut": 46
+  },
+  "retrievers": [
+    "searchMemories (substring + token, × importance)",
+    "BM25 (k1=1.2, b=0.75, Intl.Segmenter tokens)"
+  ],
+  "candidateCap": 8,
+  "note": "rank/score 是抽取当时的检索结果，冻结在文件里；改了检索算法重跑即可对比，标注不用重打。"
+}

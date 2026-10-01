@@ -923,6 +923,98 @@ test('an embedding provider that is down falls back to lexical and still writes'
   }
 })
 
+/**
+ * A provider whose vectors encode meaning the text does not spell out.
+ *
+ * The generic fake used elsewhere returns `[index + 1, 1]`, which makes similarity depend on
+ * the order texts happen to be sent in — useless for asserting that a semantic hit beat a
+ * lexical miss. This one maps two topics onto two axes, so "装东西用哪个命令" is close to the
+ * pnpm memory while sharing no token with it.
+ */
+function semanticFetch(calls: Array<{ input: string[] }>): typeof fetch {
+  return (async (_url: string, init: { body: string }) => {
+    const body = JSON.parse(init.body) as { input: string[] }
+    calls.push({ input: body.input })
+    return {
+      ok: true,
+      json: async () => ({
+        data: body.input.map((text, index) => ({
+          index,
+          embedding: [
+            /端口|port|监听|占用/u.test(text) ? 1 : 0,
+            /装东西|pnpm|依赖|包管理|安装/u.test(text) ? 1 : 0,
+          ],
+        })),
+      }),
+    }
+  }) as unknown as typeof fetch
+}
+
+test('searchRanking embedding finds a memory the question shares no word with', async () => {
+  const original = globalThis.fetch
+  const calls: Array<{ input: string[] }> = []
+  globalThis.fetch = semanticFetch(calls)
+  try {
+    const { root, captured } = await mount({
+      searchRanking: 'embedding',
+      embedding: { maxInputs: 16 },
+      // The write path is left on the heuristic so the fake provider is only ever asked
+      // about search: one thing under test at a time.
+      judge: 'heuristic',
+    })
+    const session = await seedMemory(captured)
+    const write = toolFor(captured, 'memory_write')
+    await write.execute({ text: '服务端口固定用 8000，别乱改', type: 'constraint' })
+    await write.execute({ text: '依赖统一用 pnpm 装，不要用 npm', type: 'constraint' })
+
+    const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+    const semantic = await search.execute({ query: '装东西用哪个命令' }, { agent: { session } })
+    // `seedMemory` already wrote "必须用 pnpm 管理依赖。", so two of the three memories are
+    // about pnpm. What matters is the two halves of the claim: the pnpm memories rank, and the
+    // port memory — which the question shares no word with and is not about — is excluded
+    // rather than dragged in as filler.
+    assert.ok(semantic.matches.length > 0, 'the embedding path found an answer')
+    assert.match(semantic.matches[0]!.text, /pnpm/u, 'the embedding path chose the answer')
+    assert.equal(
+      semantic.matches.some((match) => /端口/u.test(match.text)),
+      false,
+      'a memory the question is not about is not returned',
+    )
+
+    // The same question under the shipped default finds nothing, which is what makes the
+    // setting worth having rather than a no-op.
+    const start = await startEntry(root)
+    assert.equal(start?.searchRanking, 'embedding')
+    assert.ok(calls.length > 0, 'the provider was asked')
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('a search whose provider is down still answers from BM25', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = (async () => {
+    throw new Error('network down')
+  }) as unknown as typeof fetch
+  try {
+    const { root, captured } = await mount({ searchRanking: 'embedding', judge: 'heuristic' })
+    const session = await seedMemory(captured)
+    const write = toolFor(captured, 'memory_write')
+    await write.execute({ text: '依赖统一用 pnpm 装，不要用 npm', type: 'constraint' })
+
+    const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+    const hits = await search.execute({ query: 'pnpm' }, { agent: { session } })
+    assert.ok(
+      hits.matches.some((match) => /pnpm/u.test(match.text)),
+      'a provider outage degrades to lexical, not to an error',
+    )
+    const start = await startEntry(root)
+    assert.equal(start?.searchRanking, 'embedding')
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
 // Superseding is not forgetting. `memory_forget` is the person saying "remove this", and
 // keeping a copy of something they asked to delete would be a different kind of lie.
 test('forgetting a superseded memory really removes it', async () => {
