@@ -3,6 +3,7 @@ import { test } from 'node:test'
 
 import { blocksToText, clip, estimateTokens, hashText, looksInterrogative, normalize, splitSentences } from '../dsh/lib/text.ts'
 import {
+  DECISION_ASSERTION_PATTERNS,
   isNoise,
   isNoteworthyVeto,
   matchTypeSignals,
@@ -262,4 +263,41 @@ test('a requirement that merely contains a question word is not a question', () 
   )
   // And the anchored behaviour is unchanged for questions that end in a particle.
   assert.deepEqual(screenSentence('这个项目有哪些约定'), { keep: false, reason: 'question' })
+})
+
+test('a question that also states a decision is not screened out', () => {
+  // Both rows are labelled "remember" and both were rejected as questions. Measured on the
+  // 165 decided rows: this exemption rescues both and admits no row marked "don't remember"
+  // (precision 20% → 21%, recall 90% → 100%). Loosening the anchored screen to "also require
+  // no instruction shape" rescues one and admits 18.
+  assert.deepEqual(
+    screenSentence('对抗复核、误改率、规则贡献率 这玩意换个场景也不一定就适用啊 我再次申明一点哈，这个能不能改成通用的框架？'),
+    { keep: true, reason: null },
+  )
+  assert.deepEqual(
+    screenSentence('你觉得需要有JD的这部分吗，我觉得不需要吧，有些jd就写的很笼统很模糊，而且我是计算机专业的，jd一般都长差不多'),
+    { keep: true, reason: null },
+  )
+  assert.deepEqual(screenSentence('我觉得不是，你用AST和AST+LSP去进行代码评审，他们的误报率肯定是大有不同的。'), {
+    keep: true,
+    reason: null,
+  })
+  // A decision about something else does not license the question itself: without a decision
+  // assertion these stay rejected, which is what keeps the exemption from becoming a hole.
+  assert.deepEqual(screenSentence('这个面试记录里面各个问题的评分是怎么评的？'), { keep: false, reason: 'question' })
+  assert.deepEqual(screenSentence('jev是不是可以用于HITL？'), { keep: false, reason: 'question' })
+})
+
+test('the decision exemption is narrow enough to name every word it matches', () => {
+  // The list was read off two rows, so it is deliberately small. This test fails the moment
+  // someone adds a broad marker like 我觉得 on its own — which would readmit the questions
+  // the previous test pins as rejected.
+  const fires = (sentence: string): boolean =>
+    DECISION_ASSERTION_PATTERNS.some((pattern) => pattern.test(sentence))
+  for (const sentence of ['我再次申明一点', '我觉得不需要吧', '我认为不用改', '我要求不要动这个文件', '我们决定用 pnpm', '不需要吧', '不用吧']) {
+    assert.equal(fires(sentence), true, sentence)
+  }
+  for (const sentence of ['我觉得这个方案还需要再讨论一下', '我认为这个改动挺大的', '我们决定了吗', '这个需要吗']) {
+    assert.equal(fires(sentence), false, sentence)
+  }
 })

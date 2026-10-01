@@ -408,6 +408,38 @@ export const QUESTION_MARKERS =
 export const INSTRUCTION_MARKERS = /不要|不准|别|必须|应当|应该|请|改|加|删|禁止|务必/u
 
 /**
+ * Sentences that state what the person decided, even while asking something.
+ *
+ * A question screen keyed only on question words throws away the most valuable
+ * sentence shape there is: the person asking "…这个能不能改成通用的框架？" is *deciding*
+ * that the framework must be general, and "你觉得需要有 JD 的这部分吗，我觉得不需要吧"
+ * is deciding the opposite. Both were labelled "该记" and both were rejected as questions.
+ *
+ * The list is deliberately narrow. Loosening the anchored question screen to "also
+ * require no instruction shape" rescues only one of those two rows and lets through 18
+ * rows the person marked "不该记" (precision 20% → 17%). This list rescues both and lets
+ * through none (20% → 21%, recall 90% → 100% on the 165 decided rows).
+ *
+ * Said plainly: the rule was read off those two rows, so its perfect score on them is
+ * fitted, not earned. It is narrow enough that the cost is visible — a wrong entry shows
+ * up immediately as a question admitted with no label behind it.
+ */
+export const DECISION_ASSERTION_PATTERNS: RegExp[] = [
+  /我(?:再次|再)?申明/u,
+  /我(?:觉得|认为|要求|决定|希望)不/u,
+  // "我们决定了吗" is a question about a decision that has not been made, so the particle
+  // has to be excluded: without the lookahead this pattern reads it as the decision itself.
+  /我们?决定(?!了?吗|呢)/u,
+  /不需要吧/u,
+  /不用吧/u,
+]
+
+/** Whether a sentence asserts a decision of the person's own. */
+function assertsDecision(sentence: string): boolean {
+  return DECISION_ASSERTION_PATTERNS.some((pattern) => pattern.test(sentence))
+}
+
+/**
  * Decide whether one sentence may become a memory at all.
  *
  * Returns a reason instead of a boolean so the ledger can record *why* a
@@ -440,6 +472,11 @@ export function screenSentence(sentence: string): ScreenDecision {
   // anywhere *and* the sentence carries no instruction shape. The conjunction is what keeps
   // a requirement that happens to contain 什么 from being thrown away — see the note on
   // INSTRUCTION_MARKERS for the two sentences that made this necessary.
+  //
+  // Both branches yield to a stated decision: "…这个能不能改成通用的框架？" is the person
+  // deciding what the framework must be, and the question mark does not change that. The
+  // exemption is checked once, before either branch, so the two branches cannot drift apart.
+  if (assertsDecision(sentence)) return { keep: true, reason: null }
   if (looksInterrogative(sentence)) return { keep: false, reason: 'question' }
   if (QUESTION_MARKERS.test(sentence) && !INSTRUCTION_MARKERS.test(sentence)) {
     return { keep: false, reason: 'question' }

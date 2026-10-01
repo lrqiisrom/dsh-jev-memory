@@ -580,7 +580,14 @@ if (jevRuns.length > 0) {
     )
   }
   say('')
-  say('（阈值是配置，不是模型能力：同一批评分在低阈值下召回更高、精确率更低。扫描只有 30 行已定标注，**不要照单挑一个最好看的点**；等标注到 100 行以上再定。）')
+  // The count is computed rather than written down: the previous fixed sentence said
+  // "30 行已定标注" long after the labelled set had grown past 100, and a stale number
+  // like that is exactly what a reader would use to dismiss the whole sweep.
+  say(
+    decided.length < 100
+      ? `（阈值是配置，不是模型能力：同一批评分在低阈值下召回更高、精确率更低。扫描只有 ${decided.length} 行已定标注，**不要照单挑一个最好看的点**；等标注到 100 行以上再定。）`
+      : `（阈值是配置，不是模型能力：同一批评分在低阈值下召回更高、精确率更低。这一次扫描有 ${decided.length} 行已定标注，其中**该记只有 ${positives} 句**——低阈值那几个点的召回率是由很小的分母撑起来的，所以看的是整条曲线的形状，不是单点。）`,
+  )
   say('')
 }
 

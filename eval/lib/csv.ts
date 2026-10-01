@@ -21,6 +21,14 @@ export function parseCsv(text: string): string[][] {
   let cells: string[] = []
   let cell = ''
   let quoted = false
+  // A `"` only opens a quoted cell at the very start of that cell. In the middle of
+  // an unquoted cell it is a literal character, which is what the file produced by
+  // the labeller's spreadsheet and by Python's csv module actually contains: one
+  // row's id embeds transcript JSON, so `…max_output_tokens":<n>}` carries a bare
+  // quote. Treating that as an opening quote swallowed everything after it up to the
+  // next quote, commas and newlines included, and the file read as 97 rows instead
+  // of 147 with one 131-cell record.
+  let atCellStart = true
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index]
     if (quoted) {
@@ -34,18 +42,24 @@ export function parseCsv(text: string): string[][] {
       }
       continue
     }
-    if (char === '"') {
+    if (char === '"' && atCellStart) {
       quoted = true
+      atCellStart = false
     } else if (char === ',') {
       cells.push(cell)
       cell = ''
+      atCellStart = true
     } else if (char === '\n') {
       cells.push(cell)
       records.push(cells)
       cells = []
       cell = ''
+      atCellStart = true
+    } else if (char === '\r' && text[index + 1] === '\n') {
+      // CRLF files: the CR belongs to the line ending, not to the cell.
     } else {
       cell += char
+      atCellStart = false
     }
   }
   if (cell !== '' || cells.length > 0) {
