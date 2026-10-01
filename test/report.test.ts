@@ -68,7 +68,9 @@ test('re-screens rows with the rules in the working tree, not the ones that drew
     assert.equal(result.status, 0, result.stderr)
     const report_ = await readFile(join(dir, 'report.md'), 'utf8')
     // One positive, one negative, and only the positive survives today's screens.
-    assert.match(report_, /\| 只过筛子（当前规则） \| \*\*100%\*\* \| 100% \|/u)
+    // The row is asserted whole because the column layout carries the meaning: written /
+    // right / wrong / missed / 写对率 / 该记覆盖率.
+    assert.match(report_, /\| 只过筛子（当前规则） \| 1 \/ 2 \| 1 \| 0 \| 0 \| \*\*100%\*\* \| 100% \|/u)
     assert.match(report_, /两次筛子判定不同的行：1/u)
   } finally {
     await rm(dir, { recursive: true, force: true })

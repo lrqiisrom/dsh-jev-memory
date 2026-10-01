@@ -386,25 +386,67 @@ say('')
 say('## 四臂对照：写入侧')
 
 say('')
-say('这张表量的全是**写入侧**：给你抽出来的每一句候选，判定是"把它写成一条记忆"还是"丢掉它"。')
-say('这里没有检索，也没有"召回几条记忆"这回事——那是读取侧，见本节末尾。')
+say('这张表量的是**写入侧**：给你抽出来的每一句候选，判定是"把它写成一条记忆"还是"丢掉它"。')
+say('**这里没有检索**——"召回几条第几条记忆"是读取侧的事，见本节末尾。')
 say('')
-say('> ⚠️ **"召回率"在这里是个坏名字，之前的版本直接用了它，读起来像是检索指标。**')
-say('> 本报告一律改用两个不会混的名字：**写对率**（= 精确率：它写下来的句子里，有多少是你标"该记"的）')
-say('> 和**该记覆盖率**（= 召回率：你标"该记"的句子里，有多少被它写下来了）。')
-say('> 四个格子的含义：**TP** = 你标该记、它写了；**FP** = 你标不该记、它还是写了；')
-say('> **FN** = 你标该记、它没写；**TN** = 你标不该记、它也没写。')
+say(
+  `怎么读：${decided.length} 句已定的候选里，你标了 **${positives} 句"该记"**、**${decided.length - positives} 句"不该记"**。` +
+    `下面每一行是"一种判定方式"，看它拿这 ${decided.length} 句各做了什么。`,
+)
 say('')
-say('> **读取侧一件都没测。** Hit@K / Recall@K（"问某件事的时候，前 K 条里有没有那条记忆"）需要你把')
-say('> "查询 → 应该想起哪几条"也标出来，目前**没有数据、没有测量**，本报告的任何数字都不能当它用。')
-say('')
-say('| 判定 | 写对率 | 该记覆盖率 | F1 | TP | FP | FN | TN |')
-say('|---|---|---|---|---|---|---|---|')
+say('| 判定 | 它记下了几条 | 记对的 | 记错的 | 该记却漏掉的 | 写对率 | 该记覆盖率 |')
+say('|---|---|---|---|---|---|---|')
 for (const arm of arms) {
   const score = scoreArm(arm, decided, indexOf)
   const m = metrics(score)
-  say(`| ${arm.name} | **${percent(m.precision)}** | ${percent(m.recall)} | ${m.f1.toFixed(2)} | ${score.tp} | ${score.fp} | ${score.fn} | ${score.tn} |`)
+  say(
+    `| ${arm.name} | ${score.tp + score.fp} / ${decided.length} | ${score.tp} | ${score.fp} | ${score.fn} | **${percent(m.precision)}** | ${percent(m.recall)} |`,
+  )
 }
+say('')
+say('四列白话解释：')
+say('')
+say('- **记对的**（TP）：你标"该记"，它写了。')
+say('- **记错的**（FP）：你标"不该记"，它还是写了。**这一类最贵**——它会进入此后每一个会话的提示。')
+say('- **该记却漏掉的**（FN）：你标"该记"，它没写。')
+say('- **写对率** = 记对的 ÷ 它记下的条数。**低了说明它在乱记**：写下来的东西里大部分不该记。')
+say(`- **该记覆盖率** = 记对的 ÷ ${positives}（你标"该记"的总数）。**低了说明它记不住东西**：该记的大部分被漏掉。`)
+say('')
+say('这两个率必须一起看，原因在下一节。')
+say('')
+
+// A single "accuracy" is the most natural thing to ask for and the worst thing to report
+// here, because the classes are lopsided: 13% of the decided rows are things worth
+// remembering. Doing nothing scores 87%. This table exists to make that trap visible
+// before anyone quotes a number out of the section above.
+say('### 为什么不能只报一个"准确率"')
+say('')
+say(
+  `"准确率" = 判对的条数 ÷ 总条数，听起来最直观。但你这批数据里**该记的只有 ${positives}/${decided.length} = ${percent(positives / decided.length)}**，` +
+    '所以什么都不做的做法天然高分。把几种极端做法和真判定放在一张表里就看得出来了：',
+)
+say('')
+say('| 做法 | 它记下了几条 | 记对 | 记错 | 漏掉 | 准确率 |')
+say('|---|---|---|---|---|---|')
+say(
+  `| 一条都不记（什么都不做） | 0 | 0 | 0 | ${positives} | **${percent((decided.length - positives) / decided.length)}** |`,
+)
+say(
+  `| 全部都记（来者不拒） | ${decided.length} | ${positives} | ${decided.length - positives} | 0 | **${percent(positives / decided.length)}** |`,
+)
+for (const arm of arms) {
+  const score = scoreArm(arm, decided, indexOf)
+  say(
+    `| ${arm.name} | ${score.tp + score.fp} | ${score.tp} | ${score.fp} | ${score.fn} | **${percent((score.tp + score.tn) / decided.length)}** |`,
+  )
+}
+say('')
+say(
+  '看最上面两行：**什么都不做有 ' +
+    `${percent((decided.length - positives) / decided.length)}，来者不拒只有 ${percent(positives / decided.length)}**。` +
+    '所以只报一个"准确率"，会让"干脆别记"赢过所有真在干活的判定。这就是上面那张表要分开给"写对率"和"该记覆盖率"的原因——',
+)
+say('**一个回答"它记的东西干不干净"，一个回答"该记的东西它记住没有"。**')
 say('')
 for (const arm of arms) say(`- **${arm.name}**：${arm.note}`)
 say('')
@@ -421,7 +463,8 @@ if (changed.length > 0) {
   say('')
 }
 say('')
-say('> 这里的"召回率"是**写入侧召回**：在你标为该记的句子里，插件写了几条。它和 **Hit@K / Recall@K 无关**，后者需要标注过的查询，目前**没有数据、没有测量**。')
+say('> **读取侧一件都没测。** Hit@K / Recall@K（"问某件事的时候，前 K 条里有没有那条记忆"）需要你把')
+say('> "查询 → 应该想起哪几条"也标出来，目前**没有数据、没有测量**，本报告的任何数字都不能当它用。')
 say('')
 
 say('## 按任务类拆开')
@@ -520,11 +563,17 @@ if (firstRun) {
   const posScores = scored.filter((entry) => entry.row.label === '1').map((entry) => entry.judgement.remember!)
   const negScores = scored.filter((entry) => entry.row.label === '0').map((entry) => entry.judgement.remember!)
 
-  const spread = (values: number[]): string => {
-    if (values.length === 0) return '—'
-    const sorted = [...values].sort((left, right) => left - right)
-    return `${sorted[0]!.toFixed(2)} / ${sorted[Math.floor(sorted.length / 2)]!.toFixed(2)} / ${sorted.at(-1)!.toFixed(2)}`
-  }
+  // Scores are shown as buckets rather than as 最低/中位/最高: a reader asked what those
+  // three words meant, which is the sign that they were the wrong presentation. Counting
+  // how many rows land in each band answers "can the score tell the two apart" directly,
+  // and it shows *where* the two classes overlap instead of hiding it in one number.
+  const bandNames = ['0 ~ 0.2', '0.2 ~ 0.4', '0.4 ~ 0.6', '0.6 ~ 0.8', '0.8 ~ 1.0']
+  const bandNote = ['基本判"不记"', '偏低', '模糊地带', '线上（≥0.6）会记', '线上（≥0.6）会记']
+  const bandOf = (value: number): number => Math.min(bandNames.length - 1, Math.max(0, Math.floor(value / 0.2)))
+  const bandCounts = bandNames.map((_, band) => ({
+    one: scored.filter((entry) => entry.row.label === '1' && bandOf(entry.judgement.remember!) === band).length,
+    zero: scored.filter((entry) => entry.row.label === '0' && bandOf(entry.judgement.remember!) === band).length,
+  }))
   let wins = 0
   for (const positive of posScores) {
     for (const negative of negScores) wins += positive > negative ? 1 : positive === negative ? 0.5 : 0
@@ -556,34 +605,55 @@ if (firstRun) {
 
   say('## Jev 判得准不准（把阈值和筛子剥开看）')
   say('')
-  say('前面那张表的 Jev 一行是**一个阈值下的写入结果**，它会同时受两件事影响：模型的分数有没有区分力，')
-  say('以及阈值定在哪。看下面两组数字，才能知道问题出在哪一边。')
+  say('前面那张表的 Jev 一行是**一个阈值（0.6）之下的写入结果**。它把两件事混在一起了：')
+  say('① 模型给的分数本身有没有用；② 0.6 这个线画得对不对。分开看才知道该改哪一个。')
   say('')
-  say(`**① 分数分布**（Jev 给的 \`remember\`，格式 最低 / 中位 / 最高；它只经手了 ${scored.length} 行）`)
+  say(`### ① 它给分给在哪（它一共经手 ${scored.length} 行）`)
   say('')
-  say('| 你的标注 | 行数 | remember 最低 / 中位 / 最高 |')
-  say('|---|---|---|')
-  say(`| 该记（1） | ${posScores.length} | ${spread(posScores)} |`)
-  say(`| 不该记（0） | ${negScores.length} | ${spread(negScores)} |`)
+  say('Jev 对每句话给一个 0~1 的 `remember` 分，≥ 0.6 就写。把这个分数分成五档，看你的标注落在哪：')
+  say('')
+  say('| Jev 给的分 | 含义 | 你标"该记"的 | 你标"不该记"的 |')
+  say('|---|---|---|---|')
+  for (const [band, name] of bandNames.entries()) {
+    say(`| ${name} | ${bandNote[band] ?? ''} | ${bandCounts[band]!.one} | ${bandCounts[band]!.zero} |`)
+  }
+  say(
+    `| **合计** | | **${posScores.length}** | **${negScores.length}** |`,
+  )
+  say('')
+  say(
+    '一眼就能看出的问题：**你标"该记"的句子里，大多数（' +
+      `${bandCounts[0]!.one + bandCounts[1]!.one + bandCounts[2]!.one} 条）落在 0.6 以下**，所以在线上它们根本不会被写；` +
+      '而 0.6 以上那一档里，不该记的反而比该记的多。',
+  )
+  say('')
+  say('### ② 它排序排得准不准（AUC）')
+  say('')
+  say('**AUC 是什么**：不看 0.6 这条线，只问"给它两条句子，一条是你标该记的、一条是你标不该记的，它能给该记的那条打更高的分吗"。')
+  say('把所有这样的配对都试一遍，它押对的百分比就是 AUC。')
+  say('')
+  say('- **50%** = 和抛硬币一样，这个分数完全没用；')
+  say('- **100%** = 它给的分数永远把该记排在前面，完美；')
+  say('- **70%** = 明显有用，但十次里还会错三次。')
   say('')
   say(
     auc === null
-      ? '**② 区分能力（AUC）**：样本不足，算不出来。'
-      : `**② 区分能力（AUC = ${auc.toFixed(2)}）**：在全部"一条该记 × 一条不该记"的组合里，Jev 把该记那条给得更高的比例是 **${percent(auc)}**（0.50 = 纯瞎猜，1.00 = 完美排序）。**这个数里没有阈值**，所以它才是"模型的分数到底有没有用"的答案。` +
+      ? '**这次样本不足，算不出来。**'
+      : `**这次的 AUC = ${auc.toFixed(2)}，也就是 ${percent(auc)}。**` +
           (aucPerRun.length > 1
-            ? ` 每个重复各算一遍：${aucPerRun.map((value) => (value === null ? '—' : value.toFixed(2))).join('、')}。`
+            ? ` 重复跑的每一遍分别是 ${aucPerRun.map((value) => (value === null ? '—' : value.toFixed(2))).join('、')}——**这个数几乎不随重复漂**，而"写了几条"每次都在跳，所以判断"改问法有没有用"要看它。`
             : ''),
   )
   say('')
   say(
-    `**③ 有没有看懂内容**：Jev 把这些句子判成 ${GATE.types.join(' / ')} 的比例——你标"该记"的 ${posScores.length} 行里判对 **${typeHits(scored.filter((entry) => entry.row.label === '1'))}** 行；` +
-      `你标"不该记"的 ${negScores.length} 行里也判成这三类的有 **${typeHits(scored.filter((entry) => entry.row.label === '0'))}** 行（这些就是"类型看着对、其实不该记"的干扰项）。`,
+    `**③ 它有没有看懂内容**：和分数无关，只看它把句子判成了什么类型。Jev 把句子判成 ${GATE.types.join(' / ')} 时说明它认出了"这是一条要求/一个坑/一个决定"。` +
+      `结果：你标"该记"的 ${posScores.length} 行里认出了 **${typeHits(scored.filter((entry) => entry.row.label === '1'))}** 行；` +
+      `但你标"不该记"的 ${negScores.length} 行里，**也有 ${typeHits(scored.filter((entry) => entry.row.label === '0'))} 行**被认成这三类——所以"认出类型"本身不等于"该记"。`,
   )
   say('')
   say(
-    `**④ 只在筛子放行的句子里看**（这 ${passed.length} 行才是 Jev 真正经手的集合）：` +
-      `该记 ${passedPos.length} 行、不该记 ${passed.length - passedPos.length} 行。` +
-      `也就是说筛子已经先替它丢掉了 ${scored.length - passed.length} 行，**那部分 Jev 根本没机会判**——它的覆盖率上限就是筛子的放行率。`,
+    `**④ 筛子有没有挡它的路**：筛子先替它丢掉 ${scored.length - passed.length} 行，剩下 ${passed.length} 行才是 Jev 真正看得到的。` +
+      `这 ${passed.length} 行里有 ${passedPos.length} 条是你标该记的——**所以它一条都没被筛子误伤**，覆盖率低是它自己判的，不是筛子挡的。`,
   )
   say('')
   if (auc !== null && auc < 0.8) {
