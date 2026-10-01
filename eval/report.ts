@@ -55,7 +55,9 @@ import { taskClassOf, type TaskClass } from './lib/task-class.ts'
 const GATE: GateConfig = {
   types: ['constraint', 'pitfall', 'decision'],
   minImportance: 0.6,
-  minRemember: 0.6,
+  // Follows the shipped default. It moved with the remember question on 2026-10-01: a
+  // stricter question shifts every score down, so the two are one change, not two.
+  minRemember: 0.12,
   reviewOnConflict: true,
 }
 
@@ -731,7 +733,7 @@ if (jevRuns.length > 0) {
   say('')
   say('| minRemember / minImportance | Jev 写对率 | Jev 该记覆盖率 | Jev 写入数 | 规则判定 写对率 | 规则判定 该记覆盖率 |')
   say('|---|---|---|---|---|---|')
-  for (const threshold of [0.2, 0.3, 0.4, 0.5, 0.55, 0.6, 0.7]) {
+  for (const threshold of [0.1, 0.12, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]) {
     const jevScore: Score = { tp: 0, fp: 0, fn: 0, tn: 0 }
     const heurScore: Score = { tp: 0, fp: 0, fn: 0, tn: 0 }
     let writes = 0

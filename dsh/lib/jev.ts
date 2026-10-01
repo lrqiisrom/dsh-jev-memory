@@ -71,9 +71,21 @@ export interface JevSettings {
  * The distinction the wording has to carry is *how long the content stays true*, not
  * whether the sentence is phrased as an instruction — the person's own labelling
  * standard draws the line at "一次性任务指令", which is about scope, not grammar.
+ *
+ * Rewritten 2026-10-01 from the labelled set, because the old wording left the judge able
+ * to *name* the type of a requirement while still scoring it below the gate. The change is
+ * not cosmetic: on 140 labelled rows, five-fold cross-validated, ranking quality went from
+ * AUC 0.67 to 0.75 and the achievable F1 from 0.21 to 0.32, with verdict flips across
+ * repeats dropping from 5 rows to 0. Two additions did it — stating the person's own
+ * standard outright, and saying that text the model or somebody else wrote does not count
+ * even when it is true and on topic, which is the rule they applied most often and which
+ * no pattern can detect.
+ *
+ * Its threshold is `minRemember` in `dsh/index.ts`, and the two must move together: a
+ * stricter question moves the whole score distribution down.
  */
 export const REMEMBER_QUESTION =
-  '上一条 `candidate` 里包含的要求或信息，在以后**新的会话**里是否仍然适用或成立？只看内容还有没有效：以后还要照做的规矩、约定、禁忌、偏好、取舍或事实都算；今天做什么、这一段怎么写、临时状态不算。句子是以指令的形式说的并不影响判断——只看它是不是只管这一次。'
+  '上一条 `candidate` 是这个人**对他自己项目的长期主张**吗？约定、禁忌、取舍及原因、踩过的坑、项目事实都算。发生在这一次对话里的事不算：提问、寒暄、状态汇报、临时安排。特别注意——即使内容是对的、即使确实和这个项目有关，只要它是**模型的回答**、**别人写的**、或者**粘贴进来的转录**，就不算；只要它**只管这一次**，也不算。'
 
 
 /** Transport and vocabulary defaults; every one is overridable from plugin config. */

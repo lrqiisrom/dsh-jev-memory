@@ -503,8 +503,21 @@ export const DEFAULT_CONFIG: PluginConfig = {
    * Threshold on the judge's `remember` (Noul) answer — the primary write gate
    * whenever the judge answered that question. Kept separate from
    * `minImportance` because they gate different questions; see `applyGate`.
+   *
+   * 0.12, not 0.6, and the two numbers have to move together with
+   * `REMEMBER_QUESTION`. Measured on 140 labelled rows in `eval/labels/round5.csv`,
+   * five-fold cross-validated (threshold chosen on the other folds, scored on the held-out
+   * one, five repeats): the old wording with its threshold reached F1 0.21, catching 49% of
+   * what should be remembered; this wording with 0.12 reaches F1 0.32 and catches 67%,
+   * while writing *more* of them correctly (写对率 14% → 22%) rather than trading one for
+   * the other. Cross-validation pulled the best threshold for this wording to 0.12–0.13 on
+   * every repeat; the old wording's best threshold wandered between 0.23 and 0.32.
+   *
+   * The number is fitted to those 140 rows — cross-validation only rules out fitting the
+   * *threshold*, not the question — so a fresh batch is owed before this is treated as
+   * settled.
    */
-  minRemember: 0.6,
+  minRemember: 0.12,
   /** A suspected conflict is stored but withheld from recall until a human confirms. */
   reviewOnConflict: true,
   /**

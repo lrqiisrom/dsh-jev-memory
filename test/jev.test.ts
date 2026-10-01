@@ -92,14 +92,26 @@ test('an unavailable credential service never breaks a judgement', async () => {
 })
 
 test('the gate question asks about lifetime, not about grammar', () => {
-  // The first wording asked whether the sentence was "用户对项目的说法或偏好（不是这一次
-  // 任务的操作指令）" — a question about the sentence's form. The model answered it
-  // correctly and refused imperative sentences, including standing preferences that
-  // happen to be phrased as commands ("我要求你说设计是怎么设计的…就说流程就行了",
-  // scored 0.14). The wording now asks whether the content still applies later, and
-  // says outright that the imperative form is not the test.
-  assert.match(REMEMBER_QUESTION, /以后\*\*新的会话\*\*里是否仍然适用或成立/u)
-  assert.match(REMEMBER_QUESTION, /句子是以指令的形式说的并不影响判断/u)
+  // Wording history, kept because every rewrite came from a measurement and the next person
+  // should not undo one by accident.
+  //
+  // V1 asked whether the sentence was "用户对项目的说法或偏好（不是这一次任务的操作指令）" —
+  // a question about the sentence's form. The model answered it correctly and refused
+  // imperative sentences, including standing preferences phrased as commands
+  // ("我要求你说设计是怎么设计的…就说流程就行了", scored 0.14).
+  //
+  // V2 asked whether the content still applies later and said that the imperative form is
+  // not the test. That fixed the grammar problem but not the disagreement that mattered: on
+  // 140 labelled rows the judge typed 61% of the "remember" rows correctly and still scored
+  // them a median 0.38, below the gate.
+  //
+  // V3 (current) names the person's own standard and adds the rule their notes apply most
+  // often — text the model or somebody else wrote does not count, however true and on topic
+  // it is. Measured over 140 labelled rows, cross-validated: AUC 0.67 → 0.75, F1 0.21 →
+  // 0.32, verdict flips across repeats 5 → 0.
+  assert.match(REMEMBER_QUESTION, /对他自己项目的长期主张/u)
+  assert.match(REMEMBER_QUESTION, /模型的回答/u)
+  assert.match(REMEMBER_QUESTION, /只管这一次/u)
   assert.doesNotMatch(REMEMBER_QUESTION, /不是这一次任务的操作指令/u)
 
   // And it travels: a caller that swaps it gets its own text asked.
