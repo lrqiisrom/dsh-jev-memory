@@ -627,6 +627,9 @@ say('- 分层抽样按配额，各层比例不等于语料比例；比较不同�
 say('- 未测：**Hit@K / Recall@K**（需要标注查询）、多轮对话里的重复写入、以及记忆被读回后对回答质量的影响。')
 say('')
 
-const outFile = join(labelDir, 'report.md')
+// `REPORT_OUT` exists so a narrower report can be written *beside* the full one instead of
+// over it: "just round5" was asked for, and the only way to produce it was to clobber the
+// report covering every batch.
+const outFile = process.env.REPORT_OUT?.trim() || join(labelDir, 'report.md')
 await writeFile(outFile, `${out.join('\n')}\n`, 'utf8')
 console.log(`\n已写出 ${outFile}`)
