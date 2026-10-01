@@ -203,12 +203,26 @@ async function startEntry(root: string): Promise<Record<string, any>> {
 async function withTempHome(fn: (home: string) => Promise<void>): Promise<void> {
   const home = await mkdtemp(join(tmpdir(), 'dshmem-home-'))
   const previous = process.env.DSH_HOME
+  // The temporary home removes the credential *document*, but the plugin also resolves a
+  // key from the environment, so a test that means "nothing is configured" has to remove
+  // that source too. Without this the test passed on a machine with no key exported and
+  // failed on every machine that had one — which is every machine that runs the
+  // evaluation, so it failed exactly where the behaviour mattered.
+  const saved = new Map<string, string | undefined>()
+  for (const name of ['TYPESAFE_API_KEY', 'TYPESAFE_BASE_URL', 'ZHIPU_API_KEY']) {
+    saved.set(name, process.env[name])
+    delete process.env[name]
+  }
   process.env.DSH_HOME = home
   try {
     await fn(home)
   } finally {
     if (previous === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = previous
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
   }
 }
 

@@ -383,9 +383,22 @@ say('')
 say(`拿不准的 ${unsure.length} 行占已标 ${percent(unsure.length / rows.length)}——它们是标准本身有歧义的地方，**不参与任何阈值计算**。`)
 say('')
 
-say('## 三种判定的对照')
+say('## 四臂对照：写入侧')
+
 say('')
-say('| 判定 | 精确率 | 召回率 | F1 | TP | FP | FN | TN |')
+say('这张表量的全是**写入侧**：给你抽出来的每一句候选，判定是"把它写成一条记忆"还是"丢掉它"。')
+say('这里没有检索，也没有"召回几条记忆"这回事——那是读取侧，见本节末尾。')
+say('')
+say('> ⚠️ **"召回率"在这里是个坏名字，之前的版本直接用了它，读起来像是检索指标。**')
+say('> 本报告一律改用两个不会混的名字：**写对率**（= 精确率：它写下来的句子里，有多少是你标"该记"的）')
+say('> 和**该记覆盖率**（= 召回率：你标"该记"的句子里，有多少被它写下来了）。')
+say('> 四个格子的含义：**TP** = 你标该记、它写了；**FP** = 你标不该记、它还是写了；')
+say('> **FN** = 你标该记、它没写；**TN** = 你标不该记、它也没写。')
+say('')
+say('> **读取侧一件都没测。** Hit@K / Recall@K（"问某件事的时候，前 K 条里有没有那条记忆"）需要你把')
+say('> "查询 → 应该想起哪几条"也标出来，目前**没有数据、没有测量**，本报告的任何数字都不能当它用。')
+say('')
+say('| 判定 | 写对率 | 该记覆盖率 | F1 | TP | FP | FN | TN |')
 say('|---|---|---|---|---|---|---|---|')
 for (const arm of arms) {
   const score = scoreArm(arm, decided, indexOf)
@@ -425,7 +438,7 @@ for (const taskClass of ['coding', 'study', 'office', 'other'] as TaskClass[]) {
   say(`| \`${taskClass}\` | ${subset.length} | ${cells.join(' | ')} |`)
 }
 say('')
-say('（每格是 **精确率 / 召回率**。编码类才是主指标：学习类是复习问答，办公类是文档工作。）')
+say('（每格是 **写对率 / 该记覆盖率**。编码类才是主指标：学习类是复习问答，办公类是文档工作。）')
 say('')
 
 say('## 按分层拆开')
@@ -466,7 +479,7 @@ if (batchesPresent.length > 1) {
     say(`| ${batch} | \`${hash}\` | ${subset.length} | ${cells.join(' | ')} |`)
   }
   say('')
-  say('（每格是 **精确率 / 召回率**。`round1.csv` 的句子是在转录筛子存在之前抽的，它的"只过筛子"反映旧筛子。）')
+  say('（每格是 **写对率 / 该记覆盖率**。`round1.csv` 的句子是在转录筛子存在之前抽的，它的"只过筛子"反映旧筛子。）')
   say('')
 }
 
@@ -487,6 +500,101 @@ for (const arm of arms) {
   }
   if (wrong.length > 20) say(`- …另有 ${wrong.length - 20} 行`)
   say('')
+}
+
+// "Is the model judge any good" is the question this project turns on, and a
+// write/no-write matrix at one threshold answers it badly: at 0.6 the judge writes a
+// handful of rows, so both rates rest on tiny counts and the reader cannot tell "the
+// scores do not separate the two classes" from "the threshold is in the wrong place".
+// Two numbers pull those apart. AUC uses every pair of a positive and a negative and asks
+// how often the judge scores them the right way round — no threshold in it at all. The
+// type hit rate asks whether the judge read the sentence, which it can do while still
+// giving it a low remember score. Both are reported twice: once over everything the judge
+// was asked, once only over the rows the screens let through, because the screens decide
+// which sentences ever reach it.
+const firstRun = jevRuns[0]
+if (firstRun) {
+  const scored = decided
+    .map((row) => ({ row, judgement: firstRun[indexOf.get(row)!] }))
+    .filter((entry): entry is { row: Labelled; judgement: Judgement } => typeof entry.judgement?.remember === 'number')
+  const posScores = scored.filter((entry) => entry.row.label === '1').map((entry) => entry.judgement.remember!)
+  const negScores = scored.filter((entry) => entry.row.label === '0').map((entry) => entry.judgement.remember!)
+
+  const spread = (values: number[]): string => {
+    if (values.length === 0) return '—'
+    const sorted = [...values].sort((left, right) => left - right)
+    return `${sorted[0]!.toFixed(2)} / ${sorted[Math.floor(sorted.length / 2)]!.toFixed(2)} / ${sorted.at(-1)!.toFixed(2)}`
+  }
+  let wins = 0
+  for (const positive of posScores) {
+    for (const negative of negScores) wins += positive > negative ? 1 : positive === negative ? 0.5 : 0
+  }
+  const pairs = posScores.length * negScores.length
+  const auc = pairs === 0 ? null : wins / pairs
+  // AUC is reported for every repeat, not just the first: it is the one Jev number that
+  // came out identical across runs on this set, so a prompt change that moves it can be
+  // trusted, while a change that only moves the write count cannot.
+  const aucPerRun = jevRuns.map((run) => {
+    const positive: number[] = []
+    const negative: number[] = []
+    for (const row of decided) {
+      const value = run[indexOf.get(row)!]?.remember
+      if (typeof value !== 'number') continue
+      if (row.label === '1') positive.push(value)
+      else negative.push(value)
+    }
+    let runWins = 0
+    for (const p of positive) for (const n of negative) runWins += p > n ? 1 : p === n ? 0.5 : 0
+    const runPairs = positive.length * negative.length
+    return runPairs === 0 ? null : runWins / runPairs
+  })
+
+  const typeHits = (entries: typeof scored): number =>
+    entries.filter((entry) => GATE.types.includes(entry.judgement.type)).length
+  const passed = scored.filter((entry) => entry.row.screensKeptNow)
+  const passedPos = passed.filter((entry) => entry.row.label === '1')
+
+  say('## Jev 判得准不准（把阈值和筛子剥开看）')
+  say('')
+  say('前面那张表的 Jev 一行是**一个阈值下的写入结果**，它会同时受两件事影响：模型的分数有没有区分力，')
+  say('以及阈值定在哪。看下面两组数字，才能知道问题出在哪一边。')
+  say('')
+  say(`**① 分数分布**（Jev 给的 \`remember\`，格式 最低 / 中位 / 最高；它只经手了 ${scored.length} 行）`)
+  say('')
+  say('| 你的标注 | 行数 | remember 最低 / 中位 / 最高 |')
+  say('|---|---|---|')
+  say(`| 该记（1） | ${posScores.length} | ${spread(posScores)} |`)
+  say(`| 不该记（0） | ${negScores.length} | ${spread(negScores)} |`)
+  say('')
+  say(
+    auc === null
+      ? '**② 区分能力（AUC）**：样本不足，算不出来。'
+      : `**② 区分能力（AUC = ${auc.toFixed(2)}）**：在全部"一条该记 × 一条不该记"的组合里，Jev 把该记那条给得更高的比例是 **${percent(auc)}**（0.50 = 纯瞎猜，1.00 = 完美排序）。**这个数里没有阈值**，所以它才是"模型的分数到底有没有用"的答案。` +
+          (aucPerRun.length > 1
+            ? ` 每个重复各算一遍：${aucPerRun.map((value) => (value === null ? '—' : value.toFixed(2))).join('、')}。`
+            : ''),
+  )
+  say('')
+  say(
+    `**③ 有没有看懂内容**：Jev 把这些句子判成 ${GATE.types.join(' / ')} 的比例——你标"该记"的 ${posScores.length} 行里判对 **${typeHits(scored.filter((entry) => entry.row.label === '1'))}** 行；` +
+      `你标"不该记"的 ${negScores.length} 行里也判成这三类的有 **${typeHits(scored.filter((entry) => entry.row.label === '0'))}** 行（这些就是"类型看着对、其实不该记"的干扰项）。`,
+  )
+  say('')
+  say(
+    `**④ 只在筛子放行的句子里看**（这 ${passed.length} 行才是 Jev 真正经手的集合）：` +
+      `该记 ${passedPos.length} 行、不该记 ${passed.length - passedPos.length} 行。` +
+      `也就是说筛子已经先替它丢掉了 ${scored.length - passed.length} 行，**那部分 Jev 根本没机会判**——它的覆盖率上限就是筛子的放行率。`,
+  )
+  say('')
+  if (auc !== null && auc < 0.8) {
+    say(
+      auc < 0.6
+        ? '> 读法：AUC 贴着 0.5，说明分数几乎排不出顺序——这时调阈值救不回多少，换阈值只是换一组错法。'
+        : `> 读法：AUC ${auc.toFixed(2)} 是"有区分力但很弱"：正例大部分压不过负例，所以无论阈值定在哪里，多写就一定多错、少错就一定漏记。` +
+            '调阈值只是在这条曲线上挪位置，要把曲线整体抬起来得改问法或改判定，不是改配置。',
+    )
+    say('')
+  }
 }
 
 if (jevRuns.length > 1) {
@@ -522,9 +630,9 @@ if (jevRuns.length > 1) {
     const m = metrics(score)
     return `${percent(m.precision)}/${percent(m.recall)}`
   })
-  say(`这一次的每一跑：${perRun.join('、')}（精确率/召回率）——**模型判定的数字必须带上这个区间读**。`)
+  say(`这一次的每一跑：${perRun.join('、')}（写对率/该记覆盖率）——**模型判定的数字必须带上这个区间读**。`)
   say('')
-  say('所以 Jev 那一栏必须连同这个数字一起读：单次运行的精确率会随这些行上下浮动。')
+  say('所以 Jev 那一栏必须连同这个数字一起读：单次运行的写对率会随这些行上下浮动。')
   say('')
 }
 
@@ -551,7 +659,7 @@ if (jevLatency.length > 0) {
 if (jevRuns.length > 0) {
   say('## 阈值扫描')
   say('')
-  say('| minRemember / minImportance | Jev 精确率 | Jev 召回率 | Jev 写入数 | 规则判定 精确率 | 规则判定 召回率 |')
+  say('| minRemember / minImportance | Jev 写对率 | Jev 该记覆盖率 | Jev 写入数 | 规则判定 写对率 | 规则判定 该记覆盖率 |')
   say('|---|---|---|---|---|---|')
   for (const threshold of [0.2, 0.3, 0.4, 0.5, 0.55, 0.6, 0.7]) {
     const jevScore: Score = { tp: 0, fp: 0, fn: 0, tn: 0 }
@@ -585,8 +693,8 @@ if (jevRuns.length > 0) {
   // like that is exactly what a reader would use to dismiss the whole sweep.
   say(
     decided.length < 100
-      ? `（阈值是配置，不是模型能力：同一批评分在低阈值下召回更高、精确率更低。扫描只有 ${decided.length} 行已定标注，**不要照单挑一个最好看的点**；等标注到 100 行以上再定。）`
-      : `（阈值是配置，不是模型能力：同一批评分在低阈值下召回更高、精确率更低。这一次扫描有 ${decided.length} 行已定标注，其中**该记只有 ${positives} 句**——低阈值那几个点的召回率是由很小的分母撑起来的，所以看的是整条曲线的形状，不是单点。）`,
+      ? `（阈值是配置，不是模型能力：同一批评分在低阈值下写得更多、写对率更低。扫描只有 ${decided.length} 行已定标注，**不要照单挑一个最好看的点**；等标注到 100 行以上再定。）`
+      : `（阈值是配置，不是模型能力：同一批评分在低阈值下写得更多、写对率更低。这一次扫描有 ${decided.length} 行已定标注，其中**该记只有 ${positives} 句**——低阈值那几个点的该记覆盖率是由很小的分母撑起来的，所以看的是整条曲线的形状，不是单点。）`,
   )
   say('')
 }
@@ -632,4 +740,38 @@ say('')
 // report covering every batch.
 const outFile = process.env.REPORT_OUT?.trim() || join(labelDir, 'report.md')
 await writeFile(outFile, `${out.join('\n')}\n`, 'utf8')
+// The raw per-row scores go next to the report so the Jev numbers can be re-sliced (a
+// different threshold, a different subset, an AUC over one task class) without paying for
+// another round of model calls. Calling the judge is the expensive and stochastic part;
+// reading its output should not require repeating it.
+await writeFile(
+  outFile.replace(/\.md$/u, '.scores.json'),
+  `${JSON.stringify(
+    {
+      generatedAt: new Date().toISOString(),
+      batches,
+      repeats,
+      model: jevModel,
+      degraded: jevDegraded,
+      rows: rows.map((row, index) => ({
+        id: row.id,
+        batch: row.batch,
+        stratum: row.stratum,
+        taskClass: row.taskClass,
+        label: row.label,
+        screensKeptNow: row.screensKeptNow,
+        heuristic: heuristicRows[index] ? { type: heuristicRows[index]!.type, importance: heuristicRows[index]!.importance } : null,
+        jev: jevRuns.map((run) => {
+          const judgement = run[index]
+          return judgement
+            ? { type: judgement.type, remember: judgement.remember, importance: judgement.importance, by: judgement.by }
+            : null
+        }),
+      })),
+    },
+    null,
+    2,
+  )}\n`,
+  'utf8',
+)
 console.log(`\n已写出 ${outFile}`)
