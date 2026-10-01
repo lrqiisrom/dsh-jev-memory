@@ -69,6 +69,59 @@ export function clip(text: unknown, max: number = DEFAULT_MAX_MEMORY_CHARS): str
 }
 
 /**
+ * Clause markers a cut is allowed to land on, strongest first.
+ *
+ * Tiered rather than one flat list: the strongest boundary inside the budget wins, even if
+ * a weaker one sits closer to the limit. A flat "latest boundary" rule cut
+ * `KnowledgeBase._…` in half, because the `.` inside an identifier counted as a sentence
+ * end — the cut looked clause-aware and was still mid-word.
+ *
+ * A bare `.` and `,` are deliberately left out: in mixed Chinese/English text they are far
+ * more often part of an identifier, a number or a JSON blob than a sentence end. A space is
+ * enough for Latin prose and does not split an identifier.
+ */
+const CLAUSE_BOUNDARY_TIERS: ReadonlyArray<ReadonlyArray<string>> = [
+  ['。', '！', '？', '!', '?'],
+  ['；', ';', '，', '、'],
+  [' '],
+]
+
+/**
+ * Clip at a clause boundary, so what gets stored is a whole clause instead of half a word.
+ *
+ * The person asked what "上下文并不完整" was about: several candidates were cut at exactly
+ * `maxChars` in the middle of a clause, and a clipped fragment is not judgeable — they
+ * marked those rows `?` because there was nothing to judge. Cutting at the last clause
+ * boundary inside the budget keeps the memory readable and self-contained, and it keeps the
+ * punctuation the screens match on: a hard cut removed the `(` and `{` that mark a pasted
+ * payload, so the same text could look innocent after clipping and guilty before it.
+ *
+ * Falls back to the hard cut when the only boundary is in the first half of the budget —
+ * trimming a 240-character limit down to 20 characters of content would lose more than the
+ * ragged edge costs.
+ *
+ * @param text - normalized text.
+ * @param max - maximum characters, excluding the ellipsis.
+ * @returns the clipped text, ending on a clause boundary when one is available.
+ */
+export function clipAtClause(text: unknown, max: number = DEFAULT_MAX_MEMORY_CHARS): string {
+  const value = normalize(text)
+  if (value.length <= max) return value
+  const head = value.slice(0, Math.max(1, max - 1))
+  for (const tier of CLAUSE_BOUNDARY_TIERS) {
+    let cut = -1
+    for (const marker of tier) {
+      const at = head.lastIndexOf(marker)
+      if (at > cut) cut = at
+    }
+    // `cut + 1` keeps the marker itself; a memory that ends on its own punctuation reads as
+    // complete rather than as an accident.
+    if (cut >= Math.floor(max / 2)) return `${head.slice(0, cut + 1).trimEnd()}…`
+  }
+  return `${head.trimEnd()}…`
+}
+
+/**
  * Stable content hash used for dedup and for the record id.
  *
  * Case is folded because "必须用 pnpm" and "必须用 PNPM" are the same memory.

@@ -25,7 +25,7 @@
  * @module dsh/lib/extract
  */
 
-import { excerpt, normalize, splitSentences } from './text.ts'
+import { clipAtClause, excerpt, normalize, splitSentences } from './text.ts'
 import {
   emphasisWeight,
   matchTypeSignals,
@@ -252,10 +252,16 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
     // what gets stored and injected, with a pasted prefix removed so the memory reads as
     // the sentence it is. Getting this backwards is easy and the test caught it once
     // already: the comment claimed the raw sentence while the code passed the cleaned one.
+    //
+    // They also clip differently, and that is deliberate. The identity keeps the plain hard
+    // cut because the ids the labelled corpus is keyed by were built with it — changing it
+    // would orphan every label. The stored text cuts at a clause boundary instead: a memory
+    // that ends mid-clause is not judgeable (that is what "上下文并不完整" was about), and a
+    // hard cut also removes the `(`/`{` that the payload screen matches on.
     const clip = (value: string): string =>
       value.length > config.maxChars ? `${value.slice(0, config.maxChars - 1)}…` : value
     const identity = clip(raw)
-    const stored = clip(sentence)
+    const stored = clipAtClause(sentence, config.maxChars)
 
     out.push({
       kind: 'user',

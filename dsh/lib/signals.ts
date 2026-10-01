@@ -350,10 +350,10 @@ export const FRAGMENT_PATTERNS: RegExp[] = [
 /**
  * Strip garbage that a paste left in front of, or inside, a real sentence.
  *
- * Why this is cleaning and not screening: measured against the labelled corpus, the two
+ * Why this is cleaning and not screening: measured against the labelled corpus, the
  * families below appear on sentences the person marked as worth remembering. Dropping
  * them would have destroyed the memories the plugin exists for; what is wrong with them
- * is the prefix, not the content.
+ * is the residue, not the content.
  *
  *  - **Structural residue from a pasted LaTeX/markdown block** (`\end{itemize}`,
  *    `\item`, `\textbf`) — the sentence behind it is real, and the residue is why the
@@ -364,12 +364,17 @@ export const FRAGMENT_PATTERNS: RegExp[] = [
  *    They point at a file that no longer exists, so a later session can do nothing with
  *    them. Deliberately *not* general paths: a path to a config file can be the whole
  *    point of a memory.
+ *  - **A bare list ordinal left at the end.** The person writes "…问题：" then a numbered
+ *    list; the splitter breaks at the newline and the ordinal ends up glued to the sentence
+ *    before it. 8 labelled rows end this way. Screening them was measured and **rejected**:
+ *    one of the 8 is marked "remember", so the rule would have destroyed a real requirement
+ *    to remove four characters. Stripping the ordinal keeps all 8.
  *
  * The replacement is the `<path>` placeholder the signature already uses, rather than
  * deletion, so the text still shows that something was there.
  */
 export function stripPastedPrefixes(sentence: string): string {
-  return String(sentence ?? '')
+  const cleaned = String(sentence ?? '')
     .replace(/^\s*\\+(?:end|begin)\{[^}]*\}\s*/u, '')
     .replace(/^\s*\\+(?:item|hline)\b[\s\d.]*/u, '')
     .replace(/^\s*\\+(?:textbf|textit|emph|texttt)\{([^}]*)\}\s*/u, '$1')
@@ -379,6 +384,10 @@ export function stripPastedPrefixes(sentence: string): string {
     )
     .replace(/\s{2,}/gu, ' ')
     .trim()
+  // The guard matters: dropping the ordinal from a sentence that was *only* an ordinal
+  // would leave nothing behind, and an empty candidate is a different bug than a dirty one.
+  const withoutOrdinal = cleaned.replace(/\s*\d{1,2}[.、)）]\s*$/u, '').trim()
+  return withoutOrdinal.length >= 12 ? withoutOrdinal : cleaned
 }
 
 /**

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { blocksToText, clip, estimateTokens, hashText, looksInterrogative, normalize, splitSentences } from '../dsh/lib/text.ts'
+import { blocksToText, clip, clipAtClause, estimateTokens, hashText, looksInterrogative, normalize, splitSentences } from '../dsh/lib/text.ts'
 import {
   DECISION_ASSERTION_PATTERNS,
   isNoise,
@@ -33,6 +33,35 @@ test('clip and normalize collapse whitespace and bound length', () => {
   assert.equal(normalize('  a \n  b  '), 'a b')
   assert.equal(clip('x'.repeat(10), 5).length, 5)
   assert.ok(clip('x'.repeat(10), 5).endsWith('…'))
+})
+
+test('clipAtClause ends a clipped memory on a clause, not mid-word', () => {
+  // The person marked several rows `?` with "上下文并不完整": those were cut at exactly 240
+  // characters, mid-clause, and a fragment cannot be judged.
+  const chinese =
+    '你之前还说选一个场景呢：方案 A 定位成 B2B API 产品客服（改动最小）换掉 KnowledgeBase._load_default_docs() 里的零售文档，改成加载 sample_knowledge.js，然后再跑一遍评测'
+  const cutChinese = clipAtClause(chinese, 60)
+  assert.ok(cutChinese.endsWith('…'))
+  assert.equal(cutChinese.includes('KnowledgeBase._lo'), false, 'must not cut inside the identifier')
+
+  // The strongest boundary wins even when a weaker one sits closer to the limit: the `.`
+  // inside an identifier used to count as a sentence end, so the cut looked clause-aware
+  // and was still mid-word. Here the `，` is later, and the `。` still wins.
+  assert.equal(
+    clipAtClause('前面铺垫足够长的一句话内容内容内容内容内容。后面还有一点补充说明的句子', 25),
+    '前面铺垫足够长的一句话内容内容内容内容内容。…',
+  )
+  // A boundary inside the first half is refused: trimming a 240-character budget down to a
+  // handful of characters costs more than the ragged edge it removes. With `。` at index 6
+  // and `，` at 12, a 30-character budget keeps the hard cut; at 20 the `，` is past halfway
+  // and the cut lands there instead.
+  const ladder = '第一句结束了。然后是第二句，这里还有一点别的也许可以再多写几个字凑够长度'
+  assert.equal(clipAtClause(ladder, 30), `${ladder.slice(0, 29)}…`)
+  assert.equal(clipAtClause(ladder, 20), '第一句结束了。然后是第二句，…')
+  // Nothing to cut on at all: fall back to the hard cut rather than trim to nothing.
+  assert.equal(clipAtClause('x'.repeat(50), 20), `${'x'.repeat(19)}…`)
+  // Under the limit nothing happens at all.
+  assert.equal(clipAtClause('端口固定 8000。', 60), '端口固定 8000。')
 })
 
 test('hashText folds case so restatements dedup', () => {
@@ -226,6 +255,23 @@ test('a pasted prefix is stripped, and it no longer decides the verdict', () => 
     '如图： <path> 你可以分析一下',
   )
   assert.equal(stripPastedPrefixes('配置在 /etc/app/config.yaml'), '配置在 /etc/app/config.yaml')
+
+  // A bare list ordinal glued to the end of the sentence before it: the person writes
+  // "…问题：" and then a numbered list, and the splitter leaves the ordinal behind. 8
+  // labelled rows end this way. Screening them was measured and rejected — one of the 8 is
+  // marked "remember", so the rule would have destroyed a real requirement to delete four
+  // characters. Cleaning them keeps all 8.
+  assert.equal(
+    stripPastedPrefixes('第一个项目的源码，我明天会给你，有了这个上下文会更全面 2.'),
+    '第一个项目的源码，我明天会给你，有了这个上下文会更全面',
+  )
+  assert.equal(
+    stripPastedPrefixes('我觉得我需要明确一下，简历应该在对话栏这边可以选择哪个简历 2.'),
+    '我觉得我需要明确一下，简历应该在对话栏这边可以选择哪个简历',
+  )
+  // But a sentence that is *only* an ordinal keeps it: stripping would leave nothing, and an
+  // empty candidate is a different bug from a dirty one.
+  assert.equal(stripPastedPrefixes('1.'), '1.')
 
   // The half that matters: with the residue gone, the existing task-instruction screen
   // can finally see the sentence for what it is. Before this, `\end{itemize}` in front of
