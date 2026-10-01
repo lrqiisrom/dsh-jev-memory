@@ -43,7 +43,7 @@ import { join } from 'node:path'
 
 import { TOOL_FAILURE_SIGNAL_SCORE, candidateScore, toolFailureKept } from '../dsh/lib/extract.ts'
 import { applyGate, createJudge, type GateConfig, type Judgement } from '../dsh/lib/judge.ts'
-import { createJevClient, type JevCandidate } from '../dsh/lib/jev.ts'
+import { createJevClient, REMEMBER_QUESTION, type JevCandidate } from '../dsh/lib/jev.ts'
 import { matchTypeSignals, screenSentence, signatureOf } from '../dsh/lib/signals.ts'
 import { parseCsvRecords } from './lib/csv.ts'
 import { taskClassOf, type TaskClass } from './lib/task-class.ts'
@@ -326,6 +326,56 @@ function scoreArm(arm: Arm, subset: Labelled[], indices: Map<Labelled, number>):
 const indexOf = new Map(rows.map((row, index) => [row, index]))
 
 /**
+ * Ranking quality of one run's `remember` scores over one subset.
+ *
+ * Threshold-free on purpose: it is the only Jev number that stayed put across repeats, so
+ * it is what "did the change help" has to be read from. Ties count half.
+ *
+ * @param run - one repeat's judgements, indexed like `rows`.
+ * @param subset - the rows to score.
+ * @returns the AUC, or null when the subset has no positives or no negatives.
+ */
+function aucForRun(run: Judgement[], subset: Labelled[]): number | null {
+  const positive: number[] = []
+  const negative: number[] = []
+  for (const row of subset) {
+    const value = run[indexOf.get(row)!]?.remember
+    if (typeof value !== 'number') continue
+    if (row.label === '1') positive.push(value)
+    else negative.push(value)
+  }
+  if (positive.length === 0 || negative.length === 0) return null
+  let wins = 0
+  for (const p of positive) for (const n of negative) wins += p > n ? 1 : p === n ? 0.5 : 0
+  return wins / (positive.length * negative.length)
+}
+
+/** One frozen measurement, for comparing a later run against it. */
+interface Baseline {
+  name: string
+  frozenAt: string
+  /** the gate question that produced it, so a wording change is visible in the file. */
+  rememberQuestion: string
+  minRemember: number
+  dataset: { batches: string[]; decided: number; positives: number }
+  arms: Record<string, { written: number; tp: number; fp: number; fn: number; precision: number; recall: number }>
+  jev: { auc: number | null; aucPerRun: Array<number | null>; flips: number | null }
+}
+
+let baseline: Baseline | null = null
+try {
+  baseline = JSON.parse(await readFile(join(labelDir, 'baseline.json'), 'utf8')) as Baseline
+} catch {
+  // No baseline yet. The comparison section is skipped rather than faked.
+}
+// A baseline is only comparable against the same rows. Comparing a round5 baseline with a
+// run over every batch would silently mix in the study rows and read as a regression.
+const baselineApplies =
+  baseline !== null &&
+  baseline.dataset.batches.join(',') === batches.join(',') &&
+  baseline.dataset.decided === decided.length
+
+/**
  * The type the model judge assigned to one row, for the diagnosis table.
  *
  * @param index - the row's index.
@@ -453,6 +503,75 @@ say('')
 for (const arm of arms) say(`- **${arm.name}**：${arm.note}`)
 say('')
 
+/** Jev's ranking quality over the decided rows; the baseline section needs it here. */
+const aucValue = jevRuns[0] ? aucForRun(jevRuns[0], decided) : null
+
+// The question every later change has to answer is "did the numbers move", and comparing
+// against a number someone remembers from a previous message is not a comparison. The
+// baseline is a file: it records the rows, the gate question and the threshold alongside
+// the result, so a difference can be attributed instead of merely noticed.
+if (baselineApplies && baseline) {
+  const current = new Map(
+    arms.map((arm) => {
+      const score = scoreArm(arm, decided, indexOf)
+      const m = metrics(score)
+      return [arm.name, { written: score.tp + score.fp, tp: score.tp, fp: score.fp, fn: score.fn, precision: m.precision, recall: m.recall }]
+    }),
+  )
+  const delta = (now: number, then: number, asPercent = false): string => {
+    // Compared at the precision the table prints, so a 23.7% → 24.2% move is not reported as
+    // a one-point gain next to two cells that both read "24%".
+    if (asPercent) {
+      const before = Math.round(then * 100)
+      const after = Math.round(now * 100)
+      if (before === after) return '持平'
+      return `${after > before ? '+' : ''}${after - before} 个点`
+    }
+    const difference = now - then
+    if (Math.abs(difference) < 0.5) return '持平'
+    return `${difference > 0 ? '+' : ''}${difference.toFixed(0)}`
+  }
+  say(`## 与基线对比（基线：${baseline.name}）`)
+  say('')
+  say(
+    `基线冻结于 ${baseline.frozenAt.slice(0, 10)}：同样的 ${baseline.dataset.batches.join('、')}、` +
+      `${baseline.dataset.decided} 行已定、${baseline.dataset.positives} 条该记；阈值 ${baseline.minRemember}。` +
+      (baseline.rememberQuestion === REMEMBER_QUESTION ? '' : ' **注意：这次的判定问法和基线不同**，下面每一格都同时含"问法变了"和"阈值变了"两个原因。'),
+  )
+  say('')
+  say('| 判定 | 指标 | 基线 | 现在 | 变化 |')
+  say('|---|---|---|---|---|')
+  for (const arm of arms) {
+    const then = baseline.arms[arm.name]
+    const now = current.get(arm.name)
+    if (!then || !now) continue
+    const rows_: Array<[string, string, string, string]> = [
+      ['记对的（抓到的该记 / 该记总数）', `${then.tp} / ${baseline.dataset.positives}`, `${now.tp} / ${decided.filter((row) => row.label === '1').length}`, delta(now.tp, then.tp)],
+      ['写对率', percent(then.precision), percent(now.precision), delta(now.precision, then.precision, true)],
+      ['该记覆盖率', percent(then.recall), percent(now.recall), delta(now.recall, then.recall, true)],
+    ]
+    for (const [metric, before, after, movement] of rows_) {
+      say(`| ${arm.name} | ${metric} | ${before} | ${after} | ${movement} |`)
+    }
+  }
+  say('')
+  say(`**判定排序能力（AUC，与阈值无关）**：基线 ${baseline.jev.auc === null ? '—' : baseline.jev.auc.toFixed(2)} → 现在 ${aucValue === null ? '—' : aucValue.toFixed(2)}。`)
+  if (baseline.jev.auc !== null && aucValue !== null) {
+    const movement = aucValue - baseline.jev.auc
+    const spread = baseline.jev.aucPerRun.filter((value): value is number => value !== null)
+    const noise = spread.length > 1 ? Math.max(...spread) - Math.min(...spread) : 0
+    // The judge is stochastic, so a difference smaller than its own run-to-run spread is
+    // not evidence of anything. The spread is printed rather than merely used, because the
+    // reader is the one who has to decide whether the next change cleared it.
+    say(
+      Math.abs(movement) <= Math.max(noise, 0.02)
+        ? `这个差距（${(movement * 100).toFixed(0)} 个百分点）**没有超出重复跑本身的波动**（基线三跑 ${spread.map((value) => value.toFixed(2)).join('、')}），所以还不能说判定变强或变弱了。`
+        : `这个差距超出了重复跑的波动范围（基线三跑 ${spread.map((value) => value.toFixed(2)).join('、')}），所以是判定本身的变化，不是随机。`,
+    )
+  }
+  say('')
+}
+
 // A row drawn before a screen existed keeps that screen's verdict in its file, so the
 // two screens arms differ exactly by the fixes made since. Showing both is the only
 // way to tell "the plugin is imprecise" from "the plugin was imprecise".
@@ -576,29 +695,11 @@ if (firstRun) {
     one: scored.filter((entry) => entry.row.label === '1' && bandOf(entry.judgement.remember!) === band).length,
     zero: scored.filter((entry) => entry.row.label === '0' && bandOf(entry.judgement.remember!) === band).length,
   }))
-  let wins = 0
-  for (const positive of posScores) {
-    for (const negative of negScores) wins += positive > negative ? 1 : positive === negative ? 0.5 : 0
-  }
-  const pairs = posScores.length * negScores.length
-  const auc = pairs === 0 ? null : wins / pairs
+  const auc = aucForRun(firstRun, decided)
   // AUC is reported for every repeat, not just the first: it is the one Jev number that
   // came out identical across runs on this set, so a prompt change that moves it can be
   // trusted, while a change that only moves the write count cannot.
-  const aucPerRun = jevRuns.map((run) => {
-    const positive: number[] = []
-    const negative: number[] = []
-    for (const row of decided) {
-      const value = run[indexOf.get(row)!]?.remember
-      if (typeof value !== 'number') continue
-      if (row.label === '1') positive.push(value)
-      else negative.push(value)
-    }
-    let runWins = 0
-    for (const p of positive) for (const n of negative) runWins += p > n ? 1 : p === n ? 0.5 : 0
-    const runPairs = positive.length * negative.length
-    return runPairs === 0 ? null : runWins / runPairs
-  })
+  const aucPerRun = jevRuns.map((run) => aucForRun(run, decided))
 
   const typeHits = (entries: typeof scored): number =>
     entries.filter((entry) => GATE.types.includes(entry.judgement.type)).length
@@ -812,6 +913,57 @@ say('')
 // report covering every batch.
 const outFile = process.env.REPORT_OUT?.trim() || join(labelDir, 'report.md')
 await writeFile(outFile, `${out.join('\n')}\n`, 'utf8')
+
+// Freezing a baseline is a deliberate act, not a side effect of running the report: if every
+// run overwrote it, "compare against the baseline" would mean "compare against five minutes
+// ago". `REPORT_BASELINE_OUT` names the file to freeze.
+const baselineOut = process.env.REPORT_BASELINE_OUT?.trim()
+if (baselineOut) {
+  let flips: number | null = null
+  if (jevRuns.length > 1) {
+    flips = 0
+    for (const [index, row] of rows.entries()) {
+      const writes = jevRuns.map((run) => row.screensKept && applyGate(run[index]!, GATE).write)
+      const yes = writes.filter(Boolean).length
+      if (yes > 0 && yes < jevRuns.length) flips += 1
+    }
+  }
+  await writeFile(
+    baselineOut,
+    `${JSON.stringify(
+      {
+        name: `${batches.join('+').replace(/\.csv/gu, '')}-${new Date().toISOString().slice(0, 10)}`,
+        frozenAt: new Date().toISOString(),
+        // Recorded so a later run can tell "the numbers moved because the question changed"
+        // from "the numbers moved because the judge is stochastic".
+        rememberQuestion: REMEMBER_QUESTION,
+        minRemember: GATE.minRemember,
+        dataset: {
+          batches,
+          labelled: rows.length,
+          decided: decided.length,
+          positives,
+        },
+        arms: Object.fromEntries(
+          arms.map((arm) => {
+            const score = scoreArm(arm, decided, indexOf)
+            const m = metrics(score)
+            return [arm.name, { written: score.tp + score.fp, tp: score.tp, fp: score.fp, fn: score.fn, precision: m.precision, recall: m.recall }]
+          }),
+        ),
+        jev: {
+          auc: aucValue,
+          aucPerRun: jevRuns.map((run) => aucForRun(run, decided)),
+          flips,
+        },
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  )
+  console.log(`已写出基线 ${baselineOut}`)
+}
 // The raw per-row scores go next to the report so the Jev numbers can be re-sliced (a
 // different threshold, a different subset, an AUC over one task class) without paying for
 // another round of model calls. Calling the judge is the expensive and stochastic part;
