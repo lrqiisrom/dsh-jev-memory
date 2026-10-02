@@ -53,7 +53,7 @@ import {
   type ConflictScorer,
 } from './lib/conflict.ts'
 import { EXTRACT_DEFAULTS, archiveMessages, extractCandidates } from './lib/extract.ts'
-import { applyGate, createJudge, JUDGE_MODES, type Judgement } from './lib/judge.ts'
+import { applyGate, createJudge, heuristicRow, JUDGE_MODES, type Judgement } from './lib/judge.ts'
 import {
   EMBEDDING_DEFAULTS,
   cosineSimilarity,
@@ -1664,11 +1664,29 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const pendingConflicts: ConflictAsk[] = []
       for (const candidate of fresh) {
         const judgement = rows.find((row) => row.key === candidate.key)
-        // `deterministic` strips the model's answer instead of ignoring the whole judgement:
-        // the type and the conflict flag still come from the judge and still matter, only the
-        // write/no-write call is handed back to the local rule. See `writeGate` for the
-        // measurement that put it there.
-        const gated = config.writeGate === 'judge' || !judgement ? judgement : { ...judgement, remember: null }
+        // `deterministic` means the *local* type and score decide, not the model's.
+        //
+        // The first implementation only stripped `remember`, and `applyGate` then fell through to
+        // the judge's `importance` — which is its 0..1 score answer. That combination was never
+        // measured, and measuring it found it almost always closed: over 90 reconstructed rows,
+        // 2 of 18 positives cleared importance 0.6 without a window and **0 of 18 with one**. The
+        // arm the setting was justified by (F1 0.34) is the extractor's own type and score, so
+        // those are what it now uses. The judge's `conflict` answer still travels, because the
+        // review path depends on it.
+        const local = heuristicRow(
+          {
+            key: candidate.key,
+            text: candidate.text,
+            hintedType: candidate.hintedType,
+            signalScore: candidate.signalScore,
+            signals: candidate.signals,
+          },
+          config,
+        )
+        const gated =
+          config.writeGate === 'judge' || !judgement
+            ? judgement
+            : { ...judgement, type: local.type, importance: local.importance, remember: null }
         const gate = applyGate(gated, config)
         if (!gate.write || !judgement) {
           // `by` on the skip line too: otherwise the ledger shows that something

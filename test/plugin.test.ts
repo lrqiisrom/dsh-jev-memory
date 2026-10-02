@@ -401,17 +401,23 @@ test('forgetting an archived message deletes it and nothing else', async () => {
 
 test('the write gate is deterministic by default and the judge can be put back', async () => {
   // Measured on 140 labelled rows: the judge at its re-tuned threshold scored F1 0.33, the free
-  // rule 0.34, and each one's unique contribution was equally poor. Paying a network call per
-  // candidate to tie a local rule is not a trade worth making — so the model's answer no longer
-  // decides, while its type and conflict answers still do.
+  // extractor rule 0.34, and each one's unique contribution was equally poor. So the model's answer
+  // no longer decides — and "deterministic" has to mean the *local* type and score, not the model's
+  // numbers.
+  //
+  // The first implementation of this only stripped `remember`, which made `applyGate` fall through
+  // to the judge's `importance` — its 0..1 score answer. That was never measured, and measuring it
+  // later found it almost always closed: over 90 reconstructed rows, 2 of 18 positives cleared
+  // importance 0.6 without a window and 0 of 18 with one. This test pins both directions so the
+  // same mistake cannot come back quietly.
   const original = globalThis.fetch
   globalThis.fetch = (async () =>
     new Response(
       JSON.stringify({
         model: 'jev-1.13.0',
         answers: {
-          'remember:0': { type: 'noul', noul: 0.95 },
-          'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
+          'remember:0': { type: 'noul', noul: 0.05 },
+          'type:0': { type: 'choice', choice: 'fact', confidence: 0.9 },
           'importance:0': { type: 'score', score: 0, legend: {}, confidence: 0.9 },
           'conflict:0': { type: 'noul', noul: 0.05 },
         },
@@ -419,16 +425,16 @@ test('the write gate is deterministic by default and the judge can be put back',
       { status: 200, headers: { 'content-type': 'application/json' } },
     )) as unknown as typeof fetch
   try {
-    // `judge: 'auto'` on purpose: `mount` defaults to the offline heuristic, and this test is
-    // about what the *model's* answer is allowed to decide.
+    // `judge: 'auto'` on purpose: `mount` defaults to the offline heuristic, and this test is about
+    // what the *model's* answer is allowed to decide.
     const deterministic = await mount({ judge: 'auto', writeGate: 'deterministic' }, 'test-key')
     const a = fakeSession({ events: TURN_EVENTS })
     await listenerFor(deterministic.captured, 'agent/turn-stopping')({ agent: { id: 's1', session: a }, turn: 1, signal: undefined })
     const aSearch = toolFor<SearchArgs, MemorySearchResult>(deterministic.captured, 'memory_search')
     assert.equal(
       promoted(await aSearch.execute({ query: 'pnpm' }, { agent: { session: a } })).length,
-      0,
-      'the model said remember 0.95, and the local score gate still refused it',
+      1,
+      'the local type and score wrote it, even though the model said no on every answer',
     )
     assert.equal((await startEntry(deterministic.root))?.writeGate, 'deterministic')
 
@@ -438,10 +444,55 @@ test('the write gate is deterministic by default and the judge can be put back',
     const bSearch = toolFor<SearchArgs, MemorySearchResult>(judged.captured, 'memory_search')
     assert.equal(
       promoted(await bSearch.execute({ query: 'pnpm' }, { agent: { session: b } })).length,
-      1,
-      'with the judge back on the gate the same answer writes',
+      0,
+      'with the judge on the gate its remember 0.05 refuses the same sentence',
     )
     assert.equal((await startEntry(judged.root))?.writeGate, 'judge')
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('deterministic mode refuses a sentence the local signals cannot type', async () => {
+  // The other half: the model saying "yes" must not put an untyped sentence into memory either,
+  // because a memory that only exists because a model waved it through is the thing this setting
+  // was introduced to stop.
+  const original = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        model: 'jev-1.13.0',
+        answers: {
+          'remember:0': { type: 'noul', noul: 0.99 },
+          'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
+          'importance:0': { type: 'score', score: 4, legend: {}, confidence: 0.9 },
+          'conflict:0': { type: 'noul', noul: 0.05 },
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )) as unknown as typeof fetch
+  try {
+    const { captured } = await mount({ judge: 'auto', writeGate: 'deterministic' }, 'test-key')
+    const session = fakeSession({
+      events: [
+        { type: 'turn/start', data: { turn: 1 } },
+        {
+          type: 'user/message',
+          data: {
+            role: 'user',
+            source: { kind: 'user' },
+            content: [{ type: 'text', text: '我们对齐一下这个事情的进度吧。' }],
+          },
+        },
+      ],
+    })
+    await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
+    const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+    assert.equal(
+      promoted(await search.execute({ query: '对齐' }, { agent: { session } })).length,
+      0,
+      'no local type signal, so the local score gate refuses it whatever the model answered',
+    )
   } finally {
     globalThis.fetch = original
   }

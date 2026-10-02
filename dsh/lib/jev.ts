@@ -153,6 +153,8 @@ export interface JevDecideRequest {
   known?: string[]
   /** the workspace the memories belong to; passed to the model as framing. */
   project?: string | null
+  /** messages around the candidates, oldest first; omitted from the request when empty. */
+  conversation?: string[]
   /** per-call budget. */
   timeoutMs?: number
   /** the turn's abort signal. */
@@ -405,6 +407,7 @@ export function createJevClient({
         importanceLevels: settings.importanceLevels,
         rememberQuestion: settings.rememberQuestion,
         project: request.project ?? null,
+        conversation: request.conversation ?? [],
       })
 
       const response = await postWithRetry({
@@ -577,6 +580,7 @@ export function buildRequestBody({
   importanceLevels,
   rememberQuestion,
   project,
+  conversation,
 }: {
   model: string
   /** candidates, index-addressed. */
@@ -591,6 +595,18 @@ export function buildRequestBody({
   rememberQuestion: string
   /** the workspace the memories belong to, as framing for the judgement. */
   project?: string | null
+  /**
+   * The messages around the candidates, oldest first, so the judgement can see what was being
+   * discussed.
+   *
+   * A sentence judged alone is missing the one thing a person has when they read it: what came
+   * before. "就用刚才那个项目" is meaningless alone and obvious in context, and eight of the
+   * twenty-one labelled positives carry no type signal at all precisely because they are
+   * judgements ("我觉得…应该…不合理") rather than imperatives — the class a window is supposed to
+   * help with. Whether it actually does is a measurement, not an assumption; see
+   * `eval/judge-context.ts`.
+   */
+  conversation?: string[]
 }): JevRequestBody {
   const questions: Record<string, JevQuestion> = {}
   const choiceCriteria: Record<string, string> = {}
@@ -644,6 +660,10 @@ export function buildRequestBody({
       memory_system: MEMORY_CONTEXT,
       project: project ?? null,
       known_memories: known,
+      // Omitted entirely when empty, so the request for the no-context arm is byte-identical to
+      // what the plugin used to send. An extra empty field would make the two arms differ in a
+      // way that has nothing to do with the thing being measured.
+      ...(conversation && conversation.length > 0 ? { recent_conversation: conversation } : {}),
     },
     model,
     questions,

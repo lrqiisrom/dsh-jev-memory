@@ -96,6 +96,9 @@ interface Row {
   vetoReason: string
   seen: number
   text: string
+  /** the session the sentence came from, and its event index inside it. */
+  sessionId: string
+  seq: number
 }
 
 /**
@@ -129,6 +132,16 @@ const SESSION_LOG = /^session(?:\.v(\d+))?\.jsonl\.zstd$/u
 interface SessionLog {
   file: string
   generation: number
+  /**
+   * The session directory's own name, which is the session id.
+   *
+   * Recorded so a labelled row can be put back into its conversation. Without it, three things
+   * are impossible: checking whether a sentence is the model's own words (that is a comparison
+   * against the same session's earlier assistant messages), measuring whether a wider window
+   * improves the judgement, and reconstructing the window a segmentation decision saw. The id is
+   * the join key and nothing else in the corpus carries it.
+   */
+  sessionId: string
 }
 
 /** Session directories that could not be listed, instead of skipping them mutely. */
@@ -179,19 +192,19 @@ async function sessionFiles(): Promise<SessionLog[]> {
         continue
       }
       logsByGeneration[best.generation] = (logsByGeneration[best.generation] ?? 0) + 1
-      files.push({ file: join(dir, best.name), generation: best.generation })
+      files.push({ file: join(dir, best.name), generation: best.generation, sessionId: id })
     }
   }
   return files
 }
 
-function ingest(scope: string, events: Array<{ seq: number; type: string; data: unknown }>): void {
+function ingest(scope: string, events: Array<{ seq: number; type: string; data: unknown }>, sessionId: string): void {
   if (events.length === 0) return
   const taskClass = (): TaskClass => taskClassOf(scope)
   const workspace = scope
   turns += 1
     const candidates = extractCandidates(events as never, {
-      onVeto: (sentence: string, reason: string | null) => {
+      onVeto: (sentence: string, reason: string | null, vetoSeq?: number) => {
         rawVetoes += 1
         const key = signatureOf(sentence)
         const existing = rows.get(key)
@@ -206,6 +219,10 @@ function ingest(scope: string, events: Array<{ seq: number; type: string; data: 
         classPopulation[taskClass()] += 1
         rows.set(key, {
           key,
+          sessionId,
+          // A vetoed row still gets its position: it is the join key back into the session, and
+          // the interval cases that matter most (a pasted block the screens refused) are vetoed.
+          seq: vetoSeq ?? 0,
           stratum,
           taskClass: taskClass(),
           workspace,
@@ -236,6 +253,8 @@ function ingest(scope: string, events: Array<{ seq: number; type: string; data: 
       classCandidates[cls] += 1
       rows.set(candidate.key, {
         key: candidate.key,
+        sessionId,
+        seq: candidate.seq,
         stratum,
         taskClass: cls,
         workspace,
@@ -300,10 +319,11 @@ for (const log of await sessionFiles()) {
     /* a log without a readable header is treated as a normal session */
   }
   let workspace = '?'
+  let sessionId = log.sessionId
   let turn: Array<{ seq: number; type: string; data: unknown }> = []
   let seq = 0
   const flush = () => {
-    ingest(workspace, turn)
+    ingest(workspace, turn, sessionId)
     turn = []
   }
 /**
@@ -367,7 +387,10 @@ if (frame !== 'legacy') {
   const cursor = readCursorTurns({ cursorDb: process.env.HARVEST_CURSOR_DB?.trim() || undefined })
   for (const turn of [...codex.turns, ...cursor.turns]) {
     humanMessages += turn.events.length
-    ingest(turn.workspace ?? '?', turn.events)
+    // Codex and Cursor turns have no DSH session id. The workspace plus the turn's own first
+    // sequence number is the closest stable handle, and it is marked as such rather than left
+    // empty so a later join cannot mistake one of these for a DSH session.
+    ingest(turn.workspace ?? '?', turn.events as never, `codex-or-cursor:${turn.workspace ?? '?'}`)
   }
   sourceReads = {
     dsh: { turns: dshTurns, humanMessages: dshHumanMessages, skipped: {} },
@@ -446,7 +469,12 @@ for (const stratum of Object.keys(SAMPLE) as Stratum[]) {
   chosen.push(...sample(pool, SAMPLE[stratum], SAMPLE_SEED))
 }
 
-const header = 'row,stratum,task_class,workspace,kind,hinted_type,signal_score,veto_reason,seen,id,text,label,note'
+// `session_id` and `seq` are the join key back into the conversation. They were added when three
+// separate needs turned out to be the same need: comparing a sentence against the model's own
+// earlier words, measuring whether a wider window helps the judgement, and reconstructing the
+// window a segmentation decision saw. Older batches lack the columns and read back as ''.
+const header =
+  'row,stratum,task_class,workspace,kind,hinted_type,signal_score,veto_reason,seen,id,session_id,seq,text,label,note'
 
 // `HARVEST_OUT_DIR` exists so a test can harvest into a temporary directory
 // instead of writing under `eval/labels/`, where it would sit beside a real batch.
@@ -520,6 +548,8 @@ const lines = chosen.map((row, index) => {
     row.vetoReason,
     String(row.seen),
     row.key,
+    row.sessionId,
+    String(row.seq),
     row.text,
     kept?.label ?? '',
     kept?.note ?? '',

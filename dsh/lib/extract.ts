@@ -92,7 +92,7 @@ export interface ExtractOptions {
   maxPerMessage: number
   maxPerTurn: number
   includeToolFailures: boolean
-  onVeto: ((sentence: string, reason: string | null) => void) | null
+  onVeto: ((sentence: string, reason: string | null, seq?: number) => void) | null
 }
 
 /** Extraction defaults; every one of them is overridable from plugin config. */
@@ -276,7 +276,7 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
       // screen whose reach was just widened, and therefore the one whose mistakes most need
       // to be measurable. A ledger that would drown in questions is the ledger's problem,
       // not the extractor's.
-      config.onVeto?.(sentence, screen.reason)
+      config.onVeto?.(sentence, screen.reason, seq)
       continue
     }
 
@@ -385,7 +385,7 @@ function fromToolFailure(
   // exact class of rejection was invisible once and it took a person labelling rows
   // by hand to find it.
   if (!hasDiagnostic(summary)) {
-    config.onVeto?.(text, 'tool-failure-no-detail')
+    config.onVeto?.(text, 'tool-failure-no-detail', seq)
     return null
   }
 

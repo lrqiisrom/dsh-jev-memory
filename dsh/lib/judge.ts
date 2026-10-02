@@ -85,6 +85,13 @@ export interface JudgeContext {
   known?: string[]
   /** the workspace the candidates came from; forwarded as model framing. */
   project?: string | null
+  /**
+   * The messages around the candidates, oldest first.
+   *
+   * Judging a sentence with no idea what was being discussed is the gap this fills; whether it
+   * improves the judgement is measured in `eval/judge-context.ts`, not assumed.
+   */
+  conversation?: string[]
   signal?: AbortSignal
 }
 
@@ -228,6 +235,7 @@ export function createJudge({ config, jev, log = () => {} }: { config: JudgeConf
           types: config.types,
           known: context.known ?? [],
           project: context.project ?? null,
+          conversation: context.conversation ?? [],
           timeoutMs: config.judgeTimeoutMs,
           signal: context.signal,
         })
