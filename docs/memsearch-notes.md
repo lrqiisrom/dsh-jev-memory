@@ -629,3 +629,35 @@ results = await mem.search("Redis config", top_k=3, source_prefix="./memory/prod
 - `plugins/dsh/{index.js,client.js,README.md}`、`plugins/dsh/skills/memory-recall/SKILL.md`、`plugins/dsh/prompts/summarize.txt`、`plugins/dsh/scripts/maintenance-runner.py`
 - `plugins/claude-code/README.md`
 - GitHub API：`repos/zilliztech/memsearch`、`/languages`、`/releases`、`/issues?state=open`
+
+
+---
+
+## 附录：摘要提示词原文（2026-10-02 读取）
+
+来源：`plugins/_shared/prompts/summarize.txt`（raw.githubusercontent.com/zilliztech/memsearch/main）
+
+```
+You are a third-person note-taker. You will receive a transcript of ONE conversation turn
+between User and {{AGENT_NAME}}.
+
+Your job is to record what happened as factual third-person notes. You are an EXTERNAL
+OBSERVER — you are NOT {{AGENT_NAME}}, NOT an assistant. Do NOT answer User's question, do NOT
+give suggestions, do NOT offer help. ONLY record what occurred.
+
+Output 2-10 bullet points, each starting with '- '. NOTHING else.
+
+Rules:
+- Write in third person and call the user 'User'
+- First bullet: what User asked or wanted (one sentence)
+- Remaining bullets: what was done, found, changed, configured, tested, explained, decided,
+  or could not be completed
+- Be specific when useful: mention important files read or edited, searches or research
+  performed, refactors, commands or tests run, key findings, and concrete outcomes
+- Prefer the final user-visible outcome over low-level transcript mechanics
+- Do NOT answer User's question yourself — just note what was discussed
+```
+
+**对"谁说的"这件事，它没有任何专门处理——也不需要。** 因为它的记忆单位是**"这一回合发生了什么"**（第三人称会话笔记），不是"用户自己的长期要求"。用户把模型的输出粘进自己的消息，在它这里只是让笔记多一条描述，**不会变成一条错误的约束**。
+
+这一点决定了我们不能照搬它的记忆内容：我们的记忆会被当作**用户的约束**注入到以后每个会话。同一段粘贴块，在它那里是噪音，在我们这里是**假约束**。

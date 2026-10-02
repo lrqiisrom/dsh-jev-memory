@@ -867,3 +867,29 @@ OpenViking 有一个正式的 DSH 插件 `examples/dsh-memory-plugin/`（npm 包
 - 官方博客：<https://blog.openviking.ai/post/openviking-benchmark-results/>
 - issue #1258（含 34 条评论）：<https://github.com/volcengine/OpenViking/issues/1258>
 - GitHub API：<https://api.github.com/repos/volcengine/OpenViking>
+
+
+---
+
+## 附录：L1 抽取提示词里"AI 输出"怎么处理（2026-10-02 读源码）
+
+来源：`MemoryCore/src/core/prompts/l1-extraction.ts`（417 行，commit `29bb8dffa9b11617316d50f21d7a8af9f47240be`）
+
+**喂给模型的格式**（`formatExtractionPrompt`，同文件 ~L398）：每条消息渲染成
+`[id] [role] [timestamp]: content`，一次喂一批（【背景对话】+【待提取的新消息】）。
+**role 是显式的**，所以模型分得清哪条是 user、哪条是 assistant。
+
+**明确排除项**（"不应该提取的内容"）里有：**"AI助手自身的行为或输出"**。
+
+**专门一条规则**：
+
+> **7. AI / Agent 输出处理：**
+> - 不要把 AI 的建议自动当成团队事实或团队决策。
+> - 只有当人类成员采纳、确认，或 Agent 输出本身是明确的工具执行结果、交付物、实验结果时，才可以提取。
+> - AI 生成的草案、方案、分析，如被明确作为后续工作资产使用，可提取为 work_artifact 或 work_method。
+
+还有一条相关纪律："准确归因：某人提出的建议、担忧、判断，不等于团队决策。只有出现明确确认、拍板、采纳、执行安排时，才能写成确定结论。"
+
+**但要注意它防的是哪种情况**：规则 7 说的是 **role=assistant 的消息**。用户把模型的输出**粘进自己的消息**之后，role 就是 user，**这条规则不会触发**——全文件里没有一条针对"用户消息内的粘贴/引用区间"的规则（grep `引用|他人的|第三方|转述|复制` 只命中一处，是 work_artifact 的定义里列了"引用"）。
+
+**结论：两家都靠"角色 + 明确规则"，没有一家处理"用户把模型输出粘贴进自己的消息"。** 而这恰好是 round5 里 30 行 note 说的那种情况（其中 0 行标 1，今天仍有 24 行会被放行）。
