@@ -95,6 +95,19 @@ test('estimateTokens over-counts CJK and never returns zero for text', () => {
   assert.equal(estimateTokens(''), 0)
 })
 
+test('the imperative 别 needs a verb, not just the character', () => {
+  // Found by running one message through the real pipeline: "端口别乱改啊，定 8000 了" — the
+  // example the design notes call *the* memory worth keeping — typed as `fact` and was then
+  // refused by the write gate's type whitelist. The bare `/别/` is not the fix: measured on the
+  // 181 decided rows it rescues one and admits seven, because 分别, 别人 and 区别 all contain
+  // the character. The narrow form costs nothing on that corpus and catches this case.
+  assert.equal(matchTypeSignals('端口别乱改啊，定 8000 了。').type, 'constraint')
+  assert.equal(matchTypeSignals('服务端口固定用 8000，别乱改').type, 'constraint')
+  for (const sentence of ['hinted_type 有几种类型，分别解释一下', '所以实现别的 agent 只需要定义子 agent 吗', '这两条有什么区别']) {
+    assert.notEqual(matchTypeSignals(sentence).type, 'constraint', sentence)
+  }
+})
+
 test('matchTypeSignals picks the most specific family first', () => {
   assert.equal(matchTypeSignals('必须用 pnpm 而不是 npm').type, 'constraint')
   assert.equal(matchTypeSignals('这个命令会报错').type, 'pitfall')

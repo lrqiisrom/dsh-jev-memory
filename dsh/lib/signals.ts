@@ -54,6 +54,12 @@ export const TYPE_SIGNALS: TypeSignalFamily[] = [
       /不能/u,
       /不要/u,
       /别去/u,
+      // `别` + an imperative verb. Deliberately not a bare `/别/`: measured against the 181
+      // decided rows it rescues one and admits seven, because 分别, 别人 and 区别 all contain
+      // the character. This narrower form costs nothing on that corpus and still catches
+      // "端口别乱改啊，定 8000 了" — the example the design notes use as *the* memory worth
+      // keeping, which used to fall through to `fact` and be refused by the type whitelist.
+      /别[乱去用动改加再拆写]/u,
       /不准/u,
       /禁止/u,
       /只能/u,
