@@ -215,6 +215,43 @@ export function extractCandidates(
 }
 
 /**
+ * Every message in the turn, for the archive.
+ *
+ * Unlike {@link extractCandidates} this filters nothing but empty text: no screens, no length
+ * minimum, no type signals. The archive exists so a wrong promotion decision stays
+ * reversible, and a filter here would reintroduce exactly the loss it is meant to prevent.
+ *
+ * The assistant's own messages are included. Nothing else in the system records them, and
+ * without them there is no way to answer the question the labelled corpus keeps asking — "is
+ * this the model's words rather than the person's?" — because that question is a comparison
+ * against what the model said earlier in the same session.
+ *
+ * @param events - one turn's events, oldest first.
+ * @returns the messages with text, each tagged with its role and sequence.
+ */
+export function archiveMessages(events: readonly TurnEvent[]): Array<{ seq: number; role: string; text: string }> {
+  const out: Array<{ seq: number; role: string; text: string }> = []
+  for (const event of events) {
+    if (event.type === 'user/message') {
+      const message = event.data
+      const text = normalize(textBlocksOf(message?.content).join('\n'))
+      if (text === '') continue
+      const kind = message?.source?.kind
+      if (typeof event.seq !== 'number') continue
+      out.push({ seq: event.seq, role: typeof kind === 'string' && kind !== '' ? kind : 'user', text })
+      continue
+    }
+    if (event.type === 'assistant/message') {
+      const text = normalize(textBlocksOf(event.data?.message?.content).join('\n'))
+      if (text === '') continue
+      if (typeof event.seq !== 'number') continue
+      out.push({ seq: event.seq, role: 'assistant', text })
+    }
+  }
+  return out
+}
+
+/**
  * Split one human message into candidates.
  *
  * @param message - the `user/message` event data.

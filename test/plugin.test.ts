@@ -9,6 +9,7 @@ import type {
   AskQuestionItem,
   ForgetArgs,
   MemoryForgetResult,
+  MemorySearchMatch,
   MemorySearchResult,
   MemoryWriteResult,
   PluginContext,
@@ -20,6 +21,19 @@ import type {
   WriteArgs,
 } from '../dsh/index.ts'
 import { CONFLICT_CHOICES } from '../dsh/lib/conflict.ts'
+
+/**
+ * The two layers a search reaches, kept apart in assertions.
+ *
+ * `memory_search` returns promoted memories and archived messages in one list, because a person
+ * asking a question should not have to know which layer the answer lived in. A test asserting
+ * "nothing was written" still has to say which layer it means, or it would pass on an archive
+ * hit and fail to notice that the gate had stopped working.
+ */
+const promoted = (result: MemorySearchResult): MemorySearchMatch[] =>
+  result.matches.filter((match) => match.origin === 'memory')
+const archivedHits = (result: MemorySearchResult): MemorySearchMatch[] =>
+  result.matches.filter((match) => match.origin === 'archive')
 import type { TurnEvent } from '../dsh/lib/extract.ts'
 
 /** What the fake context recorded, so a test can drive the plugin's hooks by hand. */
@@ -286,13 +300,135 @@ test('a turn writes a memory, a later session recalls it, and it can be forgotte
   // The tools see the same store.
   const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
   const found = await search.execute({ query: 'pnpm' }, { agent: { session } })
-  assert.equal(found.matches.length, 1)
+  assert.equal(promoted(found).length, 1)
+  assert.ok(archivedHits(found).length >= 1, 'the raw message is reachable too, even though it is not a memory')
   assert.match(search.output.render({ query: 'pnpm' }, found)[0].text, /必须用 pnpm/)
 
   const forget = toolFor<ForgetArgs, MemoryForgetResult>(captured, 'memory_forget')
-  const removed = await forget.execute({ id: found.matches[0].id }, { agent: { session } })
-  assert.deepEqual(removed, { removed: [found.matches[0].id], count: 1 })
+  const removed = await forget.execute({ id: promoted(found)[0]!.id }, { agent: { session } })
+  assert.deepEqual(removed, { removed: [promoted(found)[0]!.id], count: 1 })
   assert.equal(captured.contexts[0].text({ agent: { session } }), '')
+})
+
+/** A message the screens refuse, plus an assistant reply that says something else. */
+const REFUSED_TURN: TurnEvent[] = [
+  { type: 'turn/start', data: { turn: 1 } },
+  {
+    type: 'user/message',
+    data: {
+      role: 'user',
+      source: { kind: 'user' },
+      content: [{ type: 'text', text: '请你按照下面三个步骤操作，把第 2 步的原始结果贴出来，不要改写也不要总结。' }],
+    },
+  },
+  {
+    type: 'assistant/message',
+    data: {
+      turn: 1,
+      step: 1,
+      message: { role: 'assistant', content: [{ type: 'text', text: '我建议先改配置项 consistencyLevel，再重跑一遍回归。' }] },
+    },
+  },
+]
+
+test('a message the gate refused is still in the archive, and search finds it', async () => {
+  // The measured reason this layer exists: 122 labelled rows marked "don't remember" had already
+  // been discarded by the plugin, so when the gate changed they could not be re-read. A
+  // decision that cannot be revisited is a deletion with extra steps.
+  const { captured } = await mount()
+  const session = fakeSession({ events: REFUSED_TURN })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
+
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+  const found = await search.execute({ query: '贴出来' }, { agent: { session } })
+  assert.equal(promoted(found).length, 0, 'the screens refused it, so it is not a memory')
+  assert.equal(archivedHits(found).length, 1, 'but the words are still there')
+  assert.match(archivedHits(found)[0]!.text, /不要改写/, 'the whole message, not a fragment')
+  assert.match(search.output.render({ query: '贴出来' }, found)[0].text, /原文归档/)
+})
+
+test('the archive keeps the assistant messages too', async () => {
+  // Nothing else records them, and "is this the model's words?" is a comparison against what the
+  // model said earlier in the same session — the 30 labelled rows whose note says exactly that
+  // cannot be judged without this.
+  const { captured } = await mount()
+  const session = fakeSession({ events: REFUSED_TURN })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
+
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+  const found = await search.execute({ query: 'consistencyLevel' }, { agent: { session } })
+  assert.equal(promoted(found).length, 0)
+  assert.equal(archivedHits(found).length, 1)
+  assert.match(archivedHits(found)[0]!.text, /我建议先改配置项/)
+})
+
+test('forgetting an archived message deletes it and nothing else', async () => {
+  // A memory the person cannot get rid of is worse than no memory, and that applies to a layer
+  // they can now search. The delete matches on session *and* sequence: comparing the sequence
+  // alone would take out another session's message that happened to share the number.
+  const { captured } = await mount()
+  const first = fakeSession({ id: 's1', events: REFUSED_TURN })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session: first }, turn: 1, signal: undefined })
+  const second = fakeSession({ id: 's2', events: REFUSED_TURN })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's2', session: second }, turn: 1, signal: undefined })
+
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+  const forget = toolFor<ForgetArgs, MemoryForgetResult>(captured, 'memory_forget')
+  const before = await search.execute({ query: '贴出来' }, { agent: { session: first } })
+  assert.equal(archivedHits(before).length, 2, 'both sessions archived the same text')
+
+  const removed = await forget.execute({ id: archivedHits(before)[0]!.id })
+  assert.equal(removed.count, 1)
+  const after = await search.execute({ query: '贴出来' }, { agent: { session: first } })
+  assert.equal(archivedHits(after).length, 1, 'the other session is untouched')
+})
+
+test('the write gate is deterministic by default and the judge can be put back', async () => {
+  // Measured on 140 labelled rows: the judge at its re-tuned threshold scored F1 0.33, the free
+  // rule 0.34, and each one's unique contribution was equally poor. Paying a network call per
+  // candidate to tie a local rule is not a trade worth making — so the model's answer no longer
+  // decides, while its type and conflict answers still do.
+  const original = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        model: 'jev-1.13.0',
+        answers: {
+          'remember:0': { type: 'noul', noul: 0.95 },
+          'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
+          'importance:0': { type: 'score', score: 0, legend: {}, confidence: 0.9 },
+          'conflict:0': { type: 'noul', noul: 0.05 },
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )) as unknown as typeof fetch
+  try {
+    // `judge: 'auto'` on purpose: `mount` defaults to the offline heuristic, and this test is
+    // about what the *model's* answer is allowed to decide.
+    const deterministic = await mount({ judge: 'auto', writeGate: 'deterministic' }, 'test-key')
+    const a = fakeSession({ events: TURN_EVENTS })
+    await listenerFor(deterministic.captured, 'agent/turn-stopping')({ agent: { id: 's1', session: a }, turn: 1, signal: undefined })
+    const aSearch = toolFor<SearchArgs, MemorySearchResult>(deterministic.captured, 'memory_search')
+    assert.equal(
+      promoted(await aSearch.execute({ query: 'pnpm' }, { agent: { session: a } })).length,
+      0,
+      'the model said remember 0.95, and the local score gate still refused it',
+    )
+    assert.equal((await startEntry(deterministic.root))?.writeGate, 'deterministic')
+
+    const judged = await mount({ judge: 'auto', writeGate: 'judge' }, 'test-key')
+    const b = fakeSession({ events: TURN_EVENTS })
+    await listenerFor(judged.captured, 'agent/turn-stopping')({ agent: { id: 's1', session: b }, turn: 1, signal: undefined })
+    const bSearch = toolFor<SearchArgs, MemorySearchResult>(judged.captured, 'memory_search')
+    assert.equal(
+      promoted(await bSearch.execute({ query: 'pnpm' }, { agent: { session: b } })).length,
+      1,
+      'with the judge back on the gate the same answer writes',
+    )
+    assert.equal((await startEntry(judged.root))?.writeGate, 'judge')
+  } finally {
+    globalThis.fetch = original
+  }
 })
 
 test('a repeated statement is not written twice', async () => {
@@ -303,7 +439,7 @@ test('a repeated statement is not written twice', async () => {
   await handler({ agent: { id: 's1', session }, turn: 2, signal: undefined })
   const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
   const found = await search.execute({ query: 'pnpm' }, { agent: { session } })
-  assert.equal(found.matches.length, 1)
+  assert.equal(promoted(found).length, 1)
   assert.equal(found.total, 1)
 })
 
@@ -333,7 +469,7 @@ test('a delegated child session never teaches the store', async () => {
   session.header!.delegationDepth = 1
   await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 'child', session }, turn: 1, signal: undefined })
   const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
-  assert.equal((await search.execute({ query: 'pnpm' }, { agent: { session } })).matches.length, 0)
+  assert.equal(promoted(await search.execute({ query: 'pnpm' }, { agent: { session } })).length, 0)
 })
 
 test('a task instruction is never written even from a root session', async () => {
@@ -352,8 +488,8 @@ test('a task instruction is never written even from a root session', async () =>
   const session = fakeSession({ id: 'root', events })
   await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 'root', session }, turn: 1, signal: undefined })
   const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
-  assert.equal((await search.execute({ query: '步骤' }, { agent: { session } })).matches.length, 0)
-  assert.equal((await search.execute({ query: 'Java' }, { agent: { session } })).matches.length, 0)
+  assert.equal(promoted(await search.execute({ query: '步骤' }, { agent: { session } })).length, 0)
+  assert.equal(promoted(await search.execute({ query: 'Java' }, { agent: { session } })).length, 0)
 })
 
 test('a failing hook never propagates out of the turn boundary', async () => {
@@ -515,8 +651,8 @@ test('a suspected conflict is put to the human and the answer decides', async ()
 
     const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
     const found = await search.execute({ query: 'data' }, { agent: { session } })
-    assert.equal(found.matches.length, 1, 'the replaced memory must no longer be offered')
-    assert.match(found.matches[0].text, /不要改动/)
+    assert.equal(promoted(found).length, 1, 'the replaced memory must no longer be offered')
+    assert.match(promoted(found)[0]!.text, /不要改动/)
 
     // It is gone from use, not from the record. The question told the person their earlier
     // statement would be kept "供以后查证", and until now the code deleted it, so that
@@ -528,7 +664,7 @@ test('a suspected conflict is put to the human and the answer decides', async ()
     const old = records.find((entry) => String(entry.text).includes('可以随便改'))
     assert.ok(old, 'the superseded memory is still stored')
     assert.equal(old.status, 'superseded')
-    assert.equal(old.supersededBy, found.matches[0].id)
+    assert.equal(old.supersededBy, promoted(found)[0]!.id)
     const replacement = records.find((entry) => String(entry.text).includes('不要改动'))
     assert.equal(replacement?.supersedes, old.id)
 
@@ -562,8 +698,8 @@ test('keeping the older memory drops the new one instead', async () => {
 
     const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
     const found = await search.execute({ query: 'data' }, { agent: { session } })
-    assert.equal(found.matches.length, 1)
-    assert.match(found.matches[0].text, /可以随便改/)
+    assert.equal(promoted(found).length, 1)
+    assert.match(promoted(found)[0]!.text, /可以随便改/)
     await settle()
     assert.match(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /"choice":"keep-old"/)
   } finally {
@@ -622,10 +758,10 @@ test('a one-off tool failure is not remembered, a repeated one is', async () => 
   const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
 
   await handler({ agent: { id: 's1', session: fakeSession({ events: failure(1) }) }, turn: 1, signal: undefined })
-  assert.equal((await search.execute({ query: 'EPERM' }, { agent: { session } })).matches.length, 0, 'the first sighting is dropped')
+  assert.equal(promoted(await search.execute({ query: 'EPERM' }, { agent: { session } })).length, 0, 'the first sighting is dropped')
 
   await handler({ agent: { id: 's1', session: fakeSession({ events: failure(2) }) }, turn: 2, signal: undefined })
-  assert.equal((await search.execute({ query: 'EPERM' }, { agent: { session } })).matches.length, 1, 'the repeat is remembered')
+  assert.equal(promoted(await search.execute({ query: 'EPERM' }, { agent: { session } })).length, 1, 'the repeat is remembered')
 })
 
 // The timeout is large on purpose, and a missed question is resumed rather than
@@ -650,7 +786,7 @@ test('an unanswered conflict is re-asked at the start of the next turn', async (
 
     // Still withheld: nothing was decided yet.
     const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
-    assert.equal((await search.execute({ query: 'data' }, { agent: { session } })).matches.length, 2)
+    assert.equal(promoted(await search.execute({ query: 'data' }, { agent: { session } })).length, 2)
 
     const preStep = listenerFor(captured, 'agent/pre-step')
     await preStep({ agent: { session }, step: 1, signal: undefined })
@@ -658,8 +794,8 @@ test('an unanswered conflict is re-asked at the start of the next turn', async (
 
     await settle()
     const found = await search.execute({ query: 'data' }, { agent: { session } })
-    assert.equal(found.matches.length, 1, 'the resumed answer resolved it')
-    assert.match(found.matches[0].text, /不要改动/)
+    assert.equal(promoted(found).length, 1, 'the resumed answer resolved it')
+    assert.match(promoted(found)[0]!.text, /不要改动/)
     assert.match(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /"attempt":2/)
   } finally {
     globalThis.fetch = realFetch
@@ -734,7 +870,7 @@ test('pairing falls back to lexical overlap when the model cannot answer', async
       { query: 'data' },
       { agent: { session } },
     )
-    assert.equal(found.matches.length, 2)
+    assert.equal(promoted(found).length, 2)
     assert.match(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /"via":"overlap"/)
   } finally {
     globalThis.fetch = realFetch
@@ -901,7 +1037,7 @@ test('an enabled embedding path asks the provider, caches the vectors, and still
 
     const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
     const found = await search.execute({ query: 'pnpm' }, { agent: { session } })
-    assert.equal(found.matches.length, 1, 'a ranking failure must never cost the write')
+    assert.equal(promoted(found).length, 1, 'a ranking failure must never cost the write')
 
     const start = await startEntry(root)
     assert.equal(start?.conflictRanking, 'embedding')
@@ -928,7 +1064,7 @@ test('an embedding provider that is down falls back to lexical and still writes'
 
     const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
     assert.equal(
-      (await search.execute({ query: '端口' }, { agent: { session } })).matches.length,
+      promoted(await search.execute({ query: '端口' }, { agent: { session } })).length,
       1,
       'the write still happened despite the provider being down',
     )
@@ -1117,9 +1253,9 @@ test('a changed number updates the memory in place, with the old text in the led
 
     const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
     const found = await search.execute({ query: '端口' }, { agent: { session } })
-    assert.equal(found.matches.length, 1, 'one rule, one current memory')
-    assert.match(found.matches[0].text, /9000/u, 'the new number is what the plugin now believes')
-    assert.equal(found.matches[0].status, 'active', 'and it is reachable — not left superseded')
+    assert.equal(promoted(found).length, 1, 'one rule, one current memory')
+    assert.match(promoted(found)[0]!.text, /9000/u, 'the new number is what the plugin now believes')
+    assert.equal(promoted(found)[0]!.status, 'active', 'and it is reachable — not left superseded')
 
     // In place, not a second record: the signature is the identity, and `<n>` folds both
     // numbers into one id. Writing a second record overwrote the first and then superseded
@@ -1162,7 +1298,7 @@ test('a paraphrase the model calls a restatement is dropped, not stored twice', 
     })
 
     const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
-    assert.equal((await search.execute({ query: 'pnpm' }, { agent: { session } })).matches.length, 1)
+    assert.equal(promoted(await search.execute({ query: 'pnpm' }, { agent: { session } })).length, 1)
     const ledger = await ledgerEntries(root)
     assert.equal(ledger.find((entry) => entry.kind === 'pair-decision')?.decision, 'same-duplicate')
     assert.ok(ledger.some((entry) => entry.reason === 'pair-duplicate'), 'the skip says why')
@@ -1188,7 +1324,7 @@ test('a different rule that merely looks alike is kept as its own memory', async
     })
     const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
     assert.equal(
-      (await search.execute({ query: '团队约定' }, { agent: { session } })).matches.length,
+      promoted(await search.execute({ query: '团队约定' }, { agent: { session } })).length,
       2,
       'two rules both survive — the deterministic key would have been wrong either way',
     )

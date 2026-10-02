@@ -52,7 +52,7 @@ import {
   type ConflictPair,
   type ConflictScorer,
 } from './lib/conflict.ts'
-import { extractCandidates, EXTRACT_DEFAULTS } from './lib/extract.ts'
+import { EXTRACT_DEFAULTS, archiveMessages, extractCandidates } from './lib/extract.ts'
 import { applyGate, createJudge, JUDGE_MODES, type Judgement } from './lib/judge.ts'
 import {
   EMBEDDING_DEFAULTS,
@@ -72,7 +72,7 @@ import {
 } from './lib/normalize.ts'
 import { DEFAULT_QUOTA, inScope, renderRecall, searchMemories, selectMemories } from './lib/recall.ts'
 import { isNoteworthyVeto, signatureOf } from './lib/signals.ts'
-import { createMemoryStore, MEMORY_TYPES, type MemoryRecord } from './lib/store.ts'
+import { archiveId, createMemoryStore, MEMORY_TYPES, type L0Entry, type MemoryRecord } from './lib/store.ts'
 import { estimateTokens, excerpt, hashText } from './lib/text.ts'
 import type { Candidate, ExtractOptions, TurnEvent } from './lib/extract.ts'
 import type { Judge } from './lib/judge.ts'
@@ -339,6 +339,29 @@ export interface PluginConfig {
   repeatFailuresToWrite: number
   writeEnabled: boolean
   writeSkipSubagents: boolean
+  /**
+   * What decides whether an archived message becomes a memory.
+   *
+   * `deterministic` (default): the type whitelist plus the extractor's own score. Measured on
+   * 140 labelled rows, the model judge at its re-tuned threshold scored F1 0.33 and the free
+   * rule scored 0.34 — and each one's *unique* contribution was equally poor (2 correct out
+   * of 14, and 2 out of 12). Paying a network call per candidate to tie a local rule is not a
+   * trade worth making, so the judge was moved off the gate.
+   *
+   * `judge`: the previous behaviour, where the model's `remember` answer gates the write.
+   * Kept because the measurement is 18 positives and a future model may earn it back.
+   *
+   * Note this does **not** disable the judge. Conflict and duplicate decisions still go to it
+   * (`pairDecision`), which is where its ranking ability — AUC 0.75 — is actually used.
+   */
+  writeGate: 'deterministic' | 'judge'
+  /**
+   * Whether `memory_search` also looks at the archive.
+   *
+   * On by default: content the gate passed over is exactly what a person is most likely to
+   * search for, since the system already decided it was not worth surfacing on its own.
+   */
+  searchArchive: boolean
   writeTimeoutMs: number
   judgeTimeoutMs: number
   knownForConflict: number
@@ -394,6 +417,16 @@ export interface MemorySearchMatch {
   importance: number
   createdAt: number
   status: string
+  /**
+   * `memory` for a promoted record, `archive` for a message that was archived but never
+   * promoted.
+   *
+   * The distinction is the whole point of the archive layer: a person searching for
+   * something the gate passed over must be able to find it, and must be able to see that it
+   * was never treated as a memory. Hiding the origin would make the two indistinguishable in
+   * exactly the case where the difference matters.
+   */
+  origin: 'memory' | 'archive'
 }
 
 /** The `memory_search` result. */
@@ -568,6 +601,8 @@ export const DEFAULT_CONFIG: PluginConfig = {
   repeatFailuresToWrite: 2,
   /** Whether turn-end writes happen at all. */
   writeEnabled: true,
+  writeGate: 'deterministic',
+  searchArchive: true,
   /**
    * Skip delegated child sessions when learning.
    *
@@ -676,6 +711,10 @@ export function resolveConfig(raw: unknown): { config: PluginConfig; problems: s
   if (config.conflictRanking !== 'lexical' && config.conflictRanking !== 'embedding') {
     problems.push(`conflictRanking: unknown value "${String(config.conflictRanking)}"; using lexical`)
     config.conflictRanking = 'lexical'
+  }
+  if (config.writeGate !== 'deterministic' && config.writeGate !== 'judge') {
+    problems.push(`writeGate: unknown value "${String(config.writeGate)}"; using deterministic`)
+    config.writeGate = 'deterministic'
   }
   if (config.searchRanking !== 'lexical' && config.searchRanking !== 'embedding') {
     problems.push(`searchRanking: unknown value "${String(config.searchRanking)}"; using lexical`)
@@ -1025,8 +1064,10 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         kind: 'start',
         version,
         judge: judge.kind,
+        writeGate: config.writeGate,
         conflictRanking: config.conflictRanking,
         searchRanking: config.searchRanking,
+        archive: store.archiveStats(),
         // The gate, not just the judge. Two runs can both say `judge: jev` while asking the
         // model different questions at different thresholds, and the ledger could not tell
         // them apart — which is exactly the question "did the numbers move because of my
@@ -1425,6 +1466,30 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     async function handleTurn(): Promise<TurnWriteOutcome> {
       const session = agent?.session
       const events = collectTurnEvents(session)
+      const header = session?.header
+      const cwd = header?.cwd ?? null
+
+      // Archive first, before any judgement. Everything downstream — the screens, the gate,
+      // the conflict window — is a decision, and a decision that cannot be revisited is a
+      // deletion in disguise. Measured cost of not having this: 122 labelled rows marked
+      // "don't remember" that the plugin had already discarded, so when the gate changed they
+      // could not be re-read. The assistant's own messages are archived too, because the
+      // question "is this the model's words?" can only be answered against them.
+      const archived = archiveMessages(events)
+      if (archived.length > 0) {
+        void store.archive(
+          archived.map((message) => ({
+            sessionId: header?.id ?? null,
+            seq: message.seq,
+            role: message.role,
+            at: Date.now(),
+            cwd,
+            text: message.text,
+          })),
+        )
+        void store.ledger({ kind: 'archive', count: archived.length, roles: [...new Set(archived.map((m) => m.role))] })
+      }
+
       const candidates = extractCandidates(events, {
         ...config.extract,
         // The extractor reports every rejection; the ledger records the reasons that carry
@@ -1437,8 +1502,6 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       })
       if (candidates.length === 0) return { written: 0, writtenIds: [], candidates: 0 }
 
-      const header = session?.header
-      const cwd = header?.cwd ?? null
       const inScopeRecords = store.all().filter((record) => inScope(record, cwd))
       const activePartners = inScopeRecords.filter((record) => record.status === 'active')
       /** candidate key → the same-identity record whose text this replaces in place. */
@@ -1594,7 +1657,12 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const pendingConflicts: ConflictAsk[] = []
       for (const candidate of fresh) {
         const judgement = rows.find((row) => row.key === candidate.key)
-        const gate = applyGate(judgement, config)
+        // `deterministic` strips the model's answer instead of ignoring the whole judgement:
+        // the type and the conflict flag still come from the judge and still matter, only the
+        // write/no-write call is handed back to the local rule. See `writeGate` for the
+        // measurement that put it there.
+        const gated = config.writeGate === 'judge' || !judgement ? judgement : { ...judgement, remember: null }
+        const gate = applyGate(gated, config)
         if (!gate.write || !judgement) {
           // `by` on the skip line too: otherwise the ledger shows that something
           // was refused but not who refused it, and "is Jev actually deciding?"
@@ -1799,32 +1867,31 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     execute: async (args: SearchArgs, exec?: ToolExecContext): Promise<MemorySearchResult> => {
       const { query, type, limit } = args ?? {}
       const asked = String(query ?? '')
+      const wanted = limit ?? 20
       // Lexical first, then replaced when the embedding path answered: the fallback is the
       // already-computed result rather than a second code path, so a provider outage degrades
       // to BM25 instead of to an error.
-      let hits = searchMemories(store.all(), asked, { cwd: cwdOf(exec), limit: limit ?? 20 })
+      let hits = searchMemories(store.all(), asked, { cwd: cwdOf(exec), limit: wanted })
       if (embeddingSearchRanker) {
         const scoped = store
           .all()
           .filter((record) => inScope(record, cwdOf(exec)) && record.status !== 'superseded')
-        const ranked = await embeddingSearchRanker(asked, scoped, limit ?? 20)
-        if (ranked) {
-          hits = ranked.map((record) => ({
-            record,
-            score: 0,
-          }))
-        }
+        const ranked = await embeddingSearchRanker(asked, scoped, wanted)
+        if (ranked) hits = ranked.map((record) => ({ record, score: 0 }))
       }
-      const matches = hits
+      const matches: MemorySearchMatch[] = hits
         .filter((hit) => (type ? hit.record.type === type : true))
-        .map((hit) => ({
-          id: hit.record.id,
-          type: hit.record.type,
-          text: hit.record.text,
-          importance: hit.record.importance,
-          createdAt: hit.record.createdAt,
-          status: hit.record.status,
-        }))
+        .map((hit) => ({ ...toMatch(hit.record), origin: 'memory' as const }))
+
+      // Then the archive, ranked by the same scorer. Same query, same ranking, one merged
+      // list: the person asked a question, not a question about one storage layer.
+      if (config.searchArchive) {
+        const archived = archiveRecords(store.recentArchive())
+          .filter((record) => (type ? false : true))
+          .filter((record) => inScope(record, cwdOf(exec)))
+        const archiveHits = searchMemories(archived, asked, { cwd: cwdOf(exec), limit: wanted })
+        for (const hit of archiveHits) matches.push({ ...toMatch(hit.record), origin: 'archive' as const })
+      }
       return { query: asked, matches, total: store.stats().total }
     },
   })
@@ -1921,7 +1988,15 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const { id, query } = args ?? {}
       let removed: string[] = []
       if (typeof id === 'string' && id) {
-        removed = (await store.remove(id)) ? [id] : []
+        // An archive id is not a memory: it was never promoted, so `remove` cannot see it.
+        // Handled here rather than rejected, because the person found it by searching and
+        // "I cannot delete what you just showed me" is the answer that makes a memory system
+        // untrustworthy.
+        removed = id.startsWith('l0:')
+          ? ((await store.forgetArchive(id)) ? [id] : [])
+          : (await store.remove(id))
+            ? [id]
+            : []
       } else if (typeof query === 'string' && query) {
         const hits = searchMemories(store.all(), query, { cwd: null, limit: 100 })
         removed = (await store.removeWhere((record) => hits.some((hit) => hit.record.id === record.id))).map((record) => record.id)
@@ -1938,11 +2013,61 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
  * @param value - the tool's structured result.
  * @returns human/model-readable text.
  */
+/** One search match without the origin, which the two call sites set themselves. */
+function toMatch(record: {
+  id: string
+  type: string
+  text: string
+  importance: number
+  createdAt: number
+  status: string
+}): Omit<MemorySearchMatch, 'origin'> {
+  return {
+    id: record.id,
+    type: record.type,
+    text: record.text,
+    importance: record.importance,
+    createdAt: record.createdAt,
+    status: record.status,
+  }
+}
+
+/**
+ * Shape archived messages so the same retriever can rank them.
+ *
+ * Reusing `searchMemories` rather than writing a second matcher is deliberate: the archive and
+ * the store must be judged by one definition of relevance, or a hit in one layer and a miss in
+ * the other would be an artefact of the code rather than of the content.
+ *
+ * @param entries - archived messages, oldest first.
+ * @returns records scoped and typed for the retriever.
+ */
+function archiveRecords(entries: readonly L0Entry[]): MemoryRecord[] {
+  return entries.map((entry, index) => ({
+    id: archiveId(entry, index),
+    type: 'archive',
+    text: entry.text,
+    cwd: entry.cwd,
+    importance: 0.5,
+    status: 'active',
+    source: { sessionId: entry.sessionId, seq: entry.seq, quote: entry.text.slice(0, 200), at: entry.at },
+    createdAt: entry.at,
+    updatedAt: entry.at,
+    recalls: 0,
+    lastRecalledAt: null,
+    judge: { kind: 'archive', confidence: null, conflict: 'unknown', mode: null },
+  }))
+}
+
 function renderSearchResult(value: MemorySearchResult): string {
   const matches = value?.matches ?? []
   if (matches.length === 0) return `长期记忆里没有匹配「${value?.query ?? ''}」的条目（共 ${value?.total ?? 0} 条记忆）。`
-  const lines = matches.map((match) => `- [${match.type}] ${match.text} (${match.id}, ${new Date(match.createdAt).toISOString().slice(0, 10)})`)
-  return `匹配「${value.query}」的长期记忆：\n${lines.join('\n')}`
+  const lines = matches.map(
+    (match) =>
+      `- [${match.type}${match.origin === 'archive' ? ' · 原文归档，未被采纳为记忆' : ''}] ${match.text} (${match.id}, ${new Date(match.createdAt).toISOString().slice(0, 10)})`,
+  )
+  const archived = matches.filter((match) => match.origin === 'archive').length
+  return `匹配「${value.query}」的长期记忆：\n${lines.join('\n')}${archived > 0 ? `\n（其中 ${archived} 条来自原文归档，是当时没通过闸门、但原话仍在的内容）` : ''}`
 }
 
 /**

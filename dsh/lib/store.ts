@@ -29,7 +29,7 @@
  * @module dsh/lib/store
  */
 
-import { mkdir, readFile, rename, writeFile, appendFile } from 'node:fs/promises'
+import {appendFile, mkdir, readFile, readdir, rename, writeFile} from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 import { hashText, normalize } from './text.ts'
@@ -115,6 +115,38 @@ export interface MemoryRecord {
   judge: MemoryJudge
 }
 
+/**
+ * One archived message: the raw evidence layer.
+ *
+ * Everything the plugin sees is written here, unfiltered, including the assistant's own
+ * messages. Two things depend on that. The first is recoverability: the promotion gate is a
+ * judgement, judgements are wrong, and a memory system that deletes what it judged
+ * uninteresting cannot revisit the decision — the labelled corpus said so directly, with 122
+ * rows marked "don't remember" that the plugin had already thrown away and could not re-read
+ * when the gate changed. The second is attribution: detecting that a memory is the model's
+ * own words rather than the person's requires having the model's earlier words, and nothing
+ * else records them.
+ *
+ * Deliberately not a `MemoryRecord`: an archive entry has no type, no importance and no
+ * recall, because none of those are known yet. This is the input to a decision, not its
+ * result.
+ */
+export interface L0Entry {
+  /** the session that produced it, so a later pass can reconstruct the thread. */
+  sessionId: string | null
+  /** the event's sequence number inside that session. */
+  seq: number | null
+  /** `user`, `assistant`, or whatever the host called it. */
+  role: string
+  /** epoch ms of the message. */
+  at: number
+  /** workspace, for scope filtering on search. */
+  cwd: string | null
+  /** the text, complete. Not clipped: the archive is the evidence, and a clipped
+   *  evidence layer is how the 240-character problem started. */
+  text: string
+}
+
 /** One append-only ledger line; `kind` is required by convention. */
 export type LedgerEntry = Record<string, unknown>
 
@@ -175,6 +207,30 @@ export function createMemoryStore({ root, now = Date.now, log = () => {} }: Memo
   return new MemoryStore({ root, now, log })
 }
 
+/**
+ * How many archived messages stay in memory for search.
+ *
+ * A number rather than "all of them" because the archive grows without bound by design, and a
+ * prompt-time search that reads every file is a latency bug waiting for a long-running
+ * install. The disk copy is complete; this is the searchable window.
+ */
+const ARCHIVE_MEMORY_LIMIT = 2000
+
+/**
+ * The id under which one archived message is addressable.
+ *
+ * Derived from where the message came from rather than from its position in the window, so an
+ * id stays valid across restarts and after other entries are deleted. `seq` is stable within a
+ * session and a session id is unique, which is exactly the pair a deletion needs.
+ *
+ * @param entry - the archived message.
+ * @param index - its position, used only when the host gave no sequence number.
+ * @returns the archive id.
+ */
+export function archiveId(entry: L0Entry, index = 0): string {
+  return `l0:${entry.sessionId ?? '?'}:${entry.seq ?? index}`
+}
+
 /** In-memory index over one JSON document, with a serialized atomic writer. */
 export class MemoryStore {
   #root: string
@@ -194,6 +250,16 @@ export class MemoryStore {
    * source of truth that could disagree with the audit trail.
    */
   #observed = new Map<string, number>()
+  /**
+   * The tail of the archive, kept in memory so search can reach it.
+   *
+   * Bounded on purpose and the bound is stated rather than hidden: the full archive is on
+   * disk as JSONL (that is the durable evidence), while this window is what
+   * `memory_search` can find without reading every file on every query. A search that
+   * silently covered only part of the archive would be worse than one that says how far
+   * back it looks.
+   */
+  #archive: L0Entry[] = []
   /**
    * How many times each conflict question has been put to the human.
    *
@@ -259,7 +325,34 @@ export class MemoryStore {
     }
     this.#loaded = true
     await this.#loadObservedCounts()
+    await this.#loadArchiveTail()
     return { loaded: this.#records.size, recovered }
+  }
+
+  /**
+   * Read the newest archive day file into the searchable window.
+   *
+   * One file, not all of them: the window is for search at prompt time, and walking a year of
+   * daily files to answer one query is the kind of cost that turns a helpful feature into a
+   * latency complaint. Failure is logged and swallowed — a missing archive is not a reason to
+   * refuse to start.
+   */
+  async #loadArchiveTail(): Promise<void> {
+    try {
+      const dir = this.#archiveDir()
+      const names = (await readdir(dir)).filter((name) => name.endsWith('.jsonl')).sort()
+      if (names.length === 0) return
+      const raw = await readFile(join(dir, names[names.length - 1]!), 'utf8')
+      const entries: L0Entry[] = []
+      for (const line of raw.split('\n')) {
+        if (line.trim() === '') continue
+        const parsed = asRecord(JSON.parse(line)) as unknown as L0Entry | null
+        if (parsed && typeof parsed.text === 'string') entries.push(parsed)
+      }
+      this.#archive = entries.slice(-ARCHIVE_MEMORY_LIMIT)
+    } catch {
+      // No archive yet, or unreadable: search simply reaches less far back.
+    }
   }
 
   /**
@@ -475,6 +568,99 @@ export class MemoryStore {
     return this.#chain
   }
 
+  /**
+   * Append messages to the archive. Never rejects, never blocks a turn.
+   *
+   * The archive is the one layer that must not lose anything: it is what makes a wrong
+   * promotion decision reversible. Failures are logged and swallowed for the same reason the
+   * ledger's are — a full disk must not take the session down.
+   *
+   * @param entries - messages to archive, in order.
+   * @returns resolves once the lines are durable.
+   */
+  async archive(entries: readonly L0Entry[]): Promise<void> {
+    if (entries.length === 0) return
+    for (const entry of entries) this.#archive.push(entry)
+    if (this.#archive.length > ARCHIVE_MEMORY_LIMIT) {
+      this.#archive.splice(0, this.#archive.length - ARCHIVE_MEMORY_LIMIT)
+    }
+    const byFile = new Map<string, string[]>()
+    for (const entry of entries) {
+      const file = this.#archiveFile(entry.at)
+      const lines = byFile.get(file) ?? []
+      lines.push(JSON.stringify(entry))
+      byFile.set(file, lines)
+    }
+    this.#chain = this.#chain
+      .then(() => mkdir(this.#archiveDir(), { recursive: true, mode: 0o700 }))
+      .then(async () => {
+        for (const [file, lines] of byFile) await appendFile(file, `${lines.join('\n')}\n`, { mode: 0o600 })
+      })
+      .catch((error) => {
+        this.#log('warn', 'archive append failed', { error: String(error) })
+      })
+    return this.#chain
+  }
+
+  /**
+   * Delete one archived message from disk as well as from the window.
+   *
+   * A real delete, not a tombstone, for the same reason `remove` is: the person asked for it
+   * to be gone, and keeping a copy while saying otherwise is the lie this project refuses.
+   * The archive is append-only for the *system's* writes; a human's deletion outranks that.
+   *
+   * The whole day file is rewritten because JSONL has no in-place delete and the files are
+   * small by construction (one day of messages).
+   *
+   * @param id - an archive id of the form `l0:<sessionId>:<seq>`.
+   * @returns whether anything was removed.
+   */
+  async forgetArchive(id: string): Promise<boolean> {
+    const match = this.#archive.find((entry, index) => archiveId(entry, index) === id)
+    if (!match) return false
+    this.#archive = this.#archive.filter((entry, index) => archiveId(entry, index) !== id)
+    const file = this.#archiveFile(match.at)
+    this.#chain = this.#chain
+      .then(async () => {
+        let raw = ''
+        try {
+          raw = await readFile(file, 'utf8')
+        } catch {
+          return
+        }
+        // Match on session *and* sequence. Comparing the sequence alone deleted every message
+        // that happened to share the number, including other sessions' — one character of
+        // carelessness away from deleting a different conversation.
+        const kept = raw
+          .split('\n')
+          .filter((line) => {
+            if (line.trim() === '') return false
+            const entry = asRecord(JSON.parse(line))
+            return !(entry && entry.sessionId === match.sessionId && entry.seq === match.seq)
+          })
+        await writeFile(file, kept.length > 0 ? `${kept.join('\n')}\n` : '', { mode: 0o600 })
+      })
+      .catch((error) => {
+        this.#log('warn', 'archive delete failed', { id, error: String(error) })
+      })
+    return true
+  }
+
+  /**
+   * The archived messages search can reach, newest last.
+   *
+   * @param limit - how many of the newest to return.
+   * @returns the messages, in chronological order.
+   */
+  recentArchive(limit = ARCHIVE_MEMORY_LIMIT): L0Entry[] {
+    return this.#archive.slice(-limit)
+  }
+
+  /** How much of the archive is in memory, for the mount ledger line. */
+  archiveStats(): { inMemory: number; dir: string } {
+    return { inMemory: this.#archive.length, dir: this.#archiveDir() }
+  }
+
   /** @returns per-type counts of live records. */
   stats(): StoreStats {
     const byType: Record<string, number> = {}
@@ -506,6 +692,15 @@ export class MemoryStore {
 
   #ledgerFile(): string {
     return join(this.#root, 'ledger.jsonl')
+  }
+
+  #archiveDir(): string {
+    return join(this.#root, 'l0')
+  }
+
+  /** One file per day: greppable, and a day is a natural unit for a human reading back. */
+  #archiveFile(at: number): string {
+    return join(this.#archiveDir(), `${new Date(at).toISOString().slice(0, 10)}.jsonl`)
   }
 
   #index(record: MemoryRecord): void {

@@ -289,14 +289,20 @@ const arms: Arm[] = [
   {
     name: '规则判定',
     write: (index) => rows[index]!.screensKeptNow && applyGate(heuristicRows[index], GATE).write,
-    note: `离线判定：类型 ∈ {${GATE.types.join(', ')}} 且 分数 ≥ ${GATE.minImportance}`,
+    note:
+      `**线上闸门**：类型 ∈ {${GATE.types.join(', ')}} 且 抽取器分数 ≥ ${GATE.minImportance}。` +
+      '不需要网络也不需要 key，并且和原文归档配套：被它拒掉的句子不是丢弃，而是留在 L0 里可检索。',
   },
   ...(jevRuns.length > 0
     ? [
         {
           name: 'Jev 判定',
           write: (index: number) => rows[index]!.screensKeptNow && applyGate(jevRuns[0]![index], GATE).write,
-          note: `模型判定：remember ≥ ${GATE.minRemember}，每次最多 ${maxCandidates} 个候选，跑 ${repeats} 次`,
+          note:
+            `模型判定：remember ≥ ${GATE.minRemember}，每次最多 ${maxCandidates} 个候选，跑 ${repeats} 次。` +
+            '**线上已不用它决定写入**（配置 `writeGate: deterministic`）：在这批标注上它的 F1 是 0.33，上一条免模型的规则是 0.34；' +
+            '两者"独有贡献"的命中率一样低（它独有的 14 行里 2 行对，规则独有的 12 行里也是 2 行）。' +
+            '花一次网络调用去追平一条本地规则不划算，所以它被移出闸门，保留在冲突/重复判定那一步——那里用的是它的排序能力（AUC 0.75）。',
         },
       ]
     : []),

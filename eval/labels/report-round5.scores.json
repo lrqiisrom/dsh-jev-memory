@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-01T21:39:21.187Z",
+  "generatedAt": "2026-10-02T12:16:37.417Z",
   "batches": [
     "round5.csv"
   ],
@@ -21,19 +21,19 @@
       "jev": [
         {
           "type": "constraint",
+          "remember": 0.1,
+          "importance": 0.2125,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.1,
+          "importance": 0.2175,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
           "remember": 0.09,
-          "importance": 0.225,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
-          "remember": 0.1,
-          "importance": 0.2225,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
-          "remember": 0.1,
           "importance": 0.2225,
           "by": "jev"
         }
@@ -53,20 +53,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.31,
+          "remember": 0.3,
           "importance": 0.545,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.35,
-          "importance": 0.5425,
+          "remember": 0.3,
+          "importance": 0.535,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.3,
-          "importance": 0.515,
+          "remember": 0.31,
+          "importance": 0.5375,
           "by": "jev"
         }
       ]
@@ -85,20 +85,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.36,
-          "importance": 0.525,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
-          "remember": 0.38,
-          "importance": 0.545,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
           "remember": 0.33,
-          "importance": 0.55,
+          "importance": 0.5775,
+          "by": "jev"
+        },
+        {
+          "type": "decision",
+          "remember": 0.36,
+          "importance": 0.5825,
+          "by": "jev"
+        },
+        {
+          "type": "decision",
+          "remember": 0.35,
+          "importance": 0.5475,
           "by": "jev"
         }
       ]
@@ -117,20 +117,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.27,
-          "importance": 0.6775,
+          "remember": 0.28,
+          "importance": 0.675,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.31,
-          "importance": 0.6925,
+          "remember": 0.28,
+          "importance": 0.67,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.27,
-          "importance": 0.6775,
+          "remember": 0.28,
+          "importance": 0.67,
           "by": "jev"
         }
       ]
@@ -150,19 +150,19 @@
         {
           "type": "constraint",
           "remember": 0.39,
-          "importance": 0.4725,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
-          "remember": 0.42,
-          "importance": 0.485,
+          "importance": 0.47,
           "by": "jev"
         },
         {
           "type": "constraint",
           "remember": 0.39,
-          "importance": 0.4725,
+          "importance": 0.455,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.37,
+          "importance": 0.4675,
           "by": "jev"
         }
       ]
@@ -181,20 +181,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.23,
-          "importance": 0.43,
+          "remember": 0.25,
+          "importance": 0.445,
           "by": "jev"
         },
         {
           "type": "decision",
           "remember": 0.24,
-          "importance": 0.4175,
+          "importance": 0.4325,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.24,
-          "importance": 0.4125,
+          "remember": 0.25,
+          "importance": 0.4375,
           "by": "jev"
         }
       ]
@@ -214,19 +214,19 @@
         {
           "type": "constraint",
           "remember": 0.24,
-          "importance": 0.25,
+          "importance": 0.2425,
           "by": "jev"
         },
         {
           "type": "constraint",
-          "remember": 0.26,
-          "importance": 0.2375,
+          "remember": 0.22,
+          "importance": 0.2275,
           "by": "jev"
         },
         {
           "type": "constraint",
           "remember": 0.23,
-          "importance": 0.23,
+          "importance": 0.2625,
           "by": "jev"
         }
       ]
@@ -245,20 +245,20 @@
       "jev": [
         {
           "type": "decision",
+          "remember": 0.32,
+          "importance": 0.5175,
+          "by": "jev"
+        },
+        {
+          "type": "decision",
           "remember": 0.35,
-          "importance": 0.5375,
+          "importance": 0.5225,
           "by": "jev"
         },
         {
           "type": "decision",
           "remember": 0.33,
-          "importance": 0.525,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
-          "remember": 0.35,
-          "importance": 0.53,
+          "importance": 0.5375,
           "by": "jev"
         }
       ]
@@ -278,19 +278,19 @@
         {
           "type": "decision",
           "remember": 0.24,
-          "importance": 0.3125,
+          "importance": 0.3,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.25,
-          "importance": 0.3125,
+          "remember": 0.24,
+          "importance": 0.29,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.23,
-          "importance": 0.3125,
+          "remember": 0.26,
+          "importance": 0.2975,
           "by": "jev"
         }
       ]
@@ -309,20 +309,20 @@
       "jev": [
         {
           "type": "decision",
+          "remember": 0.36,
+          "importance": 0.555,
+          "by": "jev"
+        },
+        {
+          "type": "decision",
+          "remember": 0.36,
+          "importance": 0.575,
+          "by": "jev"
+        },
+        {
+          "type": "decision",
           "remember": 0.35,
-          "importance": 0.5975,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
-          "remember": 0.38,
-          "importance": 0.5775,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
-          "remember": 0.39,
-          "importance": 0.5775,
+          "importance": 0.545,
           "by": "jev"
         }
       ]
@@ -348,13 +348,13 @@
         {
           "type": "constraint",
           "remember": 0.06,
-          "importance": 0.19,
+          "importance": 0.1925,
           "by": "jev"
         },
         {
           "type": "constraint",
           "remember": 0.06,
-          "importance": 0.195,
+          "importance": 0.1875,
           "by": "jev"
         }
       ]
@@ -374,19 +374,19 @@
         {
           "type": "decision",
           "remember": 0.26,
-          "importance": 0.375,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
-          "remember": 0.26,
-          "importance": 0.3475,
+          "importance": 0.3575,
           "by": "jev"
         },
         {
           "type": "decision",
           "remember": 0.24,
-          "importance": 0.3475,
+          "importance": 0.35,
+          "by": "jev"
+        },
+        {
+          "type": "decision",
+          "remember": 0.23,
+          "importance": 0.365,
           "by": "jev"
         }
       ]
@@ -405,8 +405,8 @@
       "jev": [
         {
           "type": "constraint",
-          "remember": 0.07,
-          "importance": 0.145,
+          "remember": 0.08,
+          "importance": 0.1525,
           "by": "jev"
         },
         {
@@ -417,8 +417,8 @@
         },
         {
           "type": "constraint",
-          "remember": 0.07,
-          "importance": 0.1425,
+          "remember": 0.08,
+          "importance": 0.1575,
           "by": "jev"
         }
       ]
@@ -438,19 +438,19 @@
         {
           "type": "constraint",
           "remember": 0.05,
+          "importance": 0.265,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.06,
+          "importance": 0.2625,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.05,
           "importance": 0.2675,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
-          "remember": 0.05,
-          "importance": 0.26,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
-          "remember": 0.05,
-          "importance": 0.27,
           "by": "jev"
         }
       ]
@@ -469,20 +469,20 @@
       "jev": [
         {
           "type": "constraint",
+          "remember": 0.19,
+          "importance": 0.275,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
           "remember": 0.2,
           "importance": 0.2825,
           "by": "jev"
         },
         {
           "type": "constraint",
-          "remember": 0.2,
-          "importance": 0.28,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
           "remember": 0.21,
-          "importance": 0.2875,
+          "importance": 0.2975,
           "by": "jev"
         }
       ]
@@ -501,20 +501,20 @@
       "jev": [
         {
           "type": "constraint",
-          "remember": 0.31,
-          "importance": 0.345,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
           "remember": 0.32,
-          "importance": 0.3675,
+          "importance": 0.3375,
           "by": "jev"
         },
         {
           "type": "constraint",
-          "remember": 0.31,
-          "importance": 0.3175,
+          "remember": 0.29,
+          "importance": 0.36,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.33,
+          "importance": 0.3425,
           "by": "jev"
         }
       ]
@@ -533,20 +533,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.17,
-          "importance": 0.2125,
+          "remember": 0.18,
+          "importance": 0.1975,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.16,
-          "importance": 0.1875,
+          "remember": 0.14,
+          "importance": 0.195,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.16,
-          "importance": 0.19,
+          "remember": 0.15,
+          "importance": 0.18,
           "by": "jev"
         }
       ]
@@ -566,19 +566,19 @@
         {
           "type": "constraint",
           "remember": 0.09,
-          "importance": 0.34,
+          "importance": 0.325,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.08,
+          "importance": 0.3375,
           "by": "jev"
         },
         {
           "type": "constraint",
           "remember": 0.09,
-          "importance": 0.345,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
-          "remember": 0.1,
-          "importance": 0.3375,
+          "importance": 0.3475,
           "by": "jev"
         }
       ]
@@ -597,20 +597,20 @@
       "jev": [
         {
           "type": "constraint",
-          "remember": 0.31,
-          "importance": 0.365,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
           "remember": 0.29,
           "importance": 0.355,
           "by": "jev"
         },
         {
           "type": "constraint",
-          "remember": 0.29,
-          "importance": 0.3425,
+          "remember": 0.3,
+          "importance": 0.385,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.3,
+          "importance": 0.3575,
           "by": "jev"
         }
       ]
@@ -629,20 +629,20 @@
       "jev": [
         {
           "type": "constraint",
-          "remember": 0.25,
-          "importance": 0.31,
+          "remember": 0.26,
+          "importance": 0.33,
           "by": "jev"
         },
         {
           "type": "constraint",
           "remember": 0.28,
-          "importance": 0.3225,
+          "importance": 0.35,
           "by": "jev"
         },
         {
           "type": "constraint",
-          "remember": 0.26,
-          "importance": 0.3375,
+          "remember": 0.29,
+          "importance": 0.3125,
           "by": "jev"
         }
       ]
@@ -662,19 +662,19 @@
         {
           "type": "pitfall",
           "remember": 0.05,
-          "importance": 0.2675,
+          "importance": 0.27,
           "by": "jev"
         },
         {
           "type": "pitfall",
-          "remember": 0.06,
-          "importance": 0.2625,
+          "remember": 0.05,
+          "importance": 0.265,
           "by": "jev"
         },
         {
           "type": "pitfall",
-          "remember": 0.06,
-          "importance": 0.2625,
+          "remember": 0.05,
+          "importance": 0.2575,
           "by": "jev"
         }
       ]
@@ -693,20 +693,20 @@
       "jev": [
         {
           "type": "constraint",
-          "remember": 0.3,
-          "importance": 0.335,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
-          "remember": 0.34,
-          "importance": 0.315,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
           "remember": 0.32,
-          "importance": 0.335,
+          "importance": 0.3525,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.33,
+          "importance": 0.32,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.31,
+          "importance": 0.3475,
           "by": "jev"
         }
       ]
@@ -725,20 +725,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.44,
-          "importance": 0.6375,
+          "remember": 0.45,
+          "importance": 0.67,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.48,
-          "importance": 0.6675,
+          "remember": 0.43,
+          "importance": 0.6725,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.46,
-          "importance": 0.6675,
+          "remember": 0.47,
+          "importance": 0.66,
           "by": "jev"
         }
       ]
@@ -770,7 +770,7 @@
         {
           "type": "constraint",
           "remember": 0.03,
-          "importance": 0.14,
+          "importance": 0.135,
           "by": "jev"
         }
       ]
@@ -789,20 +789,20 @@
       "jev": [
         {
           "type": "decision",
+          "remember": 0.49,
+          "importance": 0.62,
+          "by": "jev"
+        },
+        {
+          "type": "decision",
           "remember": 0.51,
-          "importance": 0.655,
+          "importance": 0.6475,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.49,
-          "importance": 0.64,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
-          "remember": 0.49,
-          "importance": 0.6375,
+          "remember": 0.48,
+          "importance": 0.63,
           "by": "jev"
         }
       ]
@@ -821,20 +821,20 @@
       "jev": [
         {
           "type": "pitfall",
-          "remember": 0.13,
-          "importance": 0.3525,
+          "remember": 0.15,
+          "importance": 0.335,
           "by": "jev"
         },
         {
           "type": "pitfall",
           "remember": 0.14,
-          "importance": 0.355,
+          "importance": 0.3425,
           "by": "jev"
         },
         {
           "type": "pitfall",
-          "remember": 0.15,
-          "importance": 0.355,
+          "remember": 0.12,
+          "importance": 0.345,
           "by": "jev"
         }
       ]
@@ -853,20 +853,20 @@
       "jev": [
         {
           "type": "constraint",
-          "remember": 0.04,
-          "importance": 0.275,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
           "remember": 0.05,
-          "importance": 0.2675,
+          "importance": 0.2825,
           "by": "jev"
         },
         {
           "type": "constraint",
           "remember": 0.04,
-          "importance": 0.275,
+          "importance": 0.27,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.04,
+          "importance": 0.2725,
           "by": "jev"
         }
       ]
@@ -885,20 +885,20 @@
       "jev": [
         {
           "type": "constraint",
-          "remember": 0.27,
-          "importance": 0.22,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
-          "remember": 0.24,
-          "importance": 0.2225,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
           "remember": 0.26,
-          "importance": 0.235,
+          "importance": 0.2325,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.28,
+          "importance": 0.2275,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.27,
+          "importance": 0.2175,
           "by": "jev"
         }
       ]
@@ -917,20 +917,20 @@
       "jev": [
         {
           "type": "pitfall",
-          "remember": 0.08,
-          "importance": 0.2975,
+          "remember": 0.07,
+          "importance": 0.3,
           "by": "jev"
         },
         {
           "type": "pitfall",
           "remember": 0.08,
+          "importance": 0.2875,
+          "by": "jev"
+        },
+        {
+          "type": "pitfall",
+          "remember": 0.07,
           "importance": 0.2925,
-          "by": "jev"
-        },
-        {
-          "type": "pitfall",
-          "remember": 0.08,
-          "importance": 0.29,
           "by": "jev"
         }
       ]
@@ -950,13 +950,13 @@
         {
           "type": "constraint",
           "remember": 0.05,
-          "importance": 0.26,
+          "importance": 0.265,
           "by": "jev"
         },
         {
           "type": "constraint",
           "remember": 0.05,
-          "importance": 0.285,
+          "importance": 0.27,
           "by": "jev"
         },
         {
@@ -982,19 +982,19 @@
         {
           "type": "constraint",
           "remember": 0.06,
-          "importance": 0.2925,
+          "importance": 0.285,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.07,
+          "importance": 0.29,
           "by": "jev"
         },
         {
           "type": "constraint",
           "remember": 0.06,
-          "importance": 0.2825,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
-          "remember": 0.06,
-          "importance": 0.265,
+          "importance": 0.2675,
           "by": "jev"
         }
       ]
@@ -1013,19 +1013,19 @@
       "jev": [
         {
           "type": "constraint",
+          "remember": 0.03,
+          "importance": 0.2275,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
           "remember": 0.04,
-          "importance": 0.23,
+          "importance": 0.2275,
           "by": "jev"
         },
         {
           "type": "constraint",
           "remember": 0.03,
-          "importance": 0.225,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
-          "remember": 0.04,
           "importance": 0.2275,
           "by": "jev"
         }
@@ -1046,19 +1046,19 @@
         {
           "type": "pitfall",
           "remember": 0.04,
-          "importance": 0.28,
+          "importance": 0.2775,
+          "by": "jev"
+        },
+        {
+          "type": "pitfall",
+          "remember": 0.04,
+          "importance": 0.2875,
           "by": "jev"
         },
         {
           "type": "pitfall",
           "remember": 0.04,
           "importance": 0.28,
-          "by": "jev"
-        },
-        {
-          "type": "pitfall",
-          "remember": 0.04,
-          "importance": 0.285,
           "by": "jev"
         }
       ]
@@ -1077,20 +1077,20 @@
       "jev": [
         {
           "type": "constraint",
-          "remember": 0.29,
-          "importance": 0.47,
+          "remember": 0.27,
+          "importance": 0.5075,
           "by": "jev"
         },
         {
           "type": "constraint",
           "remember": 0.32,
-          "importance": 0.4525,
+          "importance": 0.5,
           "by": "jev"
         },
         {
           "type": "constraint",
-          "remember": 0.3,
-          "importance": 0.475,
+          "remember": 0.31,
+          "importance": 0.4975,
           "by": "jev"
         }
       ]
@@ -1110,19 +1110,19 @@
         {
           "type": "decision",
           "remember": 0.26,
-          "importance": 0.4975,
+          "importance": 0.495,
           "by": "jev"
         },
         {
           "type": "decision",
           "remember": 0.26,
-          "importance": 0.4875,
+          "importance": 0.495,
           "by": "jev"
         },
         {
           "type": "decision",
           "remember": 0.28,
-          "importance": 0.47,
+          "importance": 0.4825,
           "by": "jev"
         }
       ]
@@ -1141,20 +1141,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.26,
-          "importance": 0.685,
+          "remember": 0.27,
+          "importance": 0.675,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.25,
-          "importance": 0.6825,
+          "remember": 0.29,
+          "importance": 0.68,
           "by": "jev"
         },
         {
           "type": "decision",
           "remember": 0.28,
-          "importance": 0.6475,
+          "importance": 0.67,
           "by": "jev"
         }
       ]
@@ -1173,20 +1173,20 @@
       "jev": [
         {
           "type": "preference",
-          "remember": 0.25,
-          "importance": 0.395,
+          "remember": 0.23,
+          "importance": 0.4325,
           "by": "jev"
         },
         {
           "type": "preference",
-          "remember": 0.26,
-          "importance": 0.415,
+          "remember": 0.25,
+          "importance": 0.4225,
           "by": "jev"
         },
         {
           "type": "preference",
           "remember": 0.23,
-          "importance": 0.425,
+          "importance": 0.4175,
           "by": "jev"
         }
       ]
@@ -1205,20 +1205,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.28,
-          "importance": 0.5875,
+          "remember": 0.29,
+          "importance": 0.625,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.29,
-          "importance": 0.6375,
+          "remember": 0.28,
+          "importance": 0.595,
           "by": "jev"
         },
         {
           "type": "decision",
           "remember": 0.3,
-          "importance": 0.61,
+          "importance": 0.615,
           "by": "jev"
         }
       ]
@@ -1237,20 +1237,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.32,
-          "importance": 0.51,
+          "remember": 0.28,
+          "importance": 0.5025,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.32,
-          "importance": 0.525,
+          "remember": 0.3,
+          "importance": 0.53,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.29,
-          "importance": 0.52,
+          "remember": 0.3,
+          "importance": 0.54,
           "by": "jev"
         }
       ]
@@ -1270,19 +1270,19 @@
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.1325,
+          "importance": 0.1475,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.03,
+          "importance": 0.14,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
           "importance": 0.145,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.03,
-          "importance": 0.1425,
           "by": "jev"
         }
       ]
@@ -1302,19 +1302,19 @@
         {
           "type": "fact",
           "remember": 0.17,
-          "importance": 0.08,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.17,
-          "importance": 0.0975,
+          "importance": 0.09,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.18,
-          "importance": 0.0925,
+          "importance": 0.09,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.18,
+          "importance": 0.1,
           "by": "jev"
         }
       ]
@@ -1334,19 +1334,19 @@
         {
           "type": "fact",
           "remember": 0.02,
-          "importance": 0.0625,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.02,
-          "importance": 0.0775,
+          "importance": 0.0675,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.02,
           "importance": 0.07,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.02,
+          "importance": 0.075,
           "by": "jev"
         }
       ]
@@ -1365,20 +1365,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.32,
-          "importance": 0.4525,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
           "remember": 0.29,
-          "importance": 0.455,
+          "importance": 0.4475,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.28,
+          "remember": 0.3,
           "importance": 0.4525,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.3,
+          "importance": 0.46,
           "by": "jev"
         }
       ]
@@ -1397,20 +1397,20 @@
       "jev": [
         {
           "type": "fact",
+          "remember": 0.24,
+          "importance": 0.0425,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
           "remember": 0.26,
+          "importance": 0.0525,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.24,
           "importance": 0.05,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.26,
-          "importance": 0.0475,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.27,
-          "importance": 0.0475,
           "by": "jev"
         }
       ]
@@ -1430,19 +1430,19 @@
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.0525,
+          "importance": 0.0575,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.0625,
+          "importance": 0.0575,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.05,
+          "importance": 0.06,
           "by": "jev"
         }
       ]
@@ -1462,19 +1462,19 @@
         {
           "type": "constraint",
           "remember": 0.4,
+          "importance": 0.5375,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.4,
           "importance": 0.54,
           "by": "jev"
         },
         {
           "type": "constraint",
-          "remember": 0.39,
-          "importance": 0.535,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
-          "remember": 0.36,
-          "importance": 0.53,
+          "remember": 0.38,
+          "importance": 0.5175,
           "by": "jev"
         }
       ]
@@ -1493,20 +1493,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.07,
+          "remember": 0.08,
           "importance": 0.1325,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.08,
-          "importance": 0.13,
+          "remember": 0.07,
+          "importance": 0.1175,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.07,
-          "importance": 0.13,
+          "importance": 0.115,
           "by": "jev"
         }
       ]
@@ -1525,20 +1525,20 @@
       "jev": [
         {
           "type": "fact",
+          "remember": 0.06,
+          "importance": 0.1425,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
           "remember": 0.07,
-          "importance": 0.1475,
+          "importance": 0.1425,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.06,
-          "importance": 0.1575,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.07,
-          "importance": 0.1525,
+          "importance": 0.155,
           "by": "jev"
         }
       ]
@@ -1558,19 +1558,19 @@
         {
           "type": "fact",
           "remember": 0.03,
+          "importance": 0.205,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.03,
           "importance": 0.1975,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.19,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.03,
-          "importance": 0.19,
+          "importance": 0.1925,
           "by": "jev"
         }
       ]
@@ -1589,20 +1589,20 @@
       "jev": [
         {
           "type": "constraint",
+          "remember": 0.27,
+          "importance": 0.4,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.29,
+          "importance": 0.405,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
           "remember": 0.28,
-          "importance": 0.3725,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
-          "remember": 0.27,
-          "importance": 0.38,
-          "by": "jev"
-        },
-        {
-          "type": "constraint",
-          "remember": 0.27,
-          "importance": 0.375,
+          "importance": 0.4025,
           "by": "jev"
         }
       ]
@@ -1622,19 +1622,19 @@
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.3175,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.05,
           "importance": 0.31,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.06,
-          "importance": 0.3175,
+          "remember": 0.05,
+          "importance": 0.2975,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.05,
+          "importance": 0.3225,
           "by": "jev"
         }
       ]
@@ -1666,7 +1666,7 @@
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.0225,
+          "importance": 0.025,
           "by": "jev"
         }
       ]
@@ -1685,20 +1685,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.34,
-          "importance": 0.4575,
+          "remember": 0.31,
+          "importance": 0.425,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.35,
+          "importance": 0.4325,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.31,
-          "importance": 0.415,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.31,
-          "importance": 0.4725,
+          "importance": 0.4225,
           "by": "jev"
         }
       ]
@@ -1718,19 +1718,19 @@
         {
           "type": "fact",
           "remember": 0.08,
-          "importance": 0.0675,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.08,
-          "importance": 0.0725,
+          "importance": 0.09,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.09,
-          "importance": 0.0625,
+          "importance": 0.0775,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.08,
+          "importance": 0.0675,
           "by": "jev"
         }
       ]
@@ -1755,14 +1755,14 @@
         },
         {
           "type": "fact",
-          "remember": 0.05,
-          "importance": 0.0275,
+          "remember": 0.06,
+          "importance": 0.03,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.0275,
+          "importance": 0.035,
           "by": "jev"
         }
       ]
@@ -1782,19 +1782,19 @@
         {
           "type": "pitfall",
           "remember": 0.05,
-          "importance": 0.235,
-          "by": "jev"
-        },
-        {
-          "type": "pitfall",
-          "remember": 0.05,
           "importance": 0.245,
           "by": "jev"
         },
         {
           "type": "pitfall",
-          "remember": 0.05,
-          "importance": 0.25,
+          "remember": 0.06,
+          "importance": 0.275,
+          "by": "jev"
+        },
+        {
+          "type": "pitfall",
+          "remember": 0.06,
+          "importance": 0.255,
           "by": "jev"
         }
       ]
@@ -1813,14 +1813,14 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.07,
-          "importance": 0.3175,
+          "remember": 0.06,
+          "importance": 0.3125,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.07,
-          "importance": 0.3225,
+          "remember": 0.06,
+          "importance": 0.3275,
           "by": "jev"
         },
         {
@@ -1845,20 +1845,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.2,
-          "importance": 0.35,
+          "remember": 0.17,
+          "importance": 0.335,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.18,
+          "remember": 0.19,
           "importance": 0.365,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.21,
-          "importance": 0.345,
+          "remember": 0.19,
+          "importance": 0.38,
           "by": "jev"
         }
       ]
@@ -1876,21 +1876,21 @@
       },
       "jev": [
         {
-          "type": "constraint",
+          "type": "decision",
           "remember": 0.41,
-          "importance": 0.4575,
+          "importance": 0.485,
           "by": "jev"
         },
         {
           "type": "constraint",
-          "remember": 0.41,
-          "importance": 0.475,
+          "remember": 0.43,
+          "importance": 0.4725,
           "by": "jev"
         },
         {
           "type": "constraint",
-          "remember": 0.42,
-          "importance": 0.4575,
+          "remember": 0.39,
+          "importance": 0.45,
           "by": "jev"
         }
       ]
@@ -1910,19 +1910,19 @@
         {
           "type": "fact",
           "remember": 0.08,
-          "importance": 0.0725,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.08,
-          "importance": 0.0775,
+          "importance": 0.08,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.07,
-          "importance": 0.0775,
+          "importance": 0.085,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.07,
+          "importance": 0.0925,
           "by": "jev"
         }
       ]
@@ -1941,19 +1941,19 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.59,
-          "importance": 0.86,
+          "remember": 0.6,
+          "importance": 0.8525,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.58,
-          "importance": 0.855,
+          "remember": 0.6,
+          "importance": 0.8625,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.62,
+          "remember": 0.6,
           "importance": 0.86,
           "by": "jev"
         }
@@ -1973,20 +1973,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.04,
-          "importance": 0.1675,
+          "remember": 0.05,
+          "importance": 0.1775,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.185,
+          "importance": 0.1775,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.1825,
+          "importance": 0.1725,
           "by": "jev"
         }
       ]
@@ -2006,13 +2006,13 @@
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.245,
+          "importance": 0.235,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.2425,
+          "importance": 0.24,
           "by": "jev"
         },
         {
@@ -2038,19 +2038,19 @@
         {
           "type": "decision",
           "remember": 0.29,
-          "importance": 0.52,
+          "importance": 0.5125,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.3,
-          "importance": 0.535,
+          "remember": 0.27,
+          "importance": 0.5175,
           "by": "jev"
         },
         {
           "type": "decision",
           "remember": 0.28,
-          "importance": 0.52,
+          "importance": 0.53,
           "by": "jev"
         }
       ]
@@ -2070,19 +2070,19 @@
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.035,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.06,
           "importance": 0.03,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.06,
-          "importance": 0.035,
+          "remember": 0.05,
+          "importance": 0.0325,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.05,
+          "importance": 0.04,
           "by": "jev"
         }
       ]
@@ -2102,19 +2102,19 @@
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.1775,
+          "importance": 0.1675,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.02,
+          "importance": 0.1625,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.1725,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.03,
-          "importance": 0.1725,
+          "importance": 0.1575,
           "by": "jev"
         }
       ]
@@ -2133,20 +2133,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.06,
-          "importance": 0.2575,
+          "remember": 0.05,
+          "importance": 0.235,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.2375,
+          "importance": 0.25,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.25,
+          "importance": 0.24,
           "by": "jev"
         }
       ]
@@ -2165,19 +2165,19 @@
       "jev": [
         {
           "type": "fact",
+          "remember": 0.15,
+          "importance": 0.0875,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
           "remember": 0.16,
-          "importance": 0.095,
+          "importance": 0.09,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.15,
-          "importance": 0.1025,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.17,
           "importance": 0.09,
           "by": "jev"
         }
@@ -2197,20 +2197,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.44,
-          "importance": 0.685,
+          "remember": 0.45,
+          "importance": 0.6975,
           "by": "jev"
         },
         {
           "type": "decision",
           "remember": 0.43,
-          "importance": 0.6775,
+          "importance": 0.6975,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.44,
-          "importance": 0.6975,
+          "remember": 0.45,
+          "importance": 0.6875,
           "by": "jev"
         }
       ]
@@ -2230,19 +2230,19 @@
         {
           "type": "fact",
           "remember": 0.24,
-          "importance": 0.1675,
+          "importance": 0.17,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.25,
-          "importance": 0.1625,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.24,
+          "remember": 0.26,
           "importance": 0.1575,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.23,
+          "importance": 0.1425,
           "by": "jev"
         }
       ]
@@ -2261,20 +2261,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.23,
-          "importance": 0.365,
+          "remember": 0.21,
+          "importance": 0.3725,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.22,
-          "importance": 0.3675,
+          "remember": 0.24,
+          "importance": 0.3625,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.23,
-          "importance": 0.375,
+          "remember": 0.21,
+          "importance": 0.355,
           "by": "jev"
         }
       ]
@@ -2293,20 +2293,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.06,
-          "importance": 0.245,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
           "remember": 0.05,
-          "importance": 0.24,
+          "importance": 0.2425,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.06,
-          "importance": 0.235,
+          "importance": 0.2375,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.06,
+          "importance": 0.24,
           "by": "jev"
         }
       ]
@@ -2325,20 +2325,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.4,
-          "importance": 0.255,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.37,
-          "importance": 0.2825,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
           "remember": 0.38,
-          "importance": 0.25,
+          "importance": 0.2575,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.39,
+          "importance": 0.23,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.39,
+          "importance": 0.2475,
           "by": "jev"
         }
       ]
@@ -2357,8 +2357,8 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.03,
-          "importance": 0.1875,
+          "remember": 0.04,
+          "importance": 0.195,
           "by": "jev"
         },
         {
@@ -2370,7 +2370,7 @@
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.1875,
+          "importance": 0.1925,
           "by": "jev"
         }
       ]
@@ -2389,20 +2389,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.48,
-          "importance": 0.55,
+          "remember": 0.47,
+          "importance": 0.5525,
           "by": "jev"
         },
         {
           "type": "decision",
           "remember": 0.48,
-          "importance": 0.5775,
+          "importance": 0.545,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.49,
-          "importance": 0.555,
+          "remember": 0.5,
+          "importance": 0.575,
           "by": "jev"
         }
       ]
@@ -2422,19 +2422,19 @@
         {
           "type": "fact",
           "remember": 0.03,
+          "importance": 0.06,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.03,
           "importance": 0.055,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.0575,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.03,
-          "importance": 0.065,
+          "importance": 0.055,
           "by": "jev"
         }
       ]
@@ -2453,20 +2453,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.03,
-          "importance": 0.05,
+          "remember": 0.02,
+          "importance": 0.0425,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.02,
-          "importance": 0.045,
+          "importance": 0.04,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.0375,
+          "importance": 0.04,
           "by": "jev"
         }
       ]
@@ -2485,20 +2485,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.16,
-          "importance": 0.4725,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.17,
-          "importance": 0.4775,
+          "remember": 0.19,
+          "importance": 0.4675,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.18,
           "importance": 0.475,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.17,
+          "importance": 0.4625,
           "by": "jev"
         }
       ]
@@ -2517,20 +2517,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.35,
-          "importance": 0.59,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
-          "remember": 0.37,
-          "importance": 0.6,
+          "remember": 0.34,
+          "importance": 0.5875,
           "by": "jev"
         },
         {
           "type": "decision",
           "remember": 0.33,
-          "importance": 0.61,
+          "importance": 0.6075,
+          "by": "jev"
+        },
+        {
+          "type": "decision",
+          "remember": 0.34,
+          "importance": 0.58,
           "by": "jev"
         }
       ]
@@ -2549,19 +2549,19 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.08,
-          "importance": 0.1175,
+          "remember": 0.07,
+          "importance": 0.105,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.09,
-          "importance": 0.1225,
+          "importance": 0.1425,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.09,
+          "remember": 0.07,
           "importance": 0.115,
           "by": "jev"
         }
@@ -2582,19 +2582,19 @@
         {
           "type": "fact",
           "remember": 0.16,
-          "importance": 0.1825,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.14,
-          "importance": 0.1875,
+          "importance": 0.185,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.15,
-          "importance": 0.1725,
+          "importance": 0.1825,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.15,
+          "importance": 0.165,
           "by": "jev"
         }
       ]
@@ -2614,19 +2614,19 @@
         {
           "type": "fact",
           "remember": 0.09,
-          "importance": 0.275,
+          "importance": 0.2825,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.1,
-          "importance": 0.2925,
+          "importance": 0.29,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.09,
-          "importance": 0.2775,
+          "importance": 0.3,
           "by": "jev"
         }
       ]
@@ -2645,20 +2645,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.12,
-          "importance": 0.2475,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.12,
-          "importance": 0.2375,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
           "remember": 0.11,
           "importance": 0.2325,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.12,
+          "importance": 0.24,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.12,
+          "importance": 0.235,
           "by": "jev"
         }
       ]
@@ -2677,20 +2677,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.36,
-          "importance": 0.5425,
+          "remember": 0.39,
+          "importance": 0.5275,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.36,
-          "importance": 0.5125,
+          "remember": 0.35,
+          "importance": 0.5325,
           "by": "jev"
         },
         {
           "type": "decision",
           "remember": 0.37,
-          "importance": 0.525,
+          "importance": 0.505,
           "by": "jev"
         }
       ]
@@ -2709,20 +2709,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.34,
-          "importance": 0.425,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
-          "remember": 0.34,
-          "importance": 0.4625,
+          "remember": 0.36,
+          "importance": 0.47,
           "by": "jev"
         },
         {
           "type": "decision",
           "remember": 0.35,
           "importance": 0.42,
+          "by": "jev"
+        },
+        {
+          "type": "decision",
+          "remember": 0.34,
+          "importance": 0.41,
           "by": "jev"
         }
       ]
@@ -2741,20 +2741,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.04,
-          "importance": 0.04,
+          "remember": 0.06,
+          "importance": 0.045,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.0575,
+          "importance": 0.0525,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.05,
+          "importance": 0.0475,
           "by": "jev"
         }
       ]
@@ -2773,20 +2773,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.15,
-          "importance": 0.31,
+          "remember": 0.14,
+          "importance": 0.305,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.14,
-          "importance": 0.315,
+          "importance": 0.3075,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.15,
-          "importance": 0.3125,
+          "remember": 0.13,
+          "importance": 0.3,
           "by": "jev"
         }
       ]
@@ -2804,21 +2804,21 @@
       },
       "jev": [
         {
-          "type": "constraint",
+          "type": "decision",
           "remember": 0.39,
-          "importance": 0.4725,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
-          "remember": 0.38,
-          "importance": 0.4875,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
-          "remember": 0.37,
           "importance": 0.49,
+          "by": "jev"
+        },
+        {
+          "type": "decision",
+          "remember": 0.4,
+          "importance": 0.5425,
+          "by": "jev"
+        },
+        {
+          "type": "constraint",
+          "remember": 0.4,
+          "importance": 0.5075,
           "by": "jev"
         }
       ]
@@ -2838,19 +2838,19 @@
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.1175,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.05,
-          "importance": 0.115,
+          "importance": 0.1075,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
           "importance": 0.105,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.04,
+          "importance": 0.1075,
           "by": "jev"
         }
       ]
@@ -2870,19 +2870,19 @@
         {
           "type": "fact",
           "remember": 0.19,
-          "importance": 0.32,
+          "importance": 0.34,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.2,
-          "importance": 0.3425,
+          "remember": 0.21,
+          "importance": 0.305,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.18,
-          "importance": 0.3225,
+          "remember": 0.21,
+          "importance": 0.325,
           "by": "jev"
         }
       ]
@@ -2901,20 +2901,20 @@
       "jev": [
         {
           "type": "fact",
+          "remember": 0.1,
+          "importance": 0.3025,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
           "remember": 0.09,
           "importance": 0.325,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.1,
-          "importance": 0.33,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
           "remember": 0.09,
-          "importance": 0.3125,
+          "importance": 0.31,
           "by": "jev"
         }
       ]
@@ -2934,19 +2934,19 @@
         {
           "type": "fact",
           "remember": 0.3,
-          "importance": 0.18,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.32,
-          "importance": 0.1925,
+          "importance": 0.1975,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.31,
-          "importance": 0.1875,
+          "importance": 0.1925,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.33,
+          "importance": 0.1775,
           "by": "jev"
         }
       ]
@@ -2965,20 +2965,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.45,
+          "remember": 0.41,
+          "importance": 0.5825,
+          "by": "jev"
+        },
+        {
+          "type": "decision",
+          "remember": 0.44,
           "importance": 0.585,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.46,
-          "importance": 0.5775,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
-          "remember": 0.46,
-          "importance": 0.57,
+          "remember": 0.42,
+          "importance": 0.575,
           "by": "jev"
         }
       ]
@@ -2997,20 +2997,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.4,
-          "importance": 0.425,
+          "remember": 0.41,
+          "importance": 0.4225,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.38,
-          "importance": 0.435,
+          "remember": 0.42,
+          "importance": 0.415,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.38,
-          "importance": 0.425,
+          "remember": 0.41,
+          "importance": 0.45,
           "by": "jev"
         }
       ]
@@ -3030,19 +3030,19 @@
         {
           "type": "fact",
           "remember": 0.06,
-          "importance": 0.175,
+          "importance": 0.1675,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.06,
-          "importance": 0.185,
+          "importance": 0.1825,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.05,
-          "importance": 0.1775,
+          "remember": 0.06,
+          "importance": 0.1725,
           "by": "jev"
         }
       ]
@@ -3062,13 +3062,13 @@
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.225,
+          "importance": 0.2375,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.2325,
+          "importance": 0.22,
           "by": "jev"
         },
         {
@@ -3094,19 +3094,19 @@
         {
           "type": "fact",
           "remember": 0.13,
-          "importance": 0.3625,
+          "importance": 0.345,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.13,
-          "importance": 0.325,
+          "remember": 0.14,
+          "importance": 0.36,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.11,
-          "importance": 0.335,
+          "remember": 0.14,
+          "importance": 0.3475,
           "by": "jev"
         }
       ]
@@ -3125,20 +3125,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.08,
-          "importance": 0.3075,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.05,
-          "importance": 0.3125,
+          "remember": 0.07,
+          "importance": 0.325,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.07,
-          "importance": 0.31,
+          "importance": 0.2925,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.07,
+          "importance": 0.3025,
           "by": "jev"
         }
       ]
@@ -3157,12 +3157,6 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.05,
-          "importance": 0.21,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
           "remember": 0.04,
           "importance": 0.2025,
           "by": "jev"
@@ -3170,7 +3164,13 @@
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.205,
+          "importance": 0.1975,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.04,
+          "importance": 0.21,
           "by": "jev"
         }
       ]
@@ -3190,13 +3190,13 @@
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.2025,
+          "importance": 0.1975,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.1925,
+          "importance": 0.2075,
           "by": "jev"
         },
         {
@@ -3222,19 +3222,19 @@
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.195,
+          "importance": 0.18,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.1975,
+          "importance": 0.1925,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.1975,
+          "importance": 0.19,
           "by": "jev"
         }
       ]
@@ -3254,19 +3254,19 @@
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.2725,
+          "importance": 0.265,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.26,
+          "importance": 0.2675,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.2625,
+          "importance": 0.265,
           "by": "jev"
         }
       ]
@@ -3286,19 +3286,19 @@
         {
           "type": "fact",
           "remember": 0.06,
+          "importance": 0.3675,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.06,
+          "importance": 0.37,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.06,
           "importance": 0.36,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.06,
-          "importance": 0.345,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.06,
-          "importance": 0.3725,
           "by": "jev"
         }
       ]
@@ -3318,19 +3318,19 @@
         {
           "type": "fact",
           "remember": 0.13,
-          "importance": 0.315,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.14,
           "importance": 0.325,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.14,
-          "importance": 0.325,
+          "importance": 0.335,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.13,
+          "importance": 0.3125,
           "by": "jev"
         }
       ]
@@ -3349,20 +3349,20 @@
       "jev": [
         {
           "type": "constraint",
-          "remember": 0.29,
-          "importance": 0.685,
+          "remember": 0.3,
+          "importance": 0.665,
           "by": "jev"
         },
         {
           "type": "constraint",
-          "remember": 0.31,
-          "importance": 0.6825,
+          "remember": 0.3,
+          "importance": 0.69,
           "by": "jev"
         },
         {
           "type": "constraint",
           "remember": 0.32,
-          "importance": 0.6775,
+          "importance": 0.6875,
           "by": "jev"
         }
       ]
@@ -3381,20 +3381,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.06,
-          "importance": 0.1125,
+          "remember": 0.07,
+          "importance": 0.1175,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.06,
-          "importance": 0.115,
+          "importance": 0.1175,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.08,
-          "importance": 0.12,
+          "remember": 0.06,
+          "importance": 0.105,
           "by": "jev"
         }
       ]
@@ -3414,19 +3414,19 @@
         {
           "type": "fact",
           "remember": 0.06,
-          "importance": 0.22,
+          "importance": 0.1975,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.215,
+          "importance": 0.1875,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.06,
-          "importance": 0.235,
+          "importance": 0.23,
           "by": "jev"
         }
       ]
@@ -3446,19 +3446,19 @@
         {
           "type": "fact",
           "remember": 0.13,
+          "importance": 0.1775,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.12,
           "importance": 0.1725,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.12,
-          "importance": 0.175,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.12,
-          "importance": 0.18,
+          "importance": 0.185,
           "by": "jev"
         }
       ]
@@ -3476,21 +3476,21 @@
       },
       "jev": [
         {
-          "type": "fact",
+          "type": "pitfall",
           "remember": 0.05,
-          "importance": 0.225,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.05,
-          "importance": 0.215,
+          "importance": 0.2325,
           "by": "jev"
         },
         {
           "type": "pitfall",
           "remember": 0.05,
-          "importance": 0.235,
+          "importance": 0.22,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.04,
+          "importance": 0.225,
           "by": "jev"
         }
       ]
@@ -3510,19 +3510,19 @@
         {
           "type": "fact",
           "remember": 0.08,
-          "importance": 0.1,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.07,
-          "importance": 0.1125,
+          "importance": 0.12,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.08,
-          "importance": 0.1,
+          "importance": 0.1225,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.08,
+          "importance": 0.105,
           "by": "jev"
         }
       ]
@@ -3542,19 +3542,19 @@
         {
           "type": "fact",
           "remember": 0.06,
-          "importance": 0.2275,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.05,
-          "importance": 0.2225,
+          "importance": 0.2325,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.06,
-          "importance": 0.23,
+          "importance": 0.2275,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.06,
+          "importance": 0.245,
           "by": "jev"
         }
       ]
@@ -3574,19 +3574,19 @@
         {
           "type": "fact",
           "remember": 0.09,
-          "importance": 0.2075,
+          "importance": 0.2225,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.09,
+          "remember": 0.08,
           "importance": 0.21,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.08,
-          "importance": 0.2125,
+          "importance": 0.2225,
           "by": "jev"
         }
       ]
@@ -3605,20 +3605,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.06,
-          "importance": 0.0825,
+          "remember": 0.05,
+          "importance": 0.075,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.0625,
+          "importance": 0.0675,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.06,
-          "importance": 0.07,
+          "importance": 0.08,
           "by": "jev"
         }
       ]
@@ -3638,19 +3638,19 @@
         {
           "type": "fact",
           "remember": 0.09,
-          "importance": 0.2875,
+          "importance": 0.2925,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.1,
+          "importance": 0.29,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.09,
           "importance": 0.2825,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.09,
-          "importance": 0.3075,
           "by": "jev"
         }
       ]
@@ -3669,20 +3669,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.04,
-          "importance": 0.145,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.04,
-          "importance": 0.16,
+          "remember": 0.03,
+          "importance": 0.1725,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.165,
+          "importance": 0.1525,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.03,
+          "importance": 0.155,
           "by": "jev"
         }
       ]
@@ -3702,13 +3702,13 @@
         {
           "type": "fact",
           "remember": 0.07,
-          "importance": 0.1525,
+          "importance": 0.1725,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.07,
-          "importance": 0.165,
+          "importance": 0.1675,
           "by": "jev"
         },
         {
@@ -3734,19 +3734,19 @@
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.0675,
+          "importance": 0.06,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.065,
+          "importance": 0.055,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.0675,
+          "importance": 0.06,
           "by": "jev"
         }
       ]
@@ -3766,19 +3766,19 @@
         {
           "type": "fact",
           "remember": 0.04,
+          "importance": 0.125,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.05,
+          "importance": 0.125,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.04,
           "importance": 0.14,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.04,
-          "importance": 0.13,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.04,
-          "importance": 0.1325,
           "by": "jev"
         }
       ]
@@ -3798,19 +3798,19 @@
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.21,
+          "importance": 0.2225,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.225,
+          "importance": 0.2175,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.05,
-          "importance": 0.2275,
+          "remember": 0.04,
+          "importance": 0.215,
           "by": "jev"
         }
       ]
@@ -3830,18 +3830,18 @@
         {
           "type": "fact",
           "remember": 0.12,
-          "importance": 0.225,
+          "importance": 0.2275,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.12,
-          "importance": 0.2425,
+          "importance": 0.23,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.12,
+          "remember": 0.11,
           "importance": 0.225,
           "by": "jev"
         }
@@ -3862,7 +3862,7 @@
         {
           "type": "fact",
           "remember": 0.02,
-          "importance": 0.0225,
+          "importance": 0.0275,
           "by": "jev"
         },
         {
@@ -3874,7 +3874,7 @@
         {
           "type": "fact",
           "remember": 0.02,
-          "importance": 0.02,
+          "importance": 0.0225,
           "by": "jev"
         }
       ]
@@ -3894,19 +3894,19 @@
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.105,
+          "importance": 0.125,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.04,
+          "importance": 0.115,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
           "importance": 0.1175,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.04,
-          "importance": 0.11,
           "by": "jev"
         }
       ]
@@ -3924,21 +3924,21 @@
       },
       "jev": [
         {
-          "type": "fact",
+          "type": "pitfall",
           "remember": 0.08,
-          "importance": 0.3375,
+          "importance": 0.3625,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.09,
+          "importance": 0.3625,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.08,
-          "importance": 0.3775,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.08,
-          "importance": 0.38,
+          "importance": 0.3575,
           "by": "jev"
         }
       ]
@@ -3958,18 +3958,18 @@
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.145,
+          "importance": 0.135,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.1275,
+          "importance": 0.135,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.05,
+          "remember": 0.04,
           "importance": 0.13,
           "by": "jev"
         }
@@ -3989,20 +3989,20 @@
       "jev": [
         {
           "type": "fact",
+          "remember": 0.18,
+          "importance": 0.2925,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
           "remember": 0.17,
-          "importance": 0.285,
+          "importance": 0.315,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.21,
+          "remember": 0.19,
           "importance": 0.285,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.21,
-          "importance": 0.28,
           "by": "jev"
         }
       ]
@@ -4021,20 +4021,20 @@
       "jev": [
         {
           "type": "decision",
-          "remember": 0.43,
-          "importance": 0.695,
-          "by": "jev"
-        },
-        {
-          "type": "decision",
           "remember": 0.4,
-          "importance": 0.705,
+          "importance": 0.685,
           "by": "jev"
         },
         {
           "type": "decision",
-          "remember": 0.42,
-          "importance": 0.6775,
+          "remember": 0.43,
+          "importance": 0.68,
+          "by": "jev"
+        },
+        {
+          "type": "decision",
+          "remember": 0.43,
+          "importance": 0.6825,
           "by": "jev"
         }
       ]
@@ -4066,7 +4066,7 @@
         {
           "type": "fact",
           "remember": 0.02,
-          "importance": 0.015,
+          "importance": 0.0125,
           "by": "jev"
         }
       ]
@@ -4085,14 +4085,14 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.11,
-          "importance": 0.25,
+          "remember": 0.1,
+          "importance": 0.23,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.1,
-          "importance": 0.2425,
+          "importance": 0.245,
           "by": "jev"
         },
         {
@@ -4117,20 +4117,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.03,
-          "importance": 0.1775,
+          "remember": 0.04,
+          "importance": 0.1675,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.1775,
+          "importance": 0.18,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.175,
+          "importance": 0.1825,
           "by": "jev"
         }
       ]
@@ -4156,13 +4156,13 @@
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.22,
+          "importance": 0.2175,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.05,
-          "importance": 0.2225,
+          "importance": 0.22,
           "by": "jev"
         }
       ]
@@ -4182,19 +4182,19 @@
         {
           "type": "fact",
           "remember": 0.02,
+          "importance": 0.135,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.02,
+          "importance": 0.135,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.02,
           "importance": 0.1325,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.02,
-          "importance": 0.13,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.02,
-          "importance": 0.125,
           "by": "jev"
         }
       ]
@@ -4213,20 +4213,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.26,
-          "importance": 0.165,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.26,
-          "importance": 0.1575,
+          "remember": 0.23,
+          "importance": 0.155,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.24,
-          "importance": 0.145,
+          "importance": 0.1475,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.23,
+          "importance": 0.165,
           "by": "jev"
         }
       ]
@@ -4246,19 +4246,19 @@
         {
           "type": "fact",
           "remember": 0.07,
+          "importance": 0.28,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.07,
           "importance": 0.295,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.07,
-          "importance": 0.2825,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.07,
-          "importance": 0.29,
+          "importance": 0.2875,
           "by": "jev"
         }
       ]
@@ -4277,14 +4277,14 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.08,
-          "importance": 0.2025,
+          "remember": 0.07,
+          "importance": 0.2,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.06,
-          "importance": 0.2075,
+          "remember": 0.07,
+          "importance": 0.2125,
           "by": "jev"
         },
         {
@@ -4309,20 +4309,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.03,
-          "importance": 0.195,
+          "remember": 0.04,
+          "importance": 0.1875,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.19,
+          "importance": 0.1975,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.1825,
+          "importance": 0.1875,
           "by": "jev"
         }
       ]
@@ -4342,19 +4342,19 @@
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.235,
+          "importance": 0.2375,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.05,
+          "importance": 0.2375,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.24,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.04,
-          "importance": 0.2425,
+          "importance": 0.2325,
           "by": "jev"
         }
       ]
@@ -4374,12 +4374,6 @@
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.0575,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.03,
           "importance": 0.0525,
           "by": "jev"
         },
@@ -4387,6 +4381,12 @@
           "type": "fact",
           "remember": 0.03,
           "importance": 0.05,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.03,
+          "importance": 0.0475,
           "by": "jev"
         }
       ]
@@ -4406,7 +4406,7 @@
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.15,
+          "importance": 0.16,
           "by": "jev"
         },
         {
@@ -4418,7 +4418,7 @@
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.1525,
+          "importance": 0.1375,
           "by": "jev"
         }
       ]
@@ -4444,13 +4444,13 @@
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.04,
+          "importance": 0.0425,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.0375,
+          "importance": 0.0425,
           "by": "jev"
         }
       ]
@@ -4469,14 +4469,14 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.05,
-          "importance": 0.0125,
+          "remember": 0.06,
+          "importance": 0.015,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.06,
-          "importance": 0.015,
+          "remember": 0.05,
+          "importance": 0.0175,
           "by": "jev"
         },
         {
@@ -4501,19 +4501,19 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.05,
+          "remember": 0.06,
+          "importance": 0.145,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.07,
           "importance": 0.135,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.07,
-          "importance": 0.13,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.06,
           "importance": 0.1375,
           "by": "jev"
         }
@@ -4533,20 +4533,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.13,
+          "remember": 0.11,
           "importance": 0.07,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.14,
-          "importance": 0.0875,
+          "remember": 0.12,
+          "importance": 0.08,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.13,
-          "importance": 0.08,
+          "remember": 0.11,
+          "importance": 0.085,
           "by": "jev"
         }
       ]
@@ -4572,13 +4572,13 @@
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.1125,
+          "importance": 0.1225,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.1125,
+          "importance": 0.12,
           "by": "jev"
         }
       ]
@@ -4597,20 +4597,20 @@
       "jev": [
         {
           "type": "fact",
-          "remember": 0.11,
-          "importance": 0.2775,
+          "remember": 0.12,
+          "importance": 0.2875,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.12,
+          "remember": 0.13,
           "importance": 0.28,
           "by": "jev"
         },
         {
           "type": "fact",
-          "remember": 0.12,
-          "importance": 0.285,
+          "remember": 0.13,
+          "importance": 0.2925,
           "by": "jev"
         }
       ]
@@ -4629,19 +4629,19 @@
       "jev": [
         {
           "type": "fact",
+          "remember": 0.02,
+          "importance": 0.25,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
+          "remember": 0.02,
+          "importance": 0.2475,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
           "remember": 0.03,
-          "importance": 0.255,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.02,
-          "importance": 0.2575,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.02,
           "importance": 0.2525,
           "by": "jev"
         }
@@ -4661,6 +4661,12 @@
       "jev": [
         {
           "type": "fact",
+          "remember": 0.04,
+          "importance": 0.0675,
+          "by": "jev"
+        },
+        {
+          "type": "fact",
           "remember": 0.05,
           "importance": 0.065,
           "by": "jev"
@@ -4668,13 +4674,7 @@
         {
           "type": "fact",
           "remember": 0.04,
-          "importance": 0.07,
-          "by": "jev"
-        },
-        {
-          "type": "fact",
-          "remember": 0.05,
-          "importance": 0.065,
+          "importance": 0.0725,
           "by": "jev"
         }
       ]
@@ -4694,19 +4694,19 @@
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.08,
+          "importance": 0.0775,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.08,
+          "importance": 0.0775,
           "by": "jev"
         },
         {
           "type": "fact",
           "remember": 0.03,
-          "importance": 0.0825,
+          "importance": 0.0775,
           "by": "jev"
         }
       ]
