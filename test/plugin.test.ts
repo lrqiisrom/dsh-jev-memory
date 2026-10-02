@@ -376,6 +376,24 @@ test('a credential service that arrives after mount still switches the judge to 
   assert.equal(start.credentialRef, 'TYPESAFE_API_KEY')
 })
 
+test('the start line says which gate is live, not just which judge', async () => {
+  // Two runs can both log `judge: jev` while asking a different question at a different
+  // threshold, and the ledger used to be unable to tell them apart — so "did the numbers move
+  // because of the change or because of the version" could not be answered from the file.
+  const { root } = await mount({ judge: 'auto', minRemember: 0.12 }, 'test-key-from-credentials')
+  const start = await startEntry(root)
+  assert.equal(start.gate.minRemember, 0.12)
+  assert.deepEqual(start.gate.types, ['constraint', 'pitfall', 'decision'])
+  assert.match(start.gate.rememberQuestionHash, /^[0-9a-f]{12}$/u)
+  assert.ok(start.gate.rememberQuestionChars > 50, 'the wording is recorded by size as well as by hash')
+
+  // The hash follows the effective question, so a config override shows up instead of being
+  // recorded as the shipped default.
+  const overridden = await mount({ judge: 'auto', jev: { rememberQuestion: '换一个问题？' } }, 'test-key-from-credentials')
+  const other = await startEntry(overridden.root)
+  assert.notEqual(other.gate.rememberQuestionHash, start.gate.rememberQuestionHash)
+})
+
 test('without any credential source the ledger says so instead of staying silent', async () => {
   await withTempHome(async (home) => {
     const { root } = await mount({ judge: 'auto' })
