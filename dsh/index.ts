@@ -63,7 +63,7 @@ import {
   type EmbeddingClient,
   type EmbeddingSettings,
 } from './lib/embedding.ts'
-import { createJevClient, JEV_DEFAULTS } from './lib/jev.ts'
+import { createJevClient, JEV_DEFAULTS, REMEMBER_QUESTION } from './lib/jev.ts'
 import {
   createNormalizer,
   NORMALIZE_DEFAULTS,
@@ -73,7 +73,7 @@ import {
 import { DEFAULT_QUOTA, inScope, renderRecall, searchMemories, selectMemories } from './lib/recall.ts'
 import { isNoteworthyVeto, signatureOf } from './lib/signals.ts'
 import { createMemoryStore, MEMORY_TYPES, type MemoryRecord } from './lib/store.ts'
-import { estimateTokens, excerpt } from './lib/text.ts'
+import { estimateTokens, excerpt, hashText } from './lib/text.ts'
 import type { Candidate, ExtractOptions, TurnEvent } from './lib/extract.ts'
 import type { Judge } from './lib/judge.ts'
 import type { JevSettings } from './lib/jev.ts'
@@ -492,7 +492,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.16.0'
+export const version = '0.17.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -1027,6 +1027,21 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         judge: judge.kind,
         conflictRanking: config.conflictRanking,
         searchRanking: config.searchRanking,
+        // The gate, not just the judge. Two runs can both say `judge: jev` while asking the
+        // model different questions at different thresholds, and the ledger could not tell
+        // them apart — which is exactly the question "did the numbers move because of my
+        // change or because of the version?" that cost a round of confusion. The question is
+        // recorded as a hash plus its length: enough to tell two wordings apart, short enough
+        // not to paste a paragraph of prompt into every start line.
+        gate: {
+          minRemember: config.minRemember,
+          minImportance: config.minImportance,
+          types: config.types,
+          // The *effective* question, so a config override is visible too rather than being
+          // recorded as the shipped default.
+          rememberQuestionHash: hashText(config.jev?.rememberQuestion ?? REMEMBER_QUESTION),
+          rememberQuestionChars: (config.jev?.rememberQuestion ?? REMEMBER_QUESTION).length,
+        },
         embedding: embeddingState,
         normalize: normalizeState,
         // `source` is the field whose absence cost a debugging round: `ready:false`
