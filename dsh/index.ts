@@ -1432,8 +1432,36 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   }
 
   ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => {
-    if (!config.writeEnabled || !ready) return
     const turnHeader = agent?.session?.header
+
+    // Archive before every guard and every flag.
+    //
+    // The archive is the evidence layer, and evidence that depends on readiness or on a feature
+    // flag has holes exactly where someone would later want it: the first turns after a restart
+    // (the store is still loading, `ready` is false, and those turns used to vanish) and delegated
+    // sessions (whose messages are the parent's instructions — not memories, but real content,
+    // and the only record of what a subagent was actually told). Extraction stays behind the
+    // guards below; this does not.
+    try {
+      const archived = archiveMessages(collectTurnEvents(agent?.session))
+      if (archived.length > 0) {
+        void store.archive(
+          archived.map((message) => ({
+            sessionId: turnHeader?.id ?? null,
+            seq: message.seq,
+            role: message.role,
+            at: Date.now(),
+            cwd: turnHeader?.cwd ?? null,
+            text: message.text,
+          })),
+        )
+        void store.ledger({ kind: 'archive', count: archived.length, roles: [...new Set(archived.map((m) => m.role))] })
+      }
+    } catch (error) {
+      log('warn', `archive skipped: ${String(error)}`)
+    }
+
+    if (!config.writeEnabled || !ready) return
     if (config.writeSkipSubagents && (turnHeader?.delegationDepth ?? 0) > 0) {
       void store.ledger({ kind: 'skip', reason: 'subagent-session', sessionId: turnHeader?.id ?? null, turn })
       return
@@ -1468,27 +1496,6 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const events = collectTurnEvents(session)
       const header = session?.header
       const cwd = header?.cwd ?? null
-
-      // Archive first, before any judgement. Everything downstream — the screens, the gate,
-      // the conflict window — is a decision, and a decision that cannot be revisited is a
-      // deletion in disguise. Measured cost of not having this: 122 labelled rows marked
-      // "don't remember" that the plugin had already discarded, so when the gate changed they
-      // could not be re-read. The assistant's own messages are archived too, because the
-      // question "is this the model's words?" can only be answered against them.
-      const archived = archiveMessages(events)
-      if (archived.length > 0) {
-        void store.archive(
-          archived.map((message) => ({
-            sessionId: header?.id ?? null,
-            seq: message.seq,
-            role: message.role,
-            at: Date.now(),
-            cwd,
-            text: message.text,
-          })),
-        )
-        void store.ledger({ kind: 'archive', count: archived.length, roles: [...new Set(archived.map((m) => m.role))] })
-      }
 
       const candidates = extractCandidates(events, {
         ...config.extract,

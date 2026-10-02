@@ -362,6 +362,22 @@ test('the archive keeps the assistant messages too', async () => {
   assert.match(archivedHits(found)[0]!.text, /我建议先改配置项/)
 })
 
+test('a subagent turn is archived even though it is not extracted', async () => {
+  // Two ways a turn used to vanish from the evidence layer: a session below the delegation depth
+  // (the parent's instructions, which must not become memories but are still content) and a turn
+  // that arrives before the store finished loading. Extraction stays behind the guards; the
+  // archive does not, because a hole in the evidence is not fixable later.
+  const { captured } = await mount()
+  const sub = fakeSession({ id: 'sub-1', events: REFUSED_TURN })
+  sub.header!.delegationDepth = 1
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 'sub-1', session: sub }, turn: 1, signal: undefined })
+
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+  const found = await search.execute({ query: '贴出来' }, { agent: { session: sub } })
+  assert.equal(promoted(found).length, 0, 'a delegated session writes no memories')
+  assert.equal(archivedHits(found).length, 1, 'but its messages are archived')
+})
+
 test('forgetting an archived message deletes it and nothing else', async () => {
   // A memory the person cannot get rid of is worse than no memory, and that applies to a layer
   // they can now search. The delete matches on session *and* sequence: comparing the sequence

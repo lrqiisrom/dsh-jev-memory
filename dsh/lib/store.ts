@@ -217,6 +217,18 @@ export function createMemoryStore({ root, now = Date.now, log = () => {} }: Memo
 const ARCHIVE_MEMORY_LIMIT = 2000
 
 /**
+ * How many day files the searchable window covers.
+ *
+ * The date in the filename is what makes this a one-line rule instead of a scan — but only
+ * because the files are named by day. Before this it read the newest file alone, which made the
+ * search window look like a retention policy: a message from two days ago was on disk and
+ * unfindable, and nothing said so. Seven days is a bound on prompt-time cost, not a claim about
+ * what is worth keeping; the retention question (how long anything stays at all) is still open
+ * and deliberately not answered by this constant.
+ */
+const ARCHIVE_SEARCH_DAYS = 7
+
+/**
  * The id under which one archived message is addressable.
  *
  * Derived from where the message came from rather than from its position in the window, so an
@@ -342,12 +354,14 @@ export class MemoryStore {
       const dir = this.#archiveDir()
       const names = (await readdir(dir)).filter((name) => name.endsWith('.jsonl')).sort()
       if (names.length === 0) return
-      const raw = await readFile(join(dir, names[names.length - 1]!), 'utf8')
       const entries: L0Entry[] = []
-      for (const line of raw.split('\n')) {
-        if (line.trim() === '') continue
-        const parsed = asRecord(JSON.parse(line)) as unknown as L0Entry | null
-        if (parsed && typeof parsed.text === 'string') entries.push(parsed)
+      for (const name of names.slice(-ARCHIVE_SEARCH_DAYS)) {
+        const raw = await readFile(join(dir, name), 'utf8')
+        for (const line of raw.split('\n')) {
+          if (line.trim() === '') continue
+          const parsed = asRecord(JSON.parse(line)) as unknown as L0Entry | null
+          if (parsed && typeof parsed.text === 'string') entries.push(parsed)
+        }
       }
       this.#archive = entries.slice(-ARCHIVE_MEMORY_LIMIT)
     } catch {
@@ -657,8 +671,8 @@ export class MemoryStore {
   }
 
   /** How much of the archive is in memory, for the mount ledger line. */
-  archiveStats(): { inMemory: number; dir: string } {
-    return { inMemory: this.#archive.length, dir: this.#archiveDir() }
+  archiveStats(): { inMemory: number; dir: string; searchDays: number } {
+    return { inMemory: this.#archive.length, dir: this.#archiveDir(), searchDays: ARCHIVE_SEARCH_DAYS }
   }
 
   /** @returns per-type counts of live records. */
