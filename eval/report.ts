@@ -291,6 +291,8 @@ const arms: Arm[] = [
     write: (index) => rows[index]!.screensKeptNow && applyGate(heuristicRows[index], GATE).write,
     note:
       `**线上闸门**：类型 ∈ {${GATE.types.join(', ')}} 且 抽取器分数 ≥ ${GATE.minImportance}。` +
+      '（这两个量都来自**本地抽取器**，不是模型的答案——`writeGate: deterministic` 就取这一行；' +
+      '判定层的 `conflict` 仍然参与冲突复核。）' +
       '不需要网络也不需要 key，并且和原文归档配套：被它拒掉的句子不是丢弃，而是留在 L0 里可检索。',
   },
   ...(jevRuns.length > 0
