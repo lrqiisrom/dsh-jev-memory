@@ -70,6 +70,7 @@ import {
   type LlmStreamPort,
   type NormalizeSettings,
 } from './lib/normalize.ts'
+import { createSegmenter, SEGMENT_DEFAULTS, type SegmentSettings } from './lib/segment.ts'
 import { DEFAULT_QUOTA, inScope, renderRecall, searchMemories, selectMemories } from './lib/recall.ts'
 import { isNoteworthyVeto, signatureOf } from './lib/signals.ts'
 import { archiveId, createMemoryStore, MEMORY_TYPES, type L0Entry, type MemoryRecord } from './lib/store.ts'
@@ -356,6 +357,16 @@ export interface PluginConfig {
    */
   writeGate: 'deterministic' | 'judge'
   /**
+   * Whether a model reads the recent window and decides the sentence boundaries and who said what.
+   *
+   * On by default, because the deterministic splitter was measured against the labelled notes and
+   * four of the sixteen badly-split rows are not mechanical at all: they are a message that mixes
+   * the person's words with a block they pasted, which no punctuation rule can separate. The
+   * fallback is the splitter, so a provider outage degrades to today's behaviour rather than to
+   * nothing — see `dsh/lib/segment.ts` for the two properties that keep it from inventing text.
+   */
+  segment: Partial<SegmentSettings>
+  /**
    * Whether `memory_search` also looks at the archive.
    *
    * On by default: content the gate passed over is exactly what a person is most likely to
@@ -603,6 +614,7 @@ export const DEFAULT_CONFIG: PluginConfig = {
   writeEnabled: true,
   writeGate: 'deterministic',
   searchArchive: true,
+  segment: { ...SEGMENT_DEFAULTS },
   /**
    * Skip delegated child sessions when learning.
    *
@@ -976,6 +988,27 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   })
 
   /**
+   * Decide the sentence boundaries and who wrote what, from a window of recent messages.
+   *
+   * Runs *inside* the write budget rather than after it, unlike the canonical pass: what it returns
+   * changes which candidates exist at all, so doing it later would mean extracting twice. It has
+   * its own shorter timeout inside that budget, and every failure falls back to the punctuation
+   * splitter — the write path must never depend on a network round trip.
+   */
+  const segmentSettings: SegmentSettings = { ...SEGMENT_DEFAULTS, ...config.segment }
+  const segmenter = createSegmenter({
+    llm: llmPort,
+    settings: segmentSettings,
+    log,
+    resolveRoute: async () => {
+      const selection = defaultModel?.currentSelection?.()
+      const provider = typeof selection?.provider === 'string' ? selection.provider : ''
+      const model = typeof selection?.model === 'string' ? selection.model : ''
+      return provider !== '' && model !== '' ? { provider, model } : null
+    },
+  })
+
+  /**
    * Give the memories written this turn a canonical form.
    *
    * Deliberately outside the write deadline: the hook has 2500ms and its job is to persist
@@ -1068,6 +1101,12 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         conflictRanking: config.conflictRanking,
         searchRanking: config.searchRanking,
         archive: store.archiveStats(),
+        segment: {
+          enabled: segmentSettings.enabled,
+          window: segmentSettings.window,
+          minCoverage: segmentSettings.minCoverage,
+          route: (await segmenter.route()) === null ? null : `${segmentSettings.timeoutMs}ms`,
+        },
         // The gate, not just the judge. Two runs can both say `judge: jev` while asking the
         // model different questions at different thresholds, and the ledger could not tell
         // them apart — which is exactly the question "did the numbers move because of my
@@ -1497,8 +1536,38 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const header = session?.header
       const cwd = header?.cwd ?? null
 
+      // The window the segmenter reads: the last N messages, oldest first, from the same events the
+      // extractor walks. Assistant messages are included because the point of a window is to see
+      // what was being discussed, and because attribution needs something to distinguish from.
+      const window = archiveMessages(events).slice(-segmentSettings.window)
+      let units: Array<{ seq: number; text: string }> | null = null
+      const segmented = window.length > 0 ? await segmenter.segment(window, signal) : null
+      if (segmented) {
+        // Only the person's own spans become candidates. A block the model marked `pasted`,
+        // `quoted` or `tool-output` is real text — it stays in the archive — but it is not their
+        // claim, which is the distinction the labelled corpus keeps asking for.
+        units = segmented.segments
+          .filter((segment) => segment.attribution === 'user')
+          .map((segment) => ({
+            seq: window[segment.messageIndex]!.seq,
+            text: window[segment.messageIndex]!.text.slice(segment.start, segment.end),
+          }))
+      }
+      void store.ledger({
+        kind: 'segment',
+        ok: segmented !== null,
+        reason: segmenter.lastReason(),
+        model: segmented?.model ?? null,
+        window: window.length,
+        units: segmented?.segments.length ?? 0,
+        userUnits: units?.length ?? 0,
+        pasted: segmented?.segments.filter((segment) => segment.attribution === 'pasted').length ?? 0,
+        coverage: segmented ? Number(segmented.coverage.toFixed(2)) : null,
+      })
+
       const candidates = extractCandidates(events, {
         ...config.extract,
+        units,
         // The extractor reports every rejection; the ledger records the reasons that carry
         // information (see isNoteworthyVeto), because a line per question and per "好的"
         // would bury the lines that matter.

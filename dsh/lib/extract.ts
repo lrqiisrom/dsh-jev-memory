@@ -92,6 +92,16 @@ export interface ExtractOptions {
   maxPerMessage: number
   maxPerTurn: number
   includeToolFailures: boolean
+  /**
+   * Units decided elsewhere, instead of splitting the message on punctuation.
+   *
+   * When a model has read the window and returned the person's own spans, those are the sentences
+   * — the deterministic splitter becomes the fallback rather than the authority. Each unit carries
+   * the `seq` of the message it was sliced from, and its text is that slice, so the identity rule
+   * downstream is unchanged: a unit that happens to equal what the splitter would have produced
+   * gets the same id, and the labels already attached to it keep working.
+   */
+  units?: ReadonlyArray<{ seq: number; text: string }> | null
   onVeto: ((sentence: string, reason: string | null, seq?: number) => void) | null
 }
 
@@ -107,6 +117,7 @@ export const EXTRACT_DEFAULTS: ExtractOptions = {
   maxPerTurn: 6,
   /** Only these failure results become pitfall candidates. */
   includeToolFailures: true,
+  units: null,
   /**
    * Called with `(sentence, reason)` for every sentence a screen rejected, so
    * the ledger can account for what was *not* remembered and why.
@@ -264,7 +275,11 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
   if (!text) return []
 
   const out: Candidate[] = []
-  for (const raw of splitSentences(text)) {
+  const provided = config.units?.filter((unit) => unit.seq === seq).map((unit) => unit.text)
+  // A message the model declined to segment — or one that arrived while it was unavailable — falls
+  // back to punctuation. `provided` being empty is not the same as the model saying "nothing here":
+  // the caller only passes units for messages it actually got an answer about.
+  for (const raw of provided && provided.length > 0 ? provided : splitSentences(text)) {
     // Screen the cleaned sentence, not the raw one: a `\end{itemize}` in front of a task
     // instruction used to change the verdict, which is the prefix deciding policy.
     const sentence = stripPastedPrefixes(raw)

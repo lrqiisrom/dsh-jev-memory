@@ -1501,6 +1501,71 @@ test('a written memory gains a canonical form, and the verbatim sentence stays',
   assert.match(String(normalizeLines[0]?.to), /必须使用 pnpm/u)
 })
 
+test('the write path uses the model\'s segmentation, and a pasted span is not a memory', async () => {
+  // The case the deterministic splitter cannot see, and the reason a model is on this path at all:
+  // one message that mixes the person's own requirement with a block they pasted. No punctuation
+  // rule separates those; the model says where the boundary is and who wrote each part.
+  // Both halves carry a type signal, and that is deliberate: the pasted block would qualify as a
+  // memory on its own, so the only thing stopping it is its attribution. A fixture where the pasted
+  // half had no signal would pass even if attribution were ignored entirely.
+  const own = '必须把端口固定成 8000。'
+  const pasted = '不要用 8000 了，改成 9000 更稳。'
+  const message = `${own}下面这段是我从模型回答里复制过来的：${pasted}`
+  const { captured } = await mount(
+    { judge: 'auto', segment: { enabled: true } },
+    'test-key',
+    (c) => {
+      c.llmPort = fakeLlm(
+        JSON.stringify([
+          { message: 0, text: own, who: 'user' },
+          { message: 0, text: pasted, who: 'pasted' },
+        ]),
+      )
+      c.defaultModelSelection = { provider: 'p', model: 'test-model' }
+    },
+  )
+  const session = fakeSession({
+    events: [
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: message }] } },
+    ],
+  })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
+
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+  const port = promoted(await search.execute({ query: '端口固定成 8000' }, { agent: { session } }))
+  assert.equal(port.length, 1, "the person's own sentence is a memory")
+  assert.equal(port[0]!.text, own)
+  assert.equal(
+    promoted(await search.execute({ query: '改成 9000' }, { agent: { session } })).length,
+    0,
+    'the pasted block is not their claim, even though it is about the same port',
+  )
+  // It is still evidence: the archive keeps it, searchable and marked.
+  assert.ok(archivedHits(await search.execute({ query: '改成 9000' }, { agent: { session } })).length >= 1)
+})
+
+test('a segmentation the model refuses falls back to the punctuation splitter', async () => {
+  // Fail-open in the only direction that is safe: the write path must never depend on a network
+  // round trip, so a refusal leaves today's behaviour exactly as it was.
+  const { captured } = await mount(
+    { judge: 'auto', segment: { enabled: true } },
+    'test-key',
+    (c) => {
+      c.llmPort = fakeLlm('我觉得这段可以切一下。')
+      c.defaultModelSelection = { provider: 'p', model: 'test-model' }
+    },
+  )
+  const session = fakeSession({ events: TURN_EVENTS })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+  assert.equal(
+    promoted(await search.execute({ query: 'pnpm' }, { agent: { session } })).length,
+    1,
+    'the deterministic splitter still produced the candidate',
+  )
+})
+
 test('injection uses the canonical form only when it is switched on', async () => {
   // Recording and injecting are separate decisions: the first is a convenience, the second
   // changes what the model is shown, so it waits for a person to read samples.
