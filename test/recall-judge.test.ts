@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { applyGate, createJudge, heuristicRow } from '../dsh/lib/judge.ts'
-import { inScope, renderRecall, searchMemories, selectMemories } from '../dsh/lib/recall.ts'
+import { fixedCost, inScope, renderLine, renderRecall, searchMemories, selectMemories } from '../dsh/lib/recall.ts'
 import { estimateTokens } from '../dsh/lib/text.ts'
 
 const DAY = 86_400_000
@@ -314,4 +314,53 @@ test('a memory irrelevant to the query still gets in when the quota is not full'
     query: '这次部署流程要注意什么？',
   })
   assert.deepEqual(chosen.map((entry) => entry.record.id), ['topic', 'rule'], 'relevant first, important still present')
+})
+
+test('a memory written just now is ranked up, but does not displace a strong match', () => {
+  // Item (3) of the reading side's work: the sentence the person just stated has not been mentioned in
+  // the conversation yet, so relevance gives it nothing and it lives on the importance half of the
+  // blend. Measured on a synthetic fresh record across the probes: 9 of 36 injected without this, 32 of
+  // 36 with it, at no cost to coverage. A *reserve* was also measured — it reaches 29 of 36 by evicting
+  // the lowest-ranked answer, which lost 1 to 6 coverage probes, so the bonus is what ships.
+  // An older but *more important* memory against a fresh but less important one. The fixture matters:
+  // the prior already contains a slow decay term (weight 0.15, half-life 180 days), so a fresh record
+  // outranks an equally important old one on its own — the first version of this test proved nothing.
+  // What the bonus adds is separate from and much larger than that decay: at weight 0.8 relevance, the
+  // decay term is worth 0.03 of the final score, the bonus 0.4.
+  const old = memory({ id: 'old', importance: 0.9 })
+  old.text = '接口返回的错误码要统一。'
+  old.createdAt = 0
+  const fresh = memory({ id: 'fresh', importance: 0.5 })
+  // Deliberately sharing no token with the query: the first fixture used a sentence containing 部署,
+  // which made it the top relevance hit and meant the bonus was never what decided anything.
+  fresh.text = '日志按天切分，不要写进同一个文件。'
+  const query = '这次部署流程要注意什么？'
+  // The block's heading and retraction note are charged to the budget too, so "room for exactly one
+  // line" has to be computed rather than guessed — a budget below the fixed cost holds nothing, and a
+  // guessed one let two lines in and quietly made the assertion below meaningless.
+  const lineCost = (record: (typeof old) | (typeof fresh)): number =>
+    estimateTokens(renderLine({ record, score: 0, ageDays: 0 }))
+  const budgetForOne = (list: Array<typeof old>): number => fixedCost() + Math.max(...list.map(lineCost))
+  const base = { cwd: '/work/a', types: ['constraint'], now: NOW, query }
+  const ids = (chosen: ReturnType<typeof selectMemories>): string[] => chosen.map((entry) => entry.record.id)
+  const both = [old, { ...fresh, createdAt: NOW }]
+  const args = { ...base, maxTokens: budgetForOne(both) }
+
+  // Both are irrelevant to the query here, so the older and slightly more important one leads.
+  const without = ids(selectMemories(both, { ...args, recencyBonus: 0 }))
+  assert.ok(without.includes('old'), 'without the term, the older memory is the one that fits')
+  assert.ok(!without.includes('fresh'), 'and the just-written one is the one that does not')
+
+  // The freshness term is computed against the clock the caller passes, so `createdAt: NOW` is "today".
+  const withBonus = ids(selectMemories(both, { ...args, recencyBonus: 0.4 }))
+  assert.ok(withBonus.includes('fresh'), 'the just-written memory is ranked up')
+  assert.ok(!withBonus.includes('old'), 'and it takes the slot the older one had')
+
+  // And it must not outrank a memory that actually answers the question.
+  const strong = memory({ id: 'strong', importance: 0.3 })
+  strong.text = '部署流程要写清楚，别漏步骤。'
+  strong.createdAt = NOW
+  const three = [{ ...fresh, createdAt: NOW }, strong, old]
+  const mixed = ids(selectMemories(three, { ...base, maxTokens: budgetForOne(three), recencyBonus: 0.4 }))
+  assert.ok(mixed.includes('strong'), 'a bounded bonus competes with weak matches; the strong one keeps its place')
 })

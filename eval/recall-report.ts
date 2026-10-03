@@ -622,6 +622,113 @@ say('')
   say('')
 }
 
+// Item (3) of the reading side's work: a memory written at the end of a turn has not been mentioned in
+// the conversation yet, so relevance gives it nothing and it has to live on the importance half of the
+// blend. That is a *simulation*, and it is labelled as one: the frozen corpus gives every record
+// `createdAt: 0`, so recency is not exercised by the probes at all. What is measured is the shape of
+// the trade — one fresh memory, plus the reserve that guarantees it a slot.
+say('### 刚写进来的记忆会不会被漏掉（模拟，因为冻结语料没有时间）')
+say('')
+say('语料里每条 `createdAt` 都是 0，所以"刚写的"这件事探针本身测不到。做法是**给每个探针追加一条"刚写的"记录**：')
+say('')
+say('- **收益**：追加的是一条**真记忆**（另一个探针的目标），它该不该被注入？')
+say('- **代价**：追加的是一条**假阳性**（写入侧会写、但你标过不该记的那种），它会被注入吗？注入里真记忆占比掉多少？')
+say('')
+say('| 机制 | 刚写的真记忆被注入 | 刚写的假阳性被注入 | 覆盖率 | 每轮 token |')
+say('|---|---|---|---|---|')
+{
+  const positives = corpus.entries.filter((entry) => entry.origin === 'true-positive').map((entry) => entry.record)
+  const negatives = corpus.entries.filter((entry) => entry.origin === 'false-positive').map((entry) => entry.record)
+  // Two mechanisms, one question: guarantee the newest a slot (evicting the lowest-ranked answer), or
+  // let it compete with a bounded bonus. Both are measured against the same synthetic fresh record.
+  const settingsList: Array<{ label: string; recentSlots: number; recencyBonus: number }> = [
+    { label: '0（今天）', recentSlots: 0, recencyBonus: 0 },
+    { label: '预留槽位 1', recentSlots: 1, recencyBonus: 0 },
+    { label: '预留槽位 2', recentSlots: 2, recencyBonus: 0 },
+    { label: '新近加成 0.1', recentSlots: 0, recencyBonus: 0.1 },
+    { label: '新近加成 0.2', recentSlots: 0, recencyBonus: 0.2 },
+    { label: '新近加成 0.4', recentSlots: 0, recencyBonus: 0.4 },
+    { label: '新近加成 0.6', recentSlots: 0, recencyBonus: 0.6 },
+    { label: '新近加成 0.8', recentSlots: 0, recencyBonus: 0.8 },
+  ]
+  for (const setting of settingsList) {
+    const slots = setting.recentSlots
+    const bonus = setting.recencyBonus
+    let freshTrueInjected = 0
+    let freshFalseInjected = 0
+    let covered = 0
+    let used = 0
+    // Rotate, and require the fresh record to be one the injection filter would accept.
+    //
+    // The first version of this used `positives.find(...)`, which returns the *same* record for every
+    // probe — and when that record was typed `fact` the whole table measured the type filter again
+    // (the bonus appeared to do nothing at all). Rotating also spreads the comparison over texts of
+    // different lengths, and skipping ineligible records keeps the denominator honest: `tested` says
+    // how many probes the row is actually about.
+    let tested = 0
+    for (const [index, probe] of all.entries()) {
+      const rotate = <T>(list: readonly T[], at: number): T | undefined => (list.length === 0 ? undefined : list[at % list.length])
+      const pick = (list: typeof positives, skip: string): (typeof positives)[number] | undefined => {
+        for (let step = 1; step <= list.length; step += 1) {
+          const candidate = list[(index + step) % list.length]!
+          if (candidate.id !== skip && types.includes(candidate.type)) return candidate
+        }
+        return undefined
+      }
+      const freshTrue = pick(positives, probe.targetId)
+      const freshFalse = pick(negatives, probe.targetId)
+      if (!freshTrue || !freshFalse) continue
+      tested += 1
+      // "Written just now": the same record every other way, with today's timestamp. It has to be the
+      // real clock — `selectMemories` defaults `now` to `Date.now()` for the *other* records' age, so a
+      // hardcoded past timestamp made the fresh record ~1000 days old and the freshness term zero: the
+      // bonus row measured nothing for three sweeps before this was noticed.
+      const now = Date.now()
+      const withFresh = [
+        ...records.filter((record) => record.id !== freshTrue.id && record.id !== freshFalse.id),
+      ]
+      const injected = (extra: typeof records): string[] =>
+        selectMemories(extra, {
+          cwd: null,
+          types,
+          maxTokens,
+          query: probe.query,
+          relevanceWeight: best.weight,
+          recentSlots: slots,
+          recencyBonus: bonus,
+        }).map((entry) => entry.record.id)
+      const asTrue = injected([...withFresh, { ...freshTrue, createdAt: now }])
+      if (asTrue.includes(freshTrue.id)) freshTrueInjected += 1
+      const asFalse = injected([...withFresh, { ...freshFalse, createdAt: now }])
+      if (asFalse.includes(freshFalse.id)) freshFalseInjected += 1
+      if (asTrue.includes(probe.targetId)) covered += 1
+      const rendered = renderRecall(
+        selectMemories([...withFresh, { ...freshTrue, createdAt: now }], {
+          cwd: null,
+          types,
+          maxTokens,
+          query: probe.query,
+          relevanceWeight: best.weight,
+          recentSlots: slots,
+          recencyBonus: bonus,
+        }),
+      )
+      used += rendered === '' ? 0 : estimateTokens(rendered)
+    }
+    say(
+      `| ${setting.label} | ${freshTrueInjected} / ${tested} | ${freshFalseInjected} / ${tested} | ${covered} / ${all.length} | ${(used / all.length).toFixed(0)} |`,
+    )
+  }
+  say('')
+  say('读法：**预留槽位是硬保证**（不管相关度，最刚写的一定有位置，代价是挤掉排名最低的那条），')
+  say('**新近加成是软竞争**（分数加一点，弱相关会被它超过，强相关不会）。')
+  say('"刚写的假阳性"那一列两列机制都高，是因为它们都不看内容、只看时间——而写入侧精确率 24%，')
+  say('"刚写的"有四分之三的概率是垃圾。另外注意两条：语料里 `fact` 类型的记录本来就不在注入白名单里，')
+  say('所以这两列的分母里有一部分是"根本没资格被注入"，不是机制没生效；预留槽位那一行覆盖率掉得最多，')
+  say('因为它挤掉的正是排名最低的那条——在探针里，那常常就是探针自己的目标。')
+  say('')
+}
+
 // The budget is the one gate here the person can move with a config value, so its price is worth a
 // number rather than a sentence. Coverage per probe at the shipped weight, as the budget grows.
 say('| token 预算 | 覆盖率 | 平均 token（实际用掉） | 平均注入条数 |')

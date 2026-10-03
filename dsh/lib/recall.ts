@@ -82,6 +82,30 @@ export interface RecallOptions {
    */
   query?: string | null
   /**
+   * How many slots to reserve for the most recently written memories.
+   *
+   * A memory written at the end of a turn has not been mentioned in the conversation yet, so at
+   * `relevanceWeight` it scores only the importance half of the blend — and anything the conversation
+   * *does* mention outranks it. That is the right order in general and the wrong one for the sentence
+   * the person just stated, which is the one they are most likely to expect the model to know.
+   *
+   * `0` (the default) is the measured baseline. The reserve deliberately ignores the per-type quota —
+   * its purpose is "this was just learned, the model should see it" — but it does not ignore the token
+   * budget, and it can only add records that passed the same eligibility filter.
+   */
+  recentSlots?: number
+  /**
+   * How much a *just written* memory is boosted above its rank, in score units.
+   *
+   * The softer half of the same idea as `recentSlots`, and the one that survived measurement. A
+   * reserve guarantees the newest record a slot by evicting the lowest-ranked answer, which cost 3 to
+   * 10 points of coverage on the probes; a bonus lets it compete instead — enough to beat the weak
+   * relevance matches, not enough to displace a strong one. Half-life is six hours, which is "this
+   * session" rather than "this month": the prior's own decay has a much longer half-life and exists to
+   * break near-ties, not to notice something written a minute ago.
+   */
+  recencyBonus?: number
+  /**
    * How much the query matters against importance, in 0..1.
    *
    * `0` is the old ranking; `1` ignores importance entirely. The shipped value is swept against the
@@ -152,6 +176,15 @@ export interface SearchOptions {
  */
 export const DEFAULT_RELEVANCE_WEIGHT = 0.8
 
+/**
+ * Half-life of the "just written" bonus, in hours.
+ *
+ * Six hours is one working session. Long enough that a memory written at the end of a turn is still
+ * boosted when the next turn asks something else; short enough that yesterday's note is not competing
+ * with today's question on age.
+ */
+export const RECENCY_HALF_LIFE_HOURS = 6
+
 /** One ranked search match. */
 export interface SearchHit {
   record: RecallableRecord
@@ -183,6 +216,7 @@ export function selectMemories(records: RecallableRecord[], options: RecallOptio
   const query = (options.query ?? '').trim()
   const relevanceWeight =
     query === '' ? 0 : Math.min(1, Math.max(0, options.relevanceWeight ?? DEFAULT_RELEVANCE_WEIGHT))
+  const recencyBonus = Math.max(0, options.recencyBonus ?? 0)
   const relevance = new Map<string, number>()
   if (query !== '' && relevanceWeight > 0) {
     // The same `cwd` the eligibility filter below uses, and it must be the same: `searchMemories`
@@ -208,7 +242,9 @@ export function selectMemories(records: RecallableRecord[], options: RecallOptio
     // The blend. At weight 0 this is the line it always was; above it, a memory that shares no
     // words with the current conversation has to out-rank a relevant one on importance alone,
     // which is the behaviour the 6% coverage number asked to change.
-    const score = relevanceWeight === 0 ? prior : relevanceWeight * (relevance.get(record.id) ?? 0) + (1 - relevanceWeight) * prior
+    const blended =
+      relevanceWeight === 0 ? prior : relevanceWeight * (relevance.get(record.id) ?? 0) + (1 - relevanceWeight) * prior
+    const score = blended + (recencyBonus > 0 ? recencyBonus * 0.5 ** ((ageDays * 24) / RECENCY_HALF_LIFE_HOURS) : 0)
     eligible.push({ record, score, ageDays })
   }
 
@@ -232,7 +268,36 @@ export function selectMemories(records: RecallableRecord[], options: RecallOptio
     tokens += cost
     chosen.push(entry)
   }
-  return chosen
+
+  const recentSlots = Math.max(0, options.recentSlots ?? 0)
+  if (recentSlots === 0) return chosen
+
+  // Newest first, and only what the loop above left out: a memory that already earned its place is not
+  // made more present by being recent.
+  const taken = new Set(chosen.map((entry) => entry.record.id))
+  const recent = eligible
+    .filter((entry) => !taken.has(entry.record.id))
+    .sort((left, right) => right.record.createdAt - left.record.createdAt)
+  const reserved: RecalledMemory[] = []
+  for (const entry of recent) {
+    if (reserved.length >= recentSlots) break
+    const cost = estimateTokens(renderLine(entry, preferCanonical))
+    // It *takes* a slot rather than asking for a spare one. The first version only added when the
+    // budget happened to have room, and the measurement showed it doing nothing at all: at the shipped
+    // 600-token budget the block is already at 592, so there was never room. A reserve that only fires
+    // when nothing needs reserving is not a reserve. The entry it evicts is the lowest-ranked one.
+    while (tokens + cost > maxTokens && chosen.length > 0) {
+      const dropped = chosen.pop()!
+      tokens -= estimateTokens(renderLine(dropped, preferCanonical))
+      perType.set(dropped.record.type, Math.max(0, (perType.get(dropped.record.type) ?? 1) - 1))
+    }
+    if (tokens + cost > maxTokens) break
+    tokens += cost
+    reserved.push(entry)
+  }
+  // Appended rather than spliced in: the ranked memories are the answer to the question, and these are
+  // "what was just learned". Keeping them last also keeps the block's order readable and stable.
+  return [...chosen, ...reserved]
 }
 
 /**

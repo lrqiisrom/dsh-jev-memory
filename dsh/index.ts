@@ -347,6 +347,17 @@ export interface RecallConfig {
   /** Importance against relevance; see `DEFAULT_RELEVANCE_WEIGHT` for the sweep. */
   relevanceWeight: number
   /**
+   * Boost for a just-written memory, in score units; `0` disables it.
+   *
+   * Answers "was the sentence I just stated visible on the next turn". Measured on the synthetic
+   * recency probe (a fresh record added to each probe, see `eval/recall-report.ts`): 0 → 9 of 36 fresh
+   * memories injected; 0.4 → 32 of 36 with **no** coverage cost; 0.6 → 36 of 36 but coverage drops a
+   * probe, which is the mechanism sliding back into being the hard reserve it was chosen over.
+   */
+  recencyBonus: number
+  /** Slots reserved for the newest memories; measured and left off — see `recentSlots` in lib/recall. */
+  recentSlots: number
+  /**
    * Which types may be injected, when that should differ from which types may be written.
    *
    * These were one value, and they are two decisions. Widening what gets stored is a change to what
@@ -605,7 +616,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.21.0'
+export const version = '0.22.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -735,6 +746,12 @@ export const DEFAULT_CONFIG: PluginConfig = {
     // false positives.
     queryMessages: 3,
     relevanceWeight: DEFAULT_RELEVANCE_WEIGHT,
+    // Just-written memories get a bounded boost rather than a reserved slot. Both were measured and the
+    // bonus strictly dominated: 32/36 fresh memories injected with the coverage number untouched,
+    // against 29/36 and coverage 17 → 16 (→ 11 at two slots) for the reserve, which pays by evicting
+    // the lowest-ranked answer. See the recency table in the report.
+    recencyBonus: 0.4,
+    recentSlots: 0,
   },
   /** Prompt context ordering; the harness runtime contexts occupy 110–120. */
   contextOrder: 130,
@@ -1390,6 +1407,8 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         preferCanonical: config.normalize.inject,
         query,
         relevanceWeight: config.recall.relevanceWeight,
+        recencyBonus: config.recall.recencyBonus,
+        recentSlots: config.recall.recentSlots,
       })
       if (chosen.length === 0) return { text: '', ids: [] }
 
