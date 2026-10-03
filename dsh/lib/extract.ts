@@ -100,8 +100,14 @@ export interface ExtractOptions {
    * the `seq` of the message it was sliced from, and its text is that slice, so the identity rule
    * downstream is unchanged: a unit that happens to equal what the splitter would have produced
    * gets the same id, and the labels already attached to it keep working.
+   *
+   * `type` is present only on the model write path (`writeMode: 'model'`), where one call decided
+   * both that the span is worth remembering *and* what kind of memory it is. Its presence is what
+   * tells the gate not to re-decide: the measured reason for that path existing is that the local
+   * type-and-score rule and this call disagree, and the call is right more often (F1 0.69 vs 0.37
+   * over the same 120 rows). Without the field the gate would overrule it and write nothing.
    */
-  units?: ReadonlyArray<{ seq: number; text: string }> | null
+  units?: ReadonlyArray<{ seq: number; text: string; type?: string | null }> | null
   onVeto: ((sentence: string, reason: string | null, seq?: number) => void) | null
 }
 
@@ -145,6 +151,13 @@ export interface Candidate {
   signals: string[]
   /** tool name for failure candidates. */
   tool: string | null
+  /**
+   * The type the model write path assigned to this span, or null on the deterministic path.
+   *
+   * Not a hint: on that path it is the decision, and `applyGate` is skipped for the candidates that
+   * carry it. Stored so the ledger can show what the model said next to what was written.
+   */
+  modelType?: string | null
 }
 
 /**
@@ -275,11 +288,19 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
   if (!text) return []
 
   const out: Candidate[] = []
-  const provided = config.units?.filter((unit) => unit.seq === seq).map((unit) => unit.text)
+  const providedUnits = config.units?.filter((unit) => unit.seq === seq) ?? []
   // A message the model declined to segment — or one that arrived while it was unavailable — falls
   // back to punctuation. `provided` being empty is not the same as the model saying "nothing here":
   // the caller only passes units for messages it actually got an answer about.
-  for (const raw of provided && provided.length > 0 ? provided : splitSentences(text)) {
+  //
+  // The unit's `type` rides along with its text rather than being looked up again after cleaning,
+  // because both `stripPastedPrefixes` and `clipAtClause` may edit the text and the association
+  // would then have to be re-derived from a string comparison that could silently mismatch.
+  const sources: Array<{ raw: string; modelType: string | null }> =
+    providedUnits.length > 0
+      ? providedUnits.map((unit) => ({ raw: unit.text, modelType: unit.type ?? null }))
+      : splitSentences(text).map((raw) => ({ raw, modelType: null }))
+  for (const { raw, modelType } of sources) {
     // Screen the cleaned sentence, not the raw one: a `\end{itemize}` in front of a task
     // instruction used to change the verdict, which is the prefix deciding policy.
     const sentence = stripPastedPrefixes(raw)
@@ -325,6 +346,7 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
       signalScore: score,
       signals: signal.hits,
       tool: null,
+      modelType,
     })
   }
 

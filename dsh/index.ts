@@ -53,7 +53,7 @@ import {
   type ConflictScorer,
 } from './lib/conflict.ts'
 import { EXTRACT_DEFAULTS, archiveMessages, extractCandidates } from './lib/extract.ts'
-import { applyGate, createJudge, heuristicRow, JUDGE_MODES, type Judgement } from './lib/judge.ts'
+import { applyGate, applyModelGate, createJudge, heuristicRow, JUDGE_MODES, type Judgement } from './lib/judge.ts'
 import {
   EMBEDDING_DEFAULTS,
   cosineSimilarity,
@@ -71,6 +71,7 @@ import {
   type NormalizeSettings,
 } from './lib/normalize.ts'
 import { createSegmenter, SEGMENT_DEFAULTS, type SegmentSettings } from './lib/segment.ts'
+import { createModelWriter, MODEL_WRITE_DEFAULTS, WRITE_TYPES, type ModelWriteSettings } from './lib/modelwrite.ts'
 import { DEFAULT_QUOTA, inScope, renderRecall, searchMemories, selectMemories } from './lib/recall.ts'
 import { isNoteworthyVeto, signatureOf } from './lib/signals.ts'
 import { archiveId, createMemoryStore, MEMORY_TYPES, type L0Entry, type MemoryRecord } from './lib/store.ts'
@@ -358,6 +359,26 @@ export interface PluginConfig {
    */
   writeGate: 'deterministic' | 'judge'
   /**
+   * Which of the two write paths reads the turn.
+   *
+   * `pipeline`: segment, then extract, then judge, then gate — the path the sections below describe,
+   * where each step is a rule and the model is asked one bounded question per step.
+   *
+   * `model`: one call reads the window and answers, per span, whether it is worth remembering and
+   * what kind of memory it is; the text is sliced from the message by offsets located in code. It
+   * exists because it was measured first, on 120 labelled rows whose windows could be rebuilt, and
+   * it beat the pipeline on precision *and* recall at once (56%/90%, F1 0.69, against 27%/60%,
+   * F1 0.37).
+   *
+   * It is **not** free: the same call's latency had a median 1233ms and a 3701ms worst case inside a
+   * 2500ms write budget, and 16 of 49 exceeded the 1600ms it would be given. When it times out the
+   * turn falls back to the deterministic splitter and the local gate — a slower decision, never a
+   * lost one, because the fallback deliberately does not then call the segmenter.
+   */
+  writeMode: 'pipeline' | 'model'
+  /** Settings for the model write path; `window` is read by both paths. */
+  modelWrite: Partial<ModelWriteSettings>
+  /**
    * Whether a sentence the session already said — by the model — may become a memory.
    *
    * On by default, and this is the one screen whose cost was measured against the person's own
@@ -546,7 +567,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.17.0'
+export const version = '0.18.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -623,6 +644,14 @@ export const DEFAULT_CONFIG: PluginConfig = {
   /** Whether turn-end writes happen at all. */
   writeEnabled: true,
   writeGate: 'deterministic',
+  // Shipped as `pipeline`, and that is a deliberate ordering rather than a verdict on the model
+  // path: the two were measured against each other on the write side and `model` won, but its
+  // latency (median 1233ms, worst 3701ms) sits too close to the write budget for a one-line default,
+  // and it costs one call per turn on every install. Turning it on is a deliberate choice with the
+  // ledger's `write-path` line as the thing to watch: `reason` there says `ok`, `unparsable` or an
+  // abort, and a high share of the two latter means the budget, not the prompt, is the problem.
+  writeMode: 'pipeline',
+  modelWrite: { ...MODEL_WRITE_DEFAULTS },
   searchArchive: true,
   // The library defaults `segment.enabled` to false so consumers opt in deliberately; the shipped
   // plugin turns it on, because the deterministic splitter was measured against the labelled notes
@@ -742,6 +771,10 @@ export function resolveConfig(raw: unknown): { config: PluginConfig; problems: s
   if (config.writeGate !== 'deterministic' && config.writeGate !== 'judge') {
     problems.push(`writeGate: unknown value "${String(config.writeGate)}"; using deterministic`)
     config.writeGate = 'deterministic'
+  }
+  if (config.writeMode !== 'pipeline' && config.writeMode !== 'model') {
+    problems.push(`writeMode: unknown value "${String(config.writeMode)}"; using pipeline`)
+    config.writeMode = 'pipeline'
   }
   if (config.searchRanking !== 'lexical' && config.searchRanking !== 'embedding') {
     problems.push(`searchRanking: unknown value "${String(config.searchRanking)}"; using lexical`)
@@ -1026,6 +1059,34 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     Math.max(400, config.writeTimeoutMs - 900),
   )
   const segmentSettings: SegmentSettings = { ...SEGMENT_DEFAULTS, ...config.segment, timeoutMs: segmentBudget }
+
+  // The one call that replaces the whole pipeline. It gets the same treatment for the same reason,
+  // but its measured profile is worse: median 1233ms over 49 real windows, 16 of them past 1600ms,
+  // worst 3701ms. `Math.max` keeps a small `writeTimeoutMs` from producing a negative budget, and the
+  // fallback below is what makes a timeout survivable — it drops to the deterministic splitter and
+  // the local gate rather than calling anything else.
+  const modelWriteSettings: ModelWriteSettings = {
+    ...MODEL_WRITE_DEFAULTS,
+    ...config.modelWrite,
+    timeoutMs: Math.min(
+      config.modelWrite.timeoutMs ?? MODEL_WRITE_DEFAULTS.timeoutMs,
+      Math.max(400, config.writeTimeoutMs - 900),
+    ),
+  }
+  const modelWriter = createModelWriter({
+    llm: llmPort,
+    settings: modelWriteSettings,
+    log,
+    resolveRoute: async () => {
+      const selection = defaultModel?.currentSelection?.()
+      const provider = typeof selection?.provider === 'string' ? selection.provider : ''
+      const model = typeof selection?.model === 'string' ? selection.model : ''
+      return provider !== '' && model !== '' ? { provider, model } : null
+    },
+  })
+  // Both paths read the same window length; `modelWrite.window` is the one that applies on the model
+  // path because the call is what consumes it, and the segmenter's own value still governs its path.
+  const writeWindow = config.writeMode === 'model' ? modelWriteSettings.window : segmentSettings.window
   const segmenter = createSegmenter({
     llm: llmPort,
     settings: segmentSettings,
@@ -1128,6 +1189,21 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         version,
         judge: judge.kind,
         writeGate: config.writeGate,
+        writeMode: config.writeMode,
+        modelWrite: {
+          window: modelWriteSettings.window,
+          budgetMs: modelWriteSettings.timeoutMs,
+          // Same three states as `segment.route` above, for the same reason: "no route" and "turned
+          // off" produce the same absence of writes and are not the same problem.
+          route:
+            config.writeMode !== 'model' || !modelWriteSettings.enabled
+              ? 'disabled'
+              : llmPort === undefined
+                ? 'no-llm-service'
+                : (await modelWriter.route()) === null
+                  ? 'no-default-model'
+                  : `${(await modelWriter.route())!.provider}/${(await modelWriter.route())!.model}`,
+        },
         conflictRanking: config.conflictRanking,
         searchRanking: config.searchRanking,
         archive: store.archiveStats(),
@@ -1583,37 +1659,82 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       // The window the segmenter reads: the last N messages, oldest first, from the same events the
       // extractor walks. Assistant messages are included because the point of a window is to see
       // what was being discussed, and because attribution needs something to distinguish from.
-      const window = archiveMessages(events).slice(-segmentSettings.window)
-      let units: Array<{ seq: number; text: string }> | null = null
-      const segmented = window.length > 0 ? await segmenter.segment(window, signal) : null
-      if (segmented) {
-        // Only the person's own spans become candidates. A block the model marked `pasted`,
-        // `quoted` or `tool-output` is real text — it stays in the archive — but it is not their
-        // claim, which is the distinction the labelled corpus keeps asking for.
-        units = segmented.segments
-          .filter((segment) => segment.attribution === 'user')
-          .map((segment) => ({
-            seq: window[segment.messageIndex]!.seq,
-            text: window[segment.messageIndex]!.text.slice(segment.start, segment.end),
-          }))
-      }
-      // A line per turn only when something happened. "No route" is a property of the install and
-      // is already on the `start` line; copying it onto every turn would bury the timeouts, which
-      // are the lines worth reading.
-      const segmentReason = segmenter.lastReason()
-      if (segmentReason !== 'no-route') {
-        void store.ledger({
-          kind: 'segment',
-          ok: segmented !== null,
-          reason: segmentReason,
-          model: segmented?.model ?? null,
-          window: window.length,
-          units: segmented?.segments.length ?? 0,
-          userUnits: units?.length ?? 0,
-          pasted: segmented?.segments.filter((segment) => segment.attribution === 'pasted').length ?? 0,
-          coverage: segmented ? Number(segmented.coverage.toFixed(2)) : null,
-          budgetMs: segmentSettings.timeoutMs,
-        })
+      //
+      // On `writeMode: 'model'` the same window goes to the one call that decides everything, and
+      // the segmentation call is *not* made: it is not that the two are redundant, it is that the
+      // write budget is 2500ms and the two calls together do not fit in it. Measured on the real
+      // provider, the one call has a median 1233ms and the slowest of 49 took 3701ms — longer than
+      // the whole budget — so a failed model write must fall back to the deterministic splitter and
+      // *stop*, never to a second round trip. Doing both would turn a timeout into a lost turn
+      // instead of a slower decision.
+      const window = archiveMessages(events).slice(-writeWindow)
+      let units: Array<{ seq: number; text: string; type?: string | null }> | null = null
+      let modelWrite: { ok: boolean; reason: string; model: string | null; items: number; kept: number; worth: number } | null =
+        null
+      if (config.writeMode === 'model' && window.length > 0) {
+        const written = await modelWriter.decide(
+          window.map((message) => ({ seq: message.seq, role: message.role, text: message.text })),
+          signal,
+        )
+        modelWrite = {
+          ok: written !== null,
+          reason: modelWriter.lastReason(),
+          model: written?.model ?? null,
+          items: written?.items.length ?? 0,
+          // Mirrors the evaluation that justified this path, exactly: an item counts only when the
+          // model attributed it to the person, called it worth remembering, *and* typed it as a
+          // memory. That triple is what scored F1 0.69 there, so widening it here would ship a rule
+          // nobody measured. `worth` is kept separately in the ledger because the two refusals mean
+          // different things: "not worth remembering" is the model doing its job, "typed other" is
+          // the type whitelist still refusing a sentence the model said was worth keeping.
+          kept: (written?.items ?? []).filter(
+            (item) => item.who === 'user' && item.worth && (WRITE_TYPES as readonly string[]).includes(item.type),
+          ).length,
+          worth: (written?.items ?? []).filter((item) => item.who === 'user' && item.worth).length,
+        }
+        if (written) {
+          units = written.items
+            .filter((item) => item.who === 'user' && item.worth && (WRITE_TYPES as readonly string[]).includes(item.type))
+            .map((item) => ({
+              seq: item.seq,
+              // Sliced here from the original message by the offsets `explainModelWrite` located, so
+              // the stored text is the person's characters and not the model's rendering of them.
+              text: window[item.messageIndex]!.text.slice(item.start, item.end),
+              type: item.type,
+            }))
+        }
+        void store.ledger({ kind: 'write-path', mode: 'model', window: window.length, ...modelWrite })
+      } else {
+        const segmented = window.length > 0 ? await segmenter.segment(window, signal) : null
+        if (segmented) {
+          // Only the person's own spans become candidates. A block the model marked `pasted`,
+          // `quoted` or `tool-output` is real text — it stays in the archive — but it is not their
+          // claim, which is the distinction the labelled corpus keeps asking for.
+          units = segmented.segments
+            .filter((segment) => segment.attribution === 'user')
+            .map((segment) => ({
+              seq: window[segment.messageIndex]!.seq,
+              text: window[segment.messageIndex]!.text.slice(segment.start, segment.end),
+            }))
+        }
+        // A line per turn only when something happened. "No route" is a property of the install and
+        // is already on the `start` line; copying it onto every turn would bury the timeouts, which
+        // are the lines worth reading.
+        const segmentReason = segmenter.lastReason()
+        if (segmentReason !== 'no-route') {
+          void store.ledger({
+            kind: 'segment',
+            ok: segmented !== null,
+            reason: segmentReason,
+            model: segmented?.model ?? null,
+            window: window.length,
+            units: segmented?.segments.length ?? 0,
+            userUnits: units?.length ?? 0,
+            pasted: segmented?.segments.filter((segment) => segment.attribution === 'pasted').length ?? 0,
+            coverage: segmented ? Number(segmented.coverage.toFixed(2)) : null,
+            budgetMs: segmentSettings.timeoutMs,
+          })
+        }
       }
 
       const candidates = extractCandidates(events, {
@@ -1839,7 +1960,12 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           config.writeGate === 'judge' || !judgement
             ? judgement
             : { ...judgement, type: local.type, importance: local.importance, remember: null }
-        const gate = applyGate(gated, config)
+        // On the model write path the call already decided this span is worth remembering and what
+        // kind of memory it is, so the local gate would be a second opinion with a worse record
+        // (F1 0.37 against 0.69 on the rows both were measured on). Its `conflict` answer still
+        // counts, which is why the gate is not simply bypassed.
+        const fromModel = typeof candidate.modelType === 'string' && candidate.modelType !== ''
+        const gate = fromModel ? applyModelGate(judgement, config) : applyGate(gated, config)
         if (!gate.write || !judgement) {
           // `by` on the skip line too: otherwise the ledger shows that something
           // was refused but not who refused it, and "is Jev actually deciding?"
@@ -1885,6 +2011,10 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         // Read the previous text *before* the put: afterwards the record already holds the
         // new one, and the ledger line would claim the old text was the new text.
         const previousText = updated === undefined ? '' : (store.get(updated)?.text ?? '')
+        // The type that decided the write. On the model path that is the model's own answer — the
+        // local type only *hinted* it, and `selectMemories` filters the type whitelist, so storing
+        // the hint here would write a record that is never injected.
+        const writtenType = fromModel ? candidate.modelType! : (gated?.type ?? judgement.type)
         await store.put({
           id: candidate.key,
           // The type and importance that the *gate used*, not the judge's own numbers.
@@ -1895,7 +2025,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           // `selectMemories` filters on the type whitelist, so such a record was written and then
           // never injected: silent, and invisible to a test that asserts through `memory_search`,
           // which does not filter by type.
-          type: gated?.type ?? judgement.type,
+          type: writtenType,
           text: candidate.text,
           cwd,
           importance: gated?.importance ?? judgement.importance,
@@ -1913,9 +2043,10 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           id: candidate.key,
           // What was acted on, and separately what the model said — the ledger records both so the
           // two can be compared after the fact instead of being conflated in one field.
-          type: gated?.type ?? judgement.type,
+          type: writtenType,
           importance: gated?.importance ?? judgement.importance,
           judgeType: judgement.type,
+          modelType: candidate.modelType ?? null,
           remember: judgement.remember,
           by: judgement.by,
           model,

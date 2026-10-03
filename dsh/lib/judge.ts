@@ -385,3 +385,27 @@ export function applyGate(judgement: GateInput | null | undefined, config: GateC
   if (judgement.conflict === 'yes' && config.reviewOnConflict) return { write: true, review: true, reason: 'conflict' }
   return { write: true, reason: 'ok' }
 }
+
+/**
+ * The gate on the model write path, where one call already answered both of its questions.
+ *
+ * `applyGate` asks two things — does this belong in memory, and how important is it — and the model
+ * write call answers the first one directly, per span, with the window in front of it. Re-asking the
+ * deterministic rule here is what that setting exists to avoid: over the same 120 labelled rows the
+ * call reached F1 0.69 and the local type-and-score rule 0.37, and the disagreement is not noise —
+ * 8 of the corpus's 21 positives are refused by the type whitelist alone (the word "流程" types a real
+ * requirement as `procedure`, which is not a memory type), so that refusal fires on a keyword rather
+ * than on understanding.
+ *
+ * What is *not* skipped is the conflict question. That answer comes from the pair decision, a
+ * different call about a different thing (this text versus one already stored), and its `yes` still
+ * routes the record to `needs-review` so recall never sees an unreviewed contradiction.
+ *
+ * @param judgement - the judge's row, or null when it did not answer.
+ * @param config - the gate config, read only for `reviewOnConflict`.
+ * @returns a decision; `write` is always true and `reason` names the path.
+ */
+export function applyModelGate(judgement: GateInput | null | undefined, config: GateConfig): GateDecision {
+  if (judgement?.conflict === 'yes' && config.reviewOnConflict) return { write: true, review: true, reason: 'conflict' }
+  return { write: true, reason: 'model-write' }
+}

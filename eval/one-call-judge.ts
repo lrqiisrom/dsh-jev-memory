@@ -183,12 +183,16 @@ let fn = 0
 let itemsTotal = 0
 let worthTrue = 0
 const rejections: Record<string, number> = {}
+/** Wall-clock per call: it has to fit inside the write budget alongside the judgement and the write,
+ *  and it replaces two calls today (segmentation and the pair question), so this decides the budget. */
+const latencies: number[] = []
 const details: string[] = []
 
 for (const [index, entry] of sample.entries()) {
   const window = windowEndingAt(entry.session, entry.seq, windowSize)
   if (window.length === 0 || !window.some((message) => message.seq === entry.seq)) continue
   const body = window.map((message, at) => `[${at}] 角色=${message.role}\n${message.text}`).join('\n\n')
+  const started = Date.now()
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
@@ -204,6 +208,7 @@ for (const [index, entry] of sample.entries()) {
   })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
   const payload = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> }
+  latencies.push(Date.now() - started)
   const raw = payload.choices?.[0]?.message?.content ?? ''
   const { items, rejected } = validate(raw, window.map((message) => ({ role: message.role, text: message.text })))
   for (const [reason, count] of Object.entries(rejected)) rejections[reason] = (rejections[reason] ?? 0) + count
@@ -260,6 +265,14 @@ lines.push(
 )
 lines.push('')
 lines.push(`模型每个窗口平均返回 ${(itemsTotal / Math.max(1, sample.length)).toFixed(1)} 项，其中 who=user 且 worth=true 的 ${(worthTrue / Math.max(1, sample.length)).toFixed(1)} 项。`)
+lines.push('')
+{
+  const sorted = [...latencies].sort((left, right) => left - right)
+  const over = latencies.filter((value) => value > 1600).length
+  lines.push(
+    `延迟：中位 ${sorted[Math.floor(sorted.length / 2)]}ms｜最快 ${sorted[0]}ms｜最慢 ${sorted[sorted.length - 1]}ms｜超过 1600ms 预算的 ${over}/${latencies.length}`,
+  )
+}
 lines.push('')
 lines.push('## 校验拒收的原因分布')
 lines.push('')

@@ -1761,3 +1761,143 @@ test('with no route the canonical pass simply does not happen', async () => {
   const start = await startEntry(root)
   assert.deepEqual(start?.normalize, { enabled: true, inject: false, ready: false, provider: null, model: null })
 })
+
+/**
+ * A fake `llm` service that answers the write path with one thing and anything else with another.
+ *
+ * Needed because `writeMode: 'model'` puts three callers on the same service — the write call, the
+ * segmenter and the canonical pass — and a single fixed answer would make the test unable to say
+ * which call it was checking.
+ */
+function llmRouting(writeAnswer: string, otherAnswer = '规范化后的句子。'): unknown {
+  return {
+    stream: (options: { system?: string }) =>
+      (async function* () {
+        yield { type: 'text-delta', text: options.system?.includes('长期记忆') ? writeAnswer : otherAnswer }
+        yield { type: 'finish' }
+      })(),
+  }
+}
+
+test('writeMode: model writes a requirement the local type whitelist refuses, and pipeline does not', async () => {
+  // Taken verbatim from the labelled corpus. The local rule types it `procedure` because of the word
+  // 流程, `procedure` is not a memory type, and so `applyGate` refuses a real requirement — by matching
+  // a keyword, not by understanding it. 8 of the corpus's 21 positives die the same way, which is the
+  // measured reason the model path exists rather than a threshold change to the rules.
+  const sentence = '顺便我觉得这个配置流程应该再简化一下。'
+
+  const pipeline = await mount({ writeMode: 'pipeline', segment: { enabled: false } })
+  await listenerFor(pipeline.captured, 'agent/turn-stopping')({
+    agent: { id: 's1', session: fakeSession({ events: turnWith(sentence) }) },
+    turn: 1,
+    signal: undefined,
+  })
+  const refused = await toolFor<SearchArgs, MemorySearchResult>(pipeline.captured, 'memory_search').execute(
+    { query: '配置流程简化' },
+    { agent: { session: fakeSession({ events: [] }) } },
+  )
+  assert.equal(promoted(refused).length, 0, 'the deterministic type rule has no memory type for 流程')
+  assert.ok(
+    (await ledgerEntries(pipeline.root)).some(
+      (entry) => entry.kind === 'skip' && entry.reason === 'type-disabled:procedure',
+    ),
+    'and the ledger names the rule that refused it',
+  )
+
+  const model = await mount({ writeMode: 'model' }, undefined, (c) => {
+    c.llmPort = llmRouting(
+      JSON.stringify([{ message: 0, text: sentence, who: 'user', worth: true, type: 'constraint' }]),
+    )
+    c.defaultModelSelection = { provider: 'p', model: 'test-model' }
+  })
+  const session = fakeSession({ events: turnWith(sentence) })
+  await listenerFor(model.captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
+
+  const found = await toolFor<SearchArgs, MemorySearchResult>(model.captured, 'memory_search').execute(
+    { query: '配置流程简化' },
+    { agent: { session } },
+  )
+  assert.equal(promoted(found).length, 1, 'the same sentence, decided by the call instead of the keyword')
+  assert.equal(promoted(found)[0]!.text, sentence)
+  // The type stored is the one the gate acted on. Storing the local hint instead would write a
+  // record that recall then filters out, which is a failure no search-based assertion would see.
+  const document = JSON.parse(await readFile(join(model.root, 'memory.json'), 'utf8')) as {
+    records?: Array<Record<string, unknown>>
+  }
+  assert.equal((document.records ?? [])[0]?.type, 'constraint')
+
+  const writePath = (await ledgerEntries(model.root)).find((entry) => entry.kind === 'write-path')
+  assert.equal(writePath?.reason, 'ok')
+  assert.equal(writePath?.mode, 'model')
+  assert.equal(writePath?.kept, 1)
+  assert.equal((await startEntry(model.root))?.modelWrite?.route, 'p/test-model')
+})
+
+test('the model path keeps only what the person said and called worth remembering', async () => {
+  // The triple that was measured (F1 0.69 over 120 rows): attributed to the person, worth
+  // remembering, typed as a memory. Each of the three is pinned by a case that would be written if
+  // the rule were only "the model returned an item".
+  const own = '状态机的边界情况我们决定先不做。'
+  const pasted = '这个模块的报错信息最好带上上下文。'
+  const message = `${own}${pasted}`
+  const { root, captured } = await mount({ writeMode: 'model' }, undefined, (c) => {
+    c.llmPort = llmRouting(
+      JSON.stringify([
+        { message: 0, text: own, who: 'user', worth: true, type: 'decision' },
+        { message: 0, text: pasted, who: 'pasted', worth: true, type: 'constraint' },
+        { message: 0, text: pasted, who: 'user', worth: true, type: 'other' },
+      ]),
+    )
+    c.defaultModelSelection = { provider: 'p', model: 'test-model' }
+  })
+  const session = fakeSession({
+    events: [
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: message }] } },
+    ],
+  })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
+
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+  assert.equal(promoted(await search.execute({ query: '边界情况先不做' }, { agent: { session } })).length, 1)
+  assert.equal(
+    promoted(await search.execute({ query: '报错信息带上上下文' }, { agent: { session } })).length,
+    0,
+    'the block was returned twice: once attributed to someone else, once typed as not-a-memory',
+  )
+  const writePath = (await ledgerEntries(root)).find((entry) => entry.kind === 'write-path')
+  assert.equal(writePath?.items, 3)
+  assert.equal(writePath?.kept, 1)
+  // Two numbers, not one, because the two refusals mean different things. `worth - kept` is the type
+  // whitelist still refusing a sentence the model said was worth keeping — on the labelled corpus
+  // that is 8 of 21 positives, and it is the count to watch if the whitelist is ever revisited.
+  assert.equal(writePath?.worth, 2, 'the model said two of them were worth remembering')
+  assert.equal(writePath?.kept, 1, 'and one of those was typed as a memory')
+})
+
+test('a model answer that is not verbatim falls back to the deterministic path, and still writes', async () => {
+  // The failure the verbatim rule exists for: the model rewrites the sentence while quoting it
+  // (measured: 22% of its items, one of them changing 集成 to 继承 — a different claim, stored under
+  // the person's name). A refusal must not cost the turn, so the deterministic path runs instead —
+  // and it must not call the segmenter to do it, because two round trips do not fit the budget.
+  const sentence = '必须把端口固定成 8000。'
+  const { root, captured } = await mount({ writeMode: 'model' }, undefined, (c) => {
+    c.llmPort = llmRouting(
+      JSON.stringify([{ message: 0, text: '必须把端口固定为 8000。', who: 'user', worth: true, type: 'constraint' }]),
+    )
+    c.defaultModelSelection = { provider: 'p', model: 'test-model' }
+  })
+  const session = fakeSession({ events: turnWith(sentence) })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
+
+  const found = await toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search').execute(
+    { query: '端口固定成 8000' },
+    { agent: { session } },
+  )
+  assert.equal(promoted(found).length, 1, 'the turn is slower, not lost')
+  assert.equal(promoted(found)[0]!.text, sentence, "and what is stored is the person's characters")
+  const writePath = (await ledgerEntries(root)).find((entry) => entry.kind === 'write-path')
+  assert.equal(writePath?.ok, false)
+  assert.equal(writePath?.reason, 'all-refused')
+  assert.equal((await ledgerEntries(root)).filter((entry) => entry.kind === 'segment').length, 0, 'no second attempt')
+})
