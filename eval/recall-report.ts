@@ -437,7 +437,139 @@ if (injectionMisses.length > 0) {
   say('')
 }
 
-say('## 漏掉的原因分类')
+// ---------------------------------------------------------------------------------------------
+// The fix: let injection look at the conversation. Swept rather than chosen, because the trade is
+// real — relevance pulls in memories that answer *this* question and pushes out memories that were
+// important in general, and both directions are visible in the numbers below.
+//
+// The precision proxy is the frozen corpus's own labels: `true-positive` records are the 18 rows the
+// person marked worth remembering, `false-positive` ones are the 76 the gate would have written
+// anyway. A human relevance label would be better and does not exist yet (the report says so a few
+// sections down), but "how much of what got injected is garbage the write side let through" is
+// exactly the question a proxy is needed for, and this one is not invented.
+const originOf = new Map(corpus.entries.map((entry) => [entry.record.id, entry.origin]))
+const WEIGHTS = [0, 0.2, 0.35, 0.5, 0.65, 0.8, 1]
+say('### 让注入看一眼当前对话：权重扫描')
+say('')
+say(`对每个探针用它的查询跑一次注入（配额、token 预算、类型过滤都不变），权重 0 就是今天的排序：`)
+say('')
+say('| 相关性权重 | 覆盖率 | 平均注入条数 | 平均 token | 注入里真记忆占比 | 注入了东西的探针 |')
+say('|---|---|---|---|---|---|')
+interface InjectionSweep {
+  weight: number
+  covered: number
+  meanCount: number
+  meanTokens: number
+  truePositiveShare: number
+  nonEmpty: number
+}
+const sweep: InjectionSweep[] = []
+for (const weight of WEIGHTS) {
+  let covered = 0
+  let count = 0
+  let tokens = 0
+  let nonEmpty = 0
+  let injectedTrue = 0
+  let injectedAll = 0
+  for (const probe of all) {
+    const selected = selectMemories(records, {
+      cwd: null,
+      types,
+      maxTokens,
+      query: probe.query,
+      relevanceWeight: weight,
+    })
+    const ids = selected.map((entry) => entry.record.id)
+    if (ids.includes(probe.targetId)) covered += 1
+    count += ids.length
+    if (ids.length > 0) nonEmpty += 1
+    const rendered = renderRecall(selected)
+    tokens += rendered === '' ? 0 : estimateTokens(rendered)
+    for (const id of ids) {
+      injectedAll += 1
+      if (originOf.get(id) === 'true-positive') injectedTrue += 1
+    }
+  }
+  const row: InjectionSweep = {
+    weight,
+    covered,
+    meanCount: count / all.length,
+    meanTokens: tokens / all.length,
+    truePositiveShare: injectedAll === 0 ? 0 : injectedTrue / injectedAll,
+    nonEmpty,
+  }
+  sweep.push(row)
+  say(
+    `| ${weight === 0 ? `**${weight}（今天）**` : weight} | **${covered} / ${all.length}（${percent(covered / all.length)}）** | ${row.meanCount.toFixed(1)} | ${row.meanTokens.toFixed(0)} | ${percent(row.truePositiveShare)} | ${nonEmpty} / ${all.length} |`,
+  )
+}
+say('')
+// Coverage first, then the precision proxy, and only then tokens: coverage differences below one
+// probe are noise on 36 probes, and a one-token difference is certainly noise — an earlier version
+// of this line picked 0.65 over 0.8 on 591 against 592 tokens, which is not a reason to prefer
+// anything.
+const best = [...sweep].sort(
+  (left, right) =>
+    right.covered - left.covered || right.truePositiveShare - left.truePositiveShare || left.meanTokens - right.meanTokens,
+)[0]!
+say(
+  `覆盖率最高的是权重 **${best.weight}**（${best.covered}/${all.length}，${percent(best.covered / all.length)}），` +
+    `注入里真记忆占比 ${percent(best.truePositiveShare)}，平均 ${best.meanTokens.toFixed(0)} token。` +
+    `**上线的默认值就取它**，并且它必须继续可复跑：\`node eval/recall-report.ts\` 会重算这张表。`,
+)
+// Why the rest are still missing. Ranking is only one of three gates between "in the store" and "in
+// the prompt", and the other two are cheaper to fix if they are the binding one — so measure the
+// funnel instead of assuming the retriever is at fault.
+say('### 剩下那些为什么还是没被注入：三道闸门的漏斗')
+say('')
+let funnelInjected = 0
+let typeBlocked = 0
+let quotaBlocked = 0
+let budgetBlocked = 0
+let rankMissed = 0
+const blockedExamples: string[] = []
+for (const probe of all) {
+  const target = byId.get(probe.targetId)
+  if (!target) continue
+  const ids = (extra: { quota?: Record<string, number>; maxTokens?: number }): string[] =>
+    selectMemories(records, {
+      cwd: null,
+      types,
+      maxTokens,
+      query: probe.query,
+      relevanceWeight: best.weight,
+      ...extra,
+    }).map((entry) => entry.record.id)
+  if (ids({}).includes(probe.targetId)) {
+    funnelInjected += 1
+    continue
+  }
+  if (!types.includes(target.type)) {
+    typeBlocked += 1
+    if (blockedExamples.length < 5) {
+      blockedExamples.push(`类型 \`${target.type}\` 不在注入白名单：${probe.query.slice(0, 36)}`)
+    }
+    continue
+  }
+  const roomy = { quota: Object.fromEntries(types.map((type) => [type, 999])), maxTokens: 100_000 }
+  if (!ids(roomy).includes(probe.targetId)) {
+    rankMissed += 1
+    if (blockedExamples.length < 5) blockedExamples.push(`相关性没排进：${probe.query.slice(0, 36)}`)
+    continue
+  }
+  if (!ids({ ...roomy, maxTokens }).includes(probe.targetId)) budgetBlocked += 1
+  else quotaBlocked += 1
+}
+say('| 卡在哪一道 | 条数 | 说明 |')
+say('|---|---|---|')
+say(`| **被注入了** | ${funnelInjected} | — |`)
+say(`| 类型过滤（\`types\` 白名单） | ${typeBlocked} | 与排序无关：这类记忆再相关也进不了提示 |`)
+say(`| 类型配额（4/3/2）挤掉 | ${quotaBlocked} | 排序对了，但同类更好的名额已满 |`)
+say(`| token 预算挤掉 | ${budgetBlocked} | 排序对了，但预算装不下 |`)
+say(`| 相关性没排进 | ${rankMissed} | 检索/排序的问题 |`)
+say('')
+for (const example of blockedExamples) say(`- ${example}`)
+say('')
 say('')
 say('同一个"没捞回来"有三种完全不同的成因，分开才能知道该修哪一边：')
 say('')
@@ -493,7 +625,18 @@ const baseline = {
       },
     ]),
   ),
-  injection: { covered: injectedHits, total: all.length, tokens: injectedTokens, maxTokens },
+  injection: {
+    covered: injectedHits,
+    total: all.length,
+    tokens: injectedTokens,
+    maxTokens,
+    sweep: sweep.map((row) => ({
+      relevanceWeight: row.weight,
+      covered: row.covered,
+      meanTokens: Number(row.meanTokens.toFixed(1)),
+      truePositiveShare: Number(row.truePositiveShare.toFixed(3)),
+    })),
+  },
   identifierProbes: identifierProbes.length,
 }
 

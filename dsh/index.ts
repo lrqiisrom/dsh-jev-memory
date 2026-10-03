@@ -72,7 +72,14 @@ import {
 } from './lib/normalize.ts'
 import { createSegmenter, SEGMENT_DEFAULTS, type SegmentSettings } from './lib/segment.ts'
 import { createModelWriter, MODEL_WRITE_DEFAULTS, WRITE_TYPES, type ModelWriteSettings } from './lib/modelwrite.ts'
-import { DEFAULT_QUOTA, inScope, renderRecall, searchMemories, selectMemories } from './lib/recall.ts'
+import {
+  DEFAULT_QUOTA,
+  DEFAULT_RELEVANCE_WEIGHT,
+  inScope,
+  renderRecall,
+  searchMemories,
+  selectMemories,
+} from './lib/recall.ts'
 import { isNoteworthyVeto, signatureOf } from './lib/signals.ts'
 import { archiveId, createMemoryStore, MEMORY_TYPES, type L0Entry, type MemoryRecord } from './lib/store.ts'
 import { ECHO_DEFAULTS, findEcho, type EchoSettings } from './lib/echo.ts'
@@ -217,6 +224,15 @@ export interface AssembleContext {
  */
 const NEAR_DUPLICATE_MIN = 0.5
 
+/**
+ * How much of the person's recent text may become the injection query.
+ *
+ * BM25 divides by document length, so a very long query flattens every memory's score toward zero —
+ * which would silently disable relevance while appearing to be more context. Four thousand characters
+ * is a few turns of conversation, which is what "what are we working on" needs.
+ */
+const RECALL_QUERY_MAX_CHARS = 4000
+
 /** A `systemPrompt.context` definition. */
 export interface PromptContextDefinition {
   name: string
@@ -320,6 +336,16 @@ export interface RecallConfig {
   skipSubagents: boolean
   quota: Record<string, number>
   maxTokens: number
+  /**
+   * How many of the person's recent messages form the injection query.
+   *
+   * 3 covers "what are we working on" without dragging in a finished topic from ten turns ago. `0`
+   * turns the relevance ranking off entirely and restores the pre-2026-10-03 behaviour, which is kept
+   * because it is the configuration the 6% coverage number was measured under.
+   */
+  queryMessages: number
+  /** Importance against relevance; see `DEFAULT_RELEVANCE_WEIGHT` for the sweep. */
+  relevanceWeight: number
 }
 
 /** The fully resolved plugin config: every field present and validated. */
@@ -567,7 +593,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.19.0'
+export const version = '0.20.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -690,6 +716,13 @@ export const DEFAULT_CONFIG: PluginConfig = {
     /** Per-type ceiling and total token budget. */
     quota: { ...DEFAULT_QUOTA },
     maxTokens: 600,
+    // Injection now reads the conversation. Measured on the 36-probe baseline: coverage 0/36 → 17/36,
+    // and the share of injected records that are real memories 20% → 42%. The probing detail is in
+    // `DEFAULT_RELEVANCE_WEIGHT`; the short version is that the old ranking spent the budget on
+    // whatever looked important, and the store's important-looking records are mostly write-side
+    // false positives.
+    queryMessages: 3,
+    relevanceWeight: DEFAULT_RELEVANCE_WEIGHT,
   },
   /** Prompt context ordering; the harness runtime contexts occupy 110–120. */
   contextOrder: 130,
@@ -1280,6 +1313,39 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   const lastRecall = new Map<string, string>()
 
   /**
+   * The person's own recent words, as the query injection ranks against.
+   *
+   * Walks the session log backwards for `count` messages the human wrote. Empty is the honest answer
+   * for a brand-new session and is what keeps the first turn behaving exactly as it used to — there
+   * is no conversation to be relevant to yet.
+   *
+   * The cap is deliberate: BM25 normalises by document length, so pasting an entire file of history
+   * in would dilute every memory's score toward zero and quietly turn relevance off.
+   *
+   * @param session - the session being served, if there is one.
+   * @param count - how many of the person's messages to include.
+   * @returns their text, oldest first, or '' when there is none.
+   */
+  function recallQueryOf(session: SessionLike | null | undefined, count: number): string {
+    if (!session || count <= 0) return ''
+    const limit = typeof session.seq === 'number' ? session.seq : 0
+    const found: string[] = []
+    for (let seq = limit - 1; seq >= 0 && found.length < count; seq -= 1) {
+      const event = session.eventAt?.(seq)
+      if (event?.type !== 'user/message') continue
+      // The `seq` has to be attached: `archiveMessages` numbers the messages it returns by it and
+      // skips any event without one, while `session.eventAt` returns the stored event rather than an
+      // enriched copy. Without this the query was '' for every session — a silently disabled feature
+      // whose output still looked plausible, because the prior ranking was still producing an order.
+      // The end-to-end test is what caught it; a library test could not, since the library was never
+      // the broken part.
+      const text = archiveMessages([{ ...event, seq } as TurnEvent])[0]?.text ?? ''
+      if (text !== '') found.push(text)
+    }
+    return found.reverse().join('\n').slice(0, RECALL_QUERY_MAX_CHARS)
+  }
+
+  /**
    * The recall block for one agent, plus the identities it covered.
    *
    * Extracted from the prompt-context callback because the block is now delivered
@@ -1297,6 +1363,11 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const header = agent?.session?.header
       if (config.recall.skipSubagents && (header?.delegationDepth ?? 0) > 0) return { text: '', ids: [] }
       const cwd = header?.cwd ?? null
+      // What the session is about right now, so injection can look at the conversation instead of
+      // only at the store. Built from the person's own recent messages rather than the model's:
+      // a memory is worth injecting when it bears on what was *asked*, and the assistant's long
+      // replies would swamp the query with words nobody is searching for.
+      const query = recallQueryOf(agent?.session, config.recall.queryMessages)
       const chosen = selectMemories(store.all(), {
         cwd,
         types: config.types,
@@ -1304,6 +1375,8 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         maxTokens: config.recall.maxTokens,
         now: Date.now(),
         preferCanonical: config.normalize.inject,
+        query,
+        relevanceWeight: config.recall.relevanceWeight,
       })
       if (chosen.length === 0) return { text: '', ids: [] }
 

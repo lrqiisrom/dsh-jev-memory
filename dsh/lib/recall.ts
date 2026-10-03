@@ -67,6 +67,27 @@ export interface RecallOptions {
   includeNeedsReview?: boolean
   /** inject the canonical rendering when a record has one. */
   preferCanonical?: boolean
+  /**
+   * What the session is currently about, so injection can look at the conversation.
+   *
+   * Before this existed the injected set was a property of the store alone: "importance ×0.85 +
+   * decay ×0.15", type quotas, token budget. Measured against the 36-probe baseline that covered
+   * **2 of 36 (6%)** of the memories the probes needed — because a memory's importance says nothing
+   * about whether it answers the question being asked right now. Injection is the only recall the
+   * model gets without asking, so missing 94% of what was needed is the largest number on the
+   * reading side.
+   *
+   * Empty or absent keeps the old behaviour exactly (see `relevanceWeight`), which is what the
+   * first turn of a session gets: there is no conversation yet.
+   */
+  query?: string | null
+  /**
+   * How much the query matters against importance, in 0..1.
+   *
+   * `0` is the old ranking; `1` ignores importance entirely. The shipped value is swept against the
+   * probes rather than chosen — see `DEFAULT_RELEVANCE_WEIGHT`.
+   */
+  relevanceWeight?: number
 }
 
 /**
@@ -101,6 +122,36 @@ export interface SearchOptions {
   limit?: number
 }
 
+/**
+ * How much the current conversation counts against a memory's importance when injecting.
+ *
+ * Swept on the 36-probe baseline (`node eval/recall-report.ts`), because the trade is real in both
+ * directions — relevance promotes memories that answer *this* question and demotes memories that were
+ * important in general:
+ *
+ * | weight | coverage | injected that are real memories |
+ * |---|---|---|
+ * | 0 (the old ranking) | 0 / 36 | — |
+ * | 0.35 | 16 / 36 | 22% |
+ * | 0.5 | 16 / 36 | 30% |
+ * | **0.8** | **17 / 36** | **42%** |
+ * | 1.0 | 16 / 36 | 39% |
+ *
+ * Both columns peak at 0.8 and neither is bought with the other, which is unusual enough to say out
+ * loud: the usual objection to relevance-ranked injection is that it fills the budget with whatever
+ * shares a word with the question. Here the opposite happened, because the old ranking was filling
+ * the budget by *importance*, and the store's important-looking records are mostly the write side's
+ * false positives (76 of 94 records in the frozen corpus). The remaining gap is not this number's
+ * fault: 16 of 36 probe targets are typed `fact`, which the injection whitelist refuses, and the
+ * live store contains no `fact` records at all because the write whitelist refuses them first.
+ *
+ * Not 1.0: at full weight a memory written this turn that the conversation has not mentioned yet
+ * scores zero, and importance is the only thing that can carry it. That case is not in the probe set
+ * (the frozen corpus has no recency), so 0.8 is chosen for a reason the probes cannot test — stated
+ * as such rather than dressed up as a measurement.
+ */
+export const DEFAULT_RELEVANCE_WEIGHT = 0.8
+
 /** One ranked search match. */
 export interface SearchHit {
   record: RecallableRecord
@@ -125,6 +176,25 @@ export function selectMemories(records: RecallableRecord[], options: RecallOptio
     preferCanonical = false,
   } = options
 
+  // Relevance is computed for the whole store and normalised by the best hit, so the blended score
+  // stays in the same 0..1 range as the prior and `relevanceWeight` means what it says. Normalising
+  // by the top hit rather than by an absolute score is deliberate: BM25 scores are unbounded and
+  // corpus-dependent, so an absolute threshold would mean something different in every store.
+  const query = (options.query ?? '').trim()
+  const relevanceWeight =
+    query === '' ? 0 : Math.min(1, Math.max(0, options.relevanceWeight ?? DEFAULT_RELEVANCE_WEIGHT))
+  const relevance = new Map<string, number>()
+  if (query !== '' && relevanceWeight > 0) {
+    // The same `cwd` the eligibility filter below uses, and it must be the same: `searchMemories`
+    // excludes out-of-scope records, so scoring with the default `null` returned no hits at all for
+    // workspace-scoped memories — which is most of them — and the relevance term silently became
+    // zero. The feature would have shipped as a no-op that looked like it was working, because the
+    // ranking still produced an order (the prior's).
+    const hits = searchMemories(records, query, { cwd, limit: records.length })
+    const best = hits[0]?.score ?? 0
+    if (best > 0) for (const hit of hits) relevance.set(hit.record.id, hit.score / best)
+  }
+
   const eligible: RecalledMemory[] = []
   for (const record of records) {
     if (!types.includes(record.type)) continue
@@ -134,15 +204,23 @@ export function selectMemories(records: RecallableRecord[], options: RecallOptio
     const decay = 0.5 ** (ageDays / HALF_LIFE_DAYS)
     // Importance dominates; decay only breaks near-ties, so a stale constraint
     // is never displaced by a trivial recent note.
-    const score = record.importance * 0.85 + decay * 0.15
+    const prior = record.importance * 0.85 + decay * 0.15
+    // The blend. At weight 0 this is the line it always was; above it, a memory that shares no
+    // words with the current conversation has to out-rank a relevant one on importance alone,
+    // which is the behaviour the 6% coverage number asked to change.
+    const score = relevanceWeight === 0 ? prior : relevanceWeight * (relevance.get(record.id) ?? 0) + (1 - relevanceWeight) * prior
     eligible.push({ record, score, ageDays })
   }
 
   eligible.sort((a, b) => b.score - a.score || b.record.createdAt - a.record.createdAt)
 
+  // The block is not only its lines: `renderRecall` adds a heading and a retraction note, and the
+  // budget was being spent without them. Measured on the 36-probe baseline the block came to 641
+  // tokens against a 600 budget — a budget the plugin reports as its own and then overran. Charging
+  // the fixed part here is what makes `maxTokens` mean what it says.
+  let tokens = fixedCost()
   const perType = new Map<string, number>()
   const chosen: RecalledMemory[] = []
-  let tokens = 0
   for (const entry of eligible) {
     const used = perType.get(entry.record.type) ?? 0
     const limit = quota[entry.record.type] ?? 0
@@ -155,6 +233,18 @@ export function selectMemories(records: RecallableRecord[], options: RecallOptio
     chosen.push(entry)
   }
   return chosen
+}
+
+/**
+ * What the block costs before any memory is in it: the heading and the retraction note.
+ *
+ * Exported because the evaluation reports a token figure for the same block, and a second copy of
+ * this number would drift the moment the heading changes.
+ *
+ * @returns the token cost of the non-memory part of the injected block.
+ */
+export function fixedCost(): number {
+  return estimateTokens(`${RECALL_HEADER}\n${RECALL_HELP}`)
 }
 
 /**
@@ -176,10 +266,15 @@ export function renderRecall(
 ): string {
   if (!chosen || chosen.length === 0) return ''
   const lines = chosen.map((entry) => renderLine(entry, options.preferCanonical === true))
-  const header = '## 长期记忆（自动积累，按会话工作区召回）'
-  const help = options.includeHelp === false ? '' : '\n（这些记忆由插件自动写入，可随时用 `memory_forget` 撤销或修正。）'
-  return `${header}\n${lines.join('\n')}${help}`
+  const help = options.includeHelp === false ? '' : RECALL_HELP
+  return `${RECALL_HEADER}\n${lines.join('\n')}${help}`
 }
+
+/** The block's heading. A constant so `fixedCost` and the renderer cannot disagree. */
+export const RECALL_HEADER = '## 长期记忆（自动积累，按会话工作区召回）'
+
+/** The retraction note. Part of the injected block, so it is part of its cost. */
+export const RECALL_HELP = '\n（这些记忆由插件自动写入，可随时用 `memory_forget` 撤销或修正。）'
 
 /**
  * One injected line: `- [type] text (id, date)`.

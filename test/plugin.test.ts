@@ -1975,3 +1975,40 @@ test('an empty answer from the write call is a decision, not a missing one', asy
   assert.equal(writePath?.items, 0)
   assert.equal(writePath?.ok, true, 'a parseable empty array is a successful answer')
 })
+
+test('injection leads with what the session is about, and falls back when there is no conversation', async () => {
+  // End to end through the plugin, because the library-level test cannot catch the wiring: the query
+  // has to come from the *session's own* messages, and the session is only reachable from the
+  // prompt-context callback's agent. Two memories, one of which matters for today's question and one
+  // that matters more in general but not here.
+  const { captured } = await mount()
+  const write = toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write')
+  await write.execute({ text: '颜色统一用蓝色系。', type: 'constraint', importance: 0.95 }, { agent: { session: fakeSession({ events: [] }) } })
+  await write.execute({ text: '部署要先把 migrations 跑完再重启。', type: 'constraint', importance: 0.5 }, { agent: { session: fakeSession({ events: [] }) } })
+  await settle()
+
+  // No conversation yet: importance decides, which is the pre-2026-10-03 behaviour.
+  const cold = fakeSession({ events: [] })
+  const coldText = captured.contexts[0]!.text({ agent: { session: cold } })
+  assert.ok(
+    coldText.indexOf('蓝色系') < coldText.indexOf('migrations'),
+    'with nothing said yet, the more important memory leads',
+  )
+
+  // Now the session has said something about deploying.
+  const warm = fakeSession({
+    events: [
+      { type: 'turn/start', data: { turn: 1 } },
+      {
+        type: 'user/message',
+        data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '这次部署流程要注意什么？' }] },
+      },
+    ],
+  })
+  const warmText = captured.contexts[0]!.text({ agent: { session: warm } })
+  assert.ok(
+    warmText.indexOf('migrations') < warmText.indexOf('蓝色系'),
+    'with a question about deploying, the deployment memory leads',
+  )
+  assert.match(warmText, /蓝色系/, 'and the unrelated-but-important one is still injected, not filtered out')
+})

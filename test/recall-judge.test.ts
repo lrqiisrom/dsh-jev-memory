@@ -3,6 +3,7 @@ import { test } from 'node:test'
 
 import { applyGate, createJudge, heuristicRow } from '../dsh/lib/judge.ts'
 import { inScope, renderRecall, searchMemories, selectMemories } from '../dsh/lib/recall.ts'
+import { estimateTokens } from '../dsh/lib/text.ts'
 
 const DAY = 86_400_000
 const NOW = 1_700_000_000_000
@@ -72,11 +73,23 @@ test('selectMemories excludes other workspaces and suspected conflicts', () => {
   assert.deepEqual(chosen.map((entry) => entry.record.id).sort(), ['global', 'here'])
 })
 
-test('selectMemories obeys the token budget', () => {
+test('selectMemories obeys the token budget, and counts the block it is part of', () => {
+  // The budget is the *block's*, not the sum of its lines: `renderRecall` adds a heading and a
+  // retraction note, and those were being spent without being charged. Measured on the 36-probe
+  // baseline the injected block came to 641 tokens against a 600 budget — a budget the plugin
+  // reports as its own and then overran. The first assertion is the behaviour change: a budget
+  // smaller than the fixed part now holds nothing rather than overflowing.
   const records = [memory({ id: 'big', importance: 1 }), memory({ id: 'small', importance: 0.95 })]
   records[0].text = '必须'.repeat(400)
-  const chosen = selectMemories(records, { cwd: '/work/a', types: ['constraint'], maxTokens: 50, now: NOW })
-  assert.deepEqual(chosen.map((entry) => entry.record.id), ['small'])
+  const tight = selectMemories(records, { cwd: '/work/a', types: ['constraint'], maxTokens: 50, now: NOW })
+  assert.deepEqual(tight.map((entry) => entry.record.id), [], 'a 50-token budget cannot hold the header and note')
+
+  const chosen = selectMemories(records, { cwd: '/work/a', types: ['constraint'], maxTokens: 200, now: NOW })
+  assert.deepEqual(chosen.map((entry) => entry.record.id), ['small'], 'the oversized line is skipped, not truncated')
+  assert.ok(
+    estimateTokens(renderRecall(chosen)) <= 200,
+    'and what is actually injected fits the budget it was given',
+  )
 })
 
 test('renderRecall labels type, id and date, and is empty when nothing was chosen', () => {
@@ -261,4 +274,44 @@ test('judge maps model rows onto candidates and rejects types outside the config
   assert.equal(rows[0].by, 'jev')
   assert.equal(model, 'jev-1.13.0', 'the responding model version travels with the judgement')
   assert.equal(degraded, null)
+})
+
+test('injection can rank by what the session is about, and does nothing without a query', () => {
+  // The reading side's largest measured number was that injection covered 2 of 36 needed memories,
+  // because it never looked at the conversation. This pins the two halves of the fix: the query
+  // changes what gets injected, and no query leaves the old ranking exactly as it was (the first turn
+  // of a session has no conversation, and turning relevance into a coin flip there would be worse
+  // than the old behaviour).
+  const records = [memory({ id: 'deploy', importance: 0.5 }), memory({ id: 'style', importance: 1 })]
+  records[0].text = '部署要先把 migrations 跑完再重启。'
+  records[1].text = '颜色统一用蓝色系。'
+  const args = { cwd: '/work/a', types: ['constraint'], maxTokens: 600, now: NOW }
+
+  const without = selectMemories(records, { ...args, query: null })
+  assert.deepEqual(without.map((entry) => entry.record.id), ['style', 'deploy'], 'no query: importance decides')
+
+  const aboutDeploy = selectMemories(records, { ...args, query: '这次部署流程要注意什么？' })
+  assert.equal(aboutDeploy[0]?.record.id, 'deploy', 'with a query, the relevant memory leads')
+
+  // Weight 0 is the escape hatch: a query is present but must not influence the order.
+  const ignored = selectMemories(records, { ...args, query: '这次部署流程要注意什么？', relevanceWeight: 0 })
+  assert.deepEqual(ignored.map((entry) => entry.record.id), ['style', 'deploy'])
+})
+
+test('a memory irrelevant to the query still gets in when the quota is not full', () => {
+  // The point of blending rather than filtering: a highly important memory that shares no words with
+  // the current question keeps its place, so a session does not lose the constraints it is supposed
+  // to be bound by just because today's question is about something else. This is why the default is
+  // 0.8 rather than 1.0.
+  const records = [memory({ id: 'rule', importance: 1 }), memory({ id: 'topic', importance: 0.2 })]
+  records[0].text = '任何时候都不要动 main 分支。'
+  records[1].text = '部署要先把 migrations 跑完再重启。'
+  const chosen = selectMemories(records, {
+    cwd: '/work/a',
+    types: ['constraint'],
+    maxTokens: 600,
+    now: NOW,
+    query: '这次部署流程要注意什么？',
+  })
+  assert.deepEqual(chosen.map((entry) => entry.record.id), ['topic', 'rule'], 'relevant first, important still present')
 })
