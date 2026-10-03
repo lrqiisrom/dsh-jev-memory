@@ -181,7 +181,17 @@ RECALL_BASELINE_OUT=eval/labels/baseline-recall.json node eval/recall-report.ts
 所以这 16 条不是读取侧能修的，要先决定**写入侧白名单要不要放宽**——那是个有标注依据的用户决定，
 不在这一版里自己改。
 
-**可复跑**：`node eval/recall-report.ts` 会重算上面两张表和漏斗；冻结进 `eval/labels/baseline-recall.json` 的
+**预算这个旋钮也量了，结论是别动它**（否定结果）：
+
+| token 预算 | 覆盖率 | 每轮实际用掉 |
+|---|---|---|
+| 600（今天） | 17 / 36（47%） | 592 |
+| 1200 | 18 / 36（50%） | 1173 |
+| 2000 | 18 / 36（50%） | 1569 |
+
+每轮多花约 580 token 只换 **1 个探针**。所以剩下的缺口不在预算——在类型白名单。
+
+**可复跑**：`node eval/recall-report.ts` 会重算上面三张表和漏斗；冻结进 `eval/labels/baseline-recall.json` 的
 `injection.sweep`。
 
 ## 下一步（按价值排序）

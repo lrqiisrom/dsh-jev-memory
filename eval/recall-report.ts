@@ -570,6 +570,36 @@ say(`| 相关性没排进 | ${rankMissed} | 检索/排序的问题 |`)
 say('')
 for (const example of blockedExamples) say(`- ${example}`)
 say('')
+
+// The budget is the one gate here the person can move with a config value, so its price is worth a
+// number rather than a sentence. Coverage per probe at the shipped weight, as the budget grows.
+say('| token 预算 | 覆盖率 | 平均 token（实际用掉） | 平均注入条数 |')
+say('|---|---|---|---|')
+for (const budget of [600, 900, 1200, 2000]) {
+  let covered = 0
+  let used = 0
+  let count = 0
+  for (const probe of all) {
+    const selected = selectMemories(records, {
+      cwd: null,
+      types,
+      maxTokens: budget,
+      query: probe.query,
+      relevanceWeight: best.weight,
+    })
+    if (selected.some((entry) => entry.record.id === probe.targetId)) covered += 1
+    const rendered = renderRecall(selected)
+    used += rendered === '' ? 0 : estimateTokens(rendered)
+    count += selected.length
+  }
+  say(
+    `| ${budget}${budget === maxTokens ? '（今天）' : ''} | **${covered} / ${all.length}（${percent(covered / all.length)}）** | ${(used / all.length).toFixed(0)} | ${(count / all.length).toFixed(1)} |`,
+  )
+}
+say('')
+say('**不要为了覆盖率去调这个值**：600 → 1200 是每轮多花约 580 token，只换来 **1 个探针**（17/36 → 18/36）。')
+say('这是一个否定结果，写下来是为了下次别再去动它——剩下的缺口在类型白名单，不在预算。')
+say('')
 say('')
 say('同一个"没捞回来"有三种完全不同的成因，分开才能知道该修哪一边：')
 say('')
