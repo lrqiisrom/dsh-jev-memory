@@ -24,7 +24,7 @@
  * @module dsh/lib/segment
  */
 
-import type { LlmStreamPort, LogSink } from './normalize.ts'
+import { answerFailure, readAnswer, type LlmStreamPort, type LogSink } from './normalize.ts'
 
 /** One message the segmenter may read. */
 export interface SegmentMessage {
@@ -275,20 +275,26 @@ export function createSegmenter({
           model: route.model,
           system: SEGMENT_SYSTEM,
           messages: [{ role: 'user', content: [{ type: 'text', text: buildSegmentPrompt(messages) }] }],
-          maxTokens: 1200,
+          // Raised from 1200 once thinking was turned off. The two changes belong together: with
+          // thinking on, 1200 tokens were not enough for a dense five-message window and the JSON came
+          // back cut in half (`finish_reason: length`) — the five live `segment` lines all failed that
+          // way — while raising it to 3000 was worse, because the reasoning expanded to fill whatever
+          // it was given (3000 reasoning tokens, no text, 12.5s). With thinking off the budget is spent
+          // on the answer only, so a larger number costs nothing unless the answer needs it: measured
+          // 4/6 windows valid with a median 860ms, no truncation in the sample.
+          maxTokens: 2500,
           signal: controller.signal,
+          reasoningEffort: 'off',
         })
-        let output = ''
-        for await (const chunk of stream) {
-          if (chunk.type === 'text-delta' && typeof chunk.text === 'string') output += chunk.text
-          if (chunk.type === 'finish') break
-        }
-        const decided = explainSegments(output, messages, settings)
-        lastReason = decided.reason
+        const answer = await readAnswer(stream)
+        const decided = explainSegments(answer.text, messages, settings)
+        lastReason = decided.segments === null ? (answerFailure(answer) ?? decided.reason) : decided.reason
         if (decided.segments === null) {
-          log('warn', `segmentation refused (${decided.reason}); the deterministic splitter stands`, {
+          log('warn', `segmentation refused (${lastReason}); the deterministic splitter stands`, {
             messages: messages.length,
-            output: output.slice(0, 80),
+            output: answer.text.slice(0, 80),
+            finish: answer.finish,
+            reasoningChars: answer.reasoningChars,
           })
           return null
         }

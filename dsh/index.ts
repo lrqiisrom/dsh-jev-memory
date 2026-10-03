@@ -567,7 +567,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.18.0'
+export const version = '0.19.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -1193,6 +1193,9 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         modelWrite: {
           window: modelWriteSettings.window,
           budgetMs: modelWriteSettings.timeoutMs,
+          // Thinking off, for the reason measured on this route: with it on the call's median was
+          // 3623ms and 2 of 7 answers were cut off mid-JSON; with it off, 596ms and none.
+          thinking: 'off',
           // Same three states as `segment.route` above, for the same reason: "no route" and "turned
           // off" produce the same absence of writes and are not the same problem.
           route:
@@ -1215,6 +1218,11 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           // write budget is the reason a slow call loses a whole turn, and the start line is where
           // that becomes visible without reading the code.
           budgetMs: segmentSettings.timeoutMs,
+          // The field that decides whether this call works at all on a reasoning route, recorded
+          // because it changed after the live failures: thinking tokens come out of the same budget,
+          // and with thinking on a dense window came back truncated (`finish_reason: length`) — which
+          // the ledger reported as `unparsable`, the word that sends you to the prompt.
+          thinking: 'off',
           // Three different states, three different words. `null` used to mean any of them at once,
           // which is the same mistake as `ready: false` with no `source`: the first start line after
           // this shipped said `route: null` next to `enabled: false`, and there was no way to tell

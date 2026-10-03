@@ -178,3 +178,36 @@ test('no route means no segmentation, and the caller keeps its splitter', async 
   assert.equal(await broken.segment(WINDOW), null)
   assert.match(broken.lastReason(), /^error:/u)
 })
+
+test('a truncated answer is called truncated, and the shipped call asks for no thinking', async () => {
+  // The live `segment` line failed on 5 of 5 turns with `unparsable`, and `unparsable` is the word that
+  // sends you to the prompt. The prompt was fine: the route is a reasoning model, the thinking came out
+  // of the same 1200-token budget, and the JSON arrived cut in half. Measured on a real archived
+  // window, same prompt: thinking on → `finish_reason: length`, 1200 chars, invalid; thinking off →
+  // `finish_reason: stop`, valid, 638ms. So this pins both halves — the word, and the request field
+  // that stops it happening.
+  const asked: Array<Record<string, unknown>> = []
+  const window: SegmentMessage[] = [
+    { seq: 1, role: 'user', text: '必须把端口固定成 8000。' },
+    { seq: 2, role: 'assistant', text: '好的。' },
+  ]
+  const truncated: LlmStreamPort = {
+    stream: (options) => {
+      asked.push(options as unknown as Record<string, unknown>)
+      return (async function* () {
+        yield { type: 'reasoning-delta', text: '先看这段……'.repeat(80) }
+        yield { type: 'text-delta', text: '[{"message": 0, "text": "必须把端口固定成 8000。", "who": "us' }
+        yield { type: 'finish', reason: 'length' }
+      })()
+    },
+  }
+  const segmenter = createSegmenter({
+    llm: truncated,
+    settings: { ...SEGMENT_DEFAULTS, enabled: true },
+    resolveRoute: async () => ({ provider: 'p', model: 'm' }),
+  })
+  assert.equal(await segmenter.segment(window), null, 'a half-written array is refused')
+  assert.equal(segmenter.lastReason(), 'truncated', 'and the ledger names the budget, not the prompt')
+  assert.equal(asked[0]?.reasoningEffort, 'off', 'thinking is off, which is what makes the budget go to the answer')
+  assert.equal(asked[0]?.maxTokens, 2500)
+})

@@ -23,7 +23,7 @@
  * @module dsh/lib/modelwrite
  */
 
-import type { LlmStreamPort, LogSink } from './normalize.ts'
+import { answerFailure, readAnswer, type LlmStreamPort, type LogSink } from './normalize.ts'
 
 /** One message the caller may show the model. */
 export interface WriteMessage {
@@ -242,18 +242,26 @@ export function createModelWriter({
             messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
             maxTokens: 1500,
             signal: controller.signal,
+            // Measured on the route this plugin is handed (`deepseek-flash`, a reasoning model), over
+            // seven real user-anchored windows: thinking on → median 3623ms, worst 7953ms, and 2 of 7
+            // answers cut off mid-JSON and unusable; thinking off → median 596ms, worst 942ms, none
+            // truncated. It is also the closer analogue of the configuration the 0.69 was measured on,
+            // which ran `deepseek-chat` and therefore did not think at all. See
+            // `LlmStreamPort.reasoningEffort` for the mechanism.
+            reasoningEffort: 'off',
           })
-          let output = ''
-          for await (const chunk of stream) {
-            if (chunk.type === 'text-delta' && typeof chunk.text === 'string') output += chunk.text
-            if (chunk.type === 'finish') break
-          }
-          const decided = explainModelWrite(output, messages)
-          lastReason = decided.reason
+          const answer = await readAnswer(stream)
+          const decided = explainModelWrite(answer.text, messages)
+          // A truncated answer is not a refused one, and the two used to share the word `unparsable`:
+          // one means the prompt or the model, the other means the budget. The caller retries both, but
+          // the ledger line is where this gets diagnosed, so it has to say which.
+          lastReason = decided.reason === 'unparsable' ? (answerFailure(answer) ?? decided.reason) : decided.reason
           if (decided.items !== null) return { items: decided.items, model: route.model }
-          log('warn', `model write refused (${decided.reason}); falling back`, {
+          log('warn', `model write refused (${lastReason}); falling back`, {
             messages: messages.length,
-            output: output.slice(0, 80),
+            output: answer.text.slice(0, 80),
+            finish: answer.finish,
+            reasoningChars: answer.reasoningChars,
           })
         } catch (error) {
           lastReason = `error:${String(error).slice(0, 40)}`

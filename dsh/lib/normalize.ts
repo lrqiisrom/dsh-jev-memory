@@ -176,7 +176,89 @@ export interface LlmStreamPort {
     system?: string
     maxTokens?: number
     signal?: AbortSignal
-  }): AsyncIterable<{ type: string; text?: string }>
+    /**
+     * Whether the model may spend tokens thinking before it answers.
+     *
+     * `'off'` is required, not a preference, on any route that serves a reasoning model — and the
+     * route this plugin is handed on the machine it was developed against is one. Measured on
+     * `deepseek-flash`, three calls that all had to fit a 1.5–2.5s budget:
+     *
+     * | call | thinking on | thinking off |
+     * |---|---|---|
+     * | segmentation, 6 real windows | 2/6 valid, median 4467ms | 4/6 valid, median 860ms |
+     * | canonical form, 4 sentences | 3/4 non-empty, max 2026ms | 4/4 non-empty, max 730ms |
+     * | write call, 7 real windows | 1 writeable, median 3623ms, 2/7 truncated | 2 writeable, median 596ms, 0 truncated |
+     *
+     * The mechanism is arithmetic rather than taste: thinking tokens come out of the same
+     * `maxTokens` budget, so a reasoning model either truncates the answer (`finish_reason: length`
+     * with a half-written JSON array — this is what the live `segment` line reported as `unparsable`
+     * on 5 of 5 turns) or spends the whole budget thinking and returns no text at all. The harness
+     * itself does this for its own short structured call (`purpose: 'session-title'` forces thinking
+     * off), and the adapter documents `'off'` as always legal, so this costs nothing where the route
+     * cannot think.
+     */
+    reasoningEffort?: string
+  }): AsyncIterable<{ type: string; text?: string; reason?: string }>
+}
+
+/** One answer, with the two fields the text alone hides. */
+export interface LlmAnswer {
+  /** the concatenated `text-delta` chunks — everything the model said *after* thinking. */
+  text: string
+  /**
+   * How many characters the model spent thinking, which never appears in `text`.
+   *
+   * Read because it is the difference between "the model had nothing to say" and "the model spent the
+   * whole budget thinking", and those two looked identical in the ledger: both produced an empty
+   * answer, and the ledger's word for it was `empty`, which points at the prompt.
+   */
+  reasoningChars: number
+  /** the terminal `finish` reason: `stop`, `length`, `tool-calls`, … or `unknown`. */
+  finish: string
+}
+
+/**
+ * Drain one model stream into an answer.
+ *
+ * Shared by the three structured calls rather than copied into each: they were three copies of the
+ * same four-line loop that kept the text and dropped the finish reason, and the dropped field is
+ * exactly what made a truncated answer indistinguishable from a refused one. One reader means one
+ * place to be right.
+ *
+ * @param stream - the chunk stream from the llm port.
+ * @returns the text, how much thinking was spent, and why the stream ended.
+ */
+export async function readAnswer(stream: AsyncIterable<{ type: string; text?: string; reason?: string }>): Promise<LlmAnswer> {
+  let text = ''
+  let reasoningChars = 0
+  let finish = 'unknown'
+  for await (const chunk of stream) {
+    if (chunk.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
+    // Counted, never merged into the answer: reasoning is not content, and a caller that concatenated
+    // it would be parsing the model's notes as its output.
+    else if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') reasoningChars += chunk.text.length
+    if (chunk.type === 'finish') {
+      finish = typeof chunk.reason === 'string' && chunk.reason !== '' ? chunk.reason : 'stop'
+      break
+    }
+  }
+  return { text, reasoningChars, finish }
+}
+
+/**
+ * Name the failure of an answer that could not be used, using the finish reason.
+ *
+ * `unparsable` was the only word for all of it, and it sends the reader to the prompt. When the
+ * stream ended because the token budget ran out, the prompt is not what is wrong — the budget is, and
+ * on a reasoning route the reason is that the budget was spent before the answer began.
+ *
+ * @param answer - the drained stream.
+ * @returns `'truncated'`, `'empty'`, or null when the answer has text and the caller must judge it.
+ */
+export function answerFailure(answer: LlmAnswer): 'truncated' | 'empty' | null {
+  if (answer.finish === 'length') return 'truncated'
+  if (answer.text.trim() === '') return 'empty'
+  return null
 }
 
 /** A normalizer, or a reason it cannot work. */
@@ -240,18 +322,19 @@ export function createNormalizer({
           messages: [{ role: 'user', content: [{ type: 'text', text: buildNormalizePrompt(text) }] }],
           maxTokens: 400,
           signal: controller.signal,
+          // See `LlmStreamPort.reasoningEffort`: without this the call spends all 400 tokens thinking
+          // and returns nothing, which is what 9 of 12 live normalize lines recorded as `empty`.
+          reasoningEffort: 'off',
         })
-        let output = ''
-        for await (const chunk of stream) {
-          if (chunk.type === 'text-delta' && typeof chunk.text === 'string') output += chunk.text
-          if (chunk.type === 'finish') break
-        }
-        const decided = explainCanonical(text, output, settings)
-        lastReason = decided.reason
+        const answer = await readAnswer(stream)
+        const decided = explainCanonical(text, answer.text, settings)
+        lastReason = decided.text === null ? (answerFailure(answer) ?? decided.reason) : decided.reason
         if (decided.text === null) {
-          log('warn', `canonical form refused (${decided.reason}); the verbatim sentence stands`, {
+          log('warn', `canonical form refused (${lastReason}); the verbatim sentence stands`, {
             input: text.slice(0, 60),
-            output: output.slice(0, 60),
+            output: answer.text.slice(0, 60),
+            finish: answer.finish,
+            reasoningChars: answer.reasoningChars,
           })
           return null
         }

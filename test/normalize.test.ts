@@ -100,3 +100,65 @@ test('every failure keeps the verbatim sentence and reports nothing', async () =
   })
   assert.equal(await disabled.route(), null)
 })
+
+test('a call that reasons instead of answering is reported as such, not as an empty answer', async () => {
+  // This is the shape that cost a real debugging round. On the route the plugin is handed, the model
+  // thinks first and the thinking is streamed as `reasoning-delta`; if the budget runs out during it,
+  // the text is empty and `finish` says `length`. The old reader kept neither field, so the ledger
+  // said `empty` — a word that points at the prompt — for a call whose prompt was fine and whose
+  // budget was the problem. Measured live: 9 of 12 `normalize` lines said exactly that.
+  const settings = { ...NORMALIZE_DEFAULTS, provider: 'p', model: 'm' }
+  const reasoningOnly = createNormalizer({
+    llm: {
+      stream: () =>
+        (async function* () {
+          yield { type: 'reasoning-delta', text: '先想一下……'.repeat(60) }
+          yield { type: 'finish', reason: 'length' }
+        })(),
+    },
+    settings,
+    resolveRoute: async () => ({ provider: 'p', model: 'm' }),
+  })
+  assert.equal(await reasoningOnly.normalize('端口固定 8000'), null)
+  assert.equal(reasoningOnly.lastReason(), 'truncated')
+
+  // And the reasoning must never be treated as the answer: the same stream with `stop` has no text at
+  // all, so it is `empty` rather than a canonical form built from the model's notes.
+  const reasoningStopped = createNormalizer({
+    llm: {
+      stream: () =>
+        (async function* () {
+          yield { type: 'reasoning-delta', text: '服务端口固定为 8000。' }
+          yield { type: 'finish', reason: 'stop' }
+        })(),
+    },
+    settings,
+    resolveRoute: async () => ({ provider: 'p', model: 'm' }),
+  })
+  assert.equal(await reasoningStopped.normalize('端口固定 8000'), null)
+  assert.equal(reasoningStopped.lastReason(), 'empty')
+})
+
+test('every structured call asks for thinking to be off', async () => {
+  // Not a style preference: on a reasoning route the thinking tokens come out of the same budget, and
+  // measured on `deepseek-flash` that was the difference between 2/6 and 4/6 valid segmentations, and
+  // between a median 3623ms and 596ms on the write call. Pinned per call so a future call site cannot
+  // quietly omit it.
+  const seen: Array<Record<string, unknown>> = []
+  const settings = { ...NORMALIZE_DEFAULTS, provider: 'p', model: 'm' }
+  const normalizer = createNormalizer({
+    llm: {
+      stream: (options) => {
+        seen.push(options as unknown as Record<string, unknown>)
+        return (async function* () {
+          yield { type: 'text-delta', text: '服务端口固定为 8000。' }
+          yield { type: 'finish', reason: 'stop' }
+        })()
+      },
+    },
+    settings,
+    resolveRoute: async () => ({ provider: 'p', model: 'm' }),
+  })
+  await normalizer.normalize('端口固定 8000')
+  assert.equal(seen[0]?.reasoningEffort, 'off')
+})
