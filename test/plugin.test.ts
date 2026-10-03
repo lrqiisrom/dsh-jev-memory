@@ -1901,3 +1901,77 @@ test('a model answer that is not verbatim falls back to the deterministic path, 
   assert.equal(writePath?.reason, 'all-refused')
   assert.equal((await ledgerEntries(root)).filter((entry) => entry.kind === 'segment').length, 0, 'no second attempt')
 })
+
+test('a message the model marked entirely as pasted writes nothing, though the splitter would have', async () => {
+  // The latent bug this pins: the extractor used to fall back to the punctuation splitter whenever a
+  // message had no *user* span, so attribution was only being enforced for messages that also
+  // contained something of the person's. A message that was entirely a pasted block came back through
+  // the splitter and the pasted text could be written as their own requirement — reachable only in
+  // that case, which is why the earlier test (one message mixing own text with a paste) did not catch
+  // it. Measured from the other side: note on the labelled rows says 30 of them came from the model.
+  const block = '必须把端口固定成 8000。'
+  const segmented = await mount({ judge: 'auto', segment: { enabled: true } }, 'test-key', (c) => {
+    c.llmPort = fakeLlm(JSON.stringify([{ message: 0, text: block, who: 'pasted' }]))
+    c.defaultModelSelection = { provider: 'p', model: 'test-model' }
+  })
+  const session = fakeSession({ events: turnWith(block) })
+  await listenerFor(segmented.captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
+  assert.equal(
+    promoted(
+      await toolFor<SearchArgs, MemorySearchResult>(segmented.captured, 'memory_search').execute(
+        { query: '端口固定成 8000' },
+        { agent: { session } },
+      ),
+    ).length,
+    0,
+    'the model answered for this message, so its answer stands even when it found nothing of the person in it',
+  )
+
+  // The control: with no model on the path, the same sentence is the local rule's to decide — and it
+  // accepts it. Without this half, the test would pass on a plugin that had stopped writing anything.
+  const plain = await mount({ segment: { enabled: false } })
+  const plainSession = fakeSession({ events: turnWith(block) })
+  await listenerFor(plain.captured, 'agent/turn-stopping')({
+    agent: { id: 's1', session: plainSession },
+    turn: 1,
+    signal: undefined,
+  })
+  assert.equal(
+    promoted(
+      await toolFor<SearchArgs, MemorySearchResult>(plain.captured, 'memory_search').execute(
+        { query: '端口固定成 8000' },
+        { agent: { session: plainSession } },
+      ),
+    ).length,
+    1,
+  )
+})
+
+test('an empty answer from the write call is a decision, not a missing one', async () => {
+  // The rule the model path was measured under is "written iff an accepted item covers the row"
+  // (F1 0.69 over 120 rows). Accepting `[]` as "no answer" instead would hand the decision back to the
+  // local gate — the rule this path exists to overrule — and the shipped behaviour would no longer be
+  // the measured one. The `write-path` line reports `items: 0` for exactly this turn shape.
+  const sentence = '必须把端口固定成 8000。'
+  const { root, captured } = await mount({ writeMode: 'model' }, undefined, (c) => {
+    c.llmPort = llmRouting('[]')
+    c.defaultModelSelection = { provider: 'p', model: 'test-model' }
+  })
+  const session = fakeSession({ events: turnWith(sentence) })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
+
+  assert.equal(
+    promoted(
+      await toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search').execute(
+        { query: '端口固定成 8000' },
+        { agent: { session } },
+      ),
+    ).length,
+    0,
+    'the local rule would have written it, which is the second opinion being declined',
+  )
+  const writePath = (await ledgerEntries(root)).find((entry) => entry.kind === 'write-path')
+  assert.equal(writePath?.reason, 'empty')
+  assert.equal(writePath?.items, 0)
+  assert.equal(writePath?.ok, true, 'a parseable empty array is a successful answer')
+})

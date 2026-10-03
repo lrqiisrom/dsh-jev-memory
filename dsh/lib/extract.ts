@@ -288,18 +288,30 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
   if (!text) return []
 
   const out: Candidate[] = []
-  const providedUnits = config.units?.filter((unit) => unit.seq === seq) ?? []
-  // A message the model declined to segment — or one that arrived while it was unavailable — falls
-  // back to punctuation. `provided` being empty is not the same as the model saying "nothing here":
-  // the caller only passes units for messages it actually got an answer about.
+  // A non-null `units` means a model read this window and answered about it, so for this message its
+  // answer is **authoritative** — including when the answer is "nothing here". That is a rule rather
+  // than a detail, and it was wrong first: the original check was `provided.length > 0`, so a message
+  // the model returned no *user* span for fell back to the punctuation splitter. Two ways that bit:
+  //
+  //  - A message whose every span the model marked `pasted` came back through the splitter, and a
+  //    pasted block could then be written as the person's own requirement — the exact failure
+  //    segmentation exists to prevent, reachable only when the whole message was pasted.
+  //  - On `writeMode: 'model'`, an answer of `[]` ("nothing worth remembering") reverted to the local
+  //    type-and-score gate and could write the very sentence the call had just rejected. The path was
+  //    measured as "written iff an accepted item covers the row" (F1 0.69 over 120 rows); the lenient
+  //    reading would have shipped something else under that number.
+  //
+  // The caller passes `null` — not `[]` — when the call failed, timed out or was refused, so the
+  // splitter still owns every case where no model actually answered.
   //
   // The unit's `type` rides along with its text rather than being looked up again after cleaning,
   // because both `stripPastedPrefixes` and `clipAtClause` may edit the text and the association
   // would then have to be re-derived from a string comparison that could silently mismatch.
-  const sources: Array<{ raw: string; modelType: string | null }> =
-    providedUnits.length > 0
-      ? providedUnits.map((unit) => ({ raw: unit.text, modelType: unit.type ?? null }))
-      : splitSentences(text).map((raw) => ({ raw, modelType: null }))
+  const answered = config.units !== null && config.units !== undefined
+  const provided = config.units?.filter((unit) => unit.seq === seq) ?? []
+  const sources: Array<{ raw: string; modelType: string | null }> = answered
+    ? provided.map((unit) => ({ raw: unit.text, modelType: unit.type ?? null }))
+    : splitSentences(text).map((raw) => ({ raw, modelType: null }))
   for (const { raw, modelType } of sources) {
     // Screen the cleaned sentence, not the raw one: a `\end{itemize}` in front of a task
     // instruction used to change the verdict, which is the prefix deciding policy.
