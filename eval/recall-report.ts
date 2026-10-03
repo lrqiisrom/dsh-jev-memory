@@ -387,8 +387,12 @@ if (embeddingReady) {
   rankers.push(['RRF 融合（用上线的词面检索）+ 名字钉住', fusedPinRanker])
   rankers.push(['伪相关反馈（前 3 条共同词，最多 4 个）', prfRanker(3, 4)])
   rankers.push(['伪相关反馈（前 1 条，最多 4 个）', prfRanker(1, 4)])
-  rankers.push(['**embedding + 名字钉住（名字只出现在 ≤1 条记忆里）**', embeddingPinRanker(1)])
-  rankers.push(['embedding + 名字钉住（≤2 条）', embeddingPinRanker(2)])
+  // The bold row is the one that ships (`<= 2` in `dsh/index.ts`): 0.92 / near 1.00 / far 0.83 /
+  // identifiers 0.98. Bolding `<= 1` instead was a labelling mistake — it is close behind at
+  // 0.90/0.97/0.83/0.95, but it is not what the plugin does, and a report that names the wrong
+  // configuration is worse than one that names none.
+  rankers.push(['embedding + 名字钉住（≤1 条）', embeddingPinRanker(1)])
+  rankers.push(['**embedding + 名字钉住（≤2 条，线上就是这个）**', embeddingPinRanker(2)])
   rankers.push(['embedding + 名字钉住（不限，钉子很钝）', embeddingPinRanker(records.length)])
 }
 for (const [name, ranker] of rankers) {
