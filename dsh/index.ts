@@ -1824,10 +1824,18 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         const previousText = updated === undefined ? '' : (store.get(updated)?.text ?? '')
         await store.put({
           id: candidate.key,
-          type: judgement.type,
+          // The type and importance that the *gate used*, not the judge's own numbers.
+          //
+          // Under `writeGate: deterministic` the gate reads the local type and score while the
+          // judge may answer something else entirely — and this line used the judge's answer, so a
+          // sentence the local rule accepted as `constraint` was stored as the judge's `fact`.
+          // `selectMemories` filters on the type whitelist, so such a record was written and then
+          // never injected: silent, and invisible to a test that asserts through `memory_search`,
+          // which does not filter by type.
+          type: gated?.type ?? judgement.type,
           text: candidate.text,
           cwd,
-          importance: judgement.importance,
+          importance: gated?.importance ?? judgement.importance,
           status: gate.review && replaced === undefined && updated === undefined ? 'needs-review' : 'active',
           supersedes: replaced ?? null,
           source: { sessionId: header?.id ?? agent?.id ?? null, seq: candidate.seq, quote: candidate.quote, at: now },
@@ -1840,8 +1848,11 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         void store.ledger({
           kind: 'write',
           id: candidate.key,
-          type: judgement.type,
-          importance: judgement.importance,
+          // What was acted on, and separately what the model said — the ledger records both so the
+          // two can be compared after the fact instead of being conflated in one field.
+          type: gated?.type ?? judgement.type,
+          importance: gated?.importance ?? judgement.importance,
+          judgeType: judgement.type,
           remember: judgement.remember,
           by: judgement.by,
           model,

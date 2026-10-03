@@ -453,6 +453,47 @@ test('the write gate is deterministic by default and the judge can be put back',
   }
 })
 
+test('a memory the local rule accepted is stored with the type the gate used, so recall finds it', async () => {
+  // The judge answering `fact` while the local signals say `constraint` used to decide two different
+  // things: the gate wrote the record, and the *judge's* type was what got stored. Recall filters on
+  // the type whitelist, so that record was written and then never injected — silent, and invisible
+  // to a test that asserts through `memory_search`, which does not filter by type. This asserts
+  // through the injected context instead.
+  const original = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        model: 'jev-1.13.0',
+        answers: {
+          'remember:0': { type: 'noul', noul: 0.05 },
+          // `pitfall` is in the enabled list on purpose: an answer *outside* it would be replaced by
+          // the candidate's hinted type in the mapper, and the test would pass against the bug. The
+          // mismatch only shows when the judge picks a different member of the list than the local
+          // signals did.
+          'type:0': { type: 'choice', choice: 'pitfall', confidence: 0.9 },
+          'importance:0': { type: 'score', score: 0, legend: {}, confidence: 0.9 },
+          'conflict:0': { type: 'noul', noul: 0.05 },
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )) as unknown as typeof fetch
+  try {
+    const { captured } = await mount({ judge: 'auto', writeGate: 'deterministic' }, 'test-key')
+    const session = fakeSession({ events: TURN_EVENTS })
+    await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
+
+    const injected = captured.contexts[0]!.text({ agent: { session } })
+    assert.match(injected, /pnpm/, 'the local rule accepted it, so it must reach the next session')
+    assert.match(
+      injected,
+      /\[constraint\]/,
+      "the stored type is the one the gate used; the judge answered pitfall, and the local signals said constraint",
+    )
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
 test('deterministic mode refuses a sentence the local signals cannot type', async () => {
   // The other half: the model saying "yes" must not put an untyped sentence into memory either,
   // because a memory that only exists because a model waved it through is the thing this setting
