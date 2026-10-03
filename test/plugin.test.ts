@@ -1545,6 +1545,24 @@ test('the write path uses the model\'s segmentation, and a pasted span is not a 
   assert.ok(archivedHits(await search.execute({ query: '改成 9000' }, { agent: { session } })).length >= 1)
 })
 
+test('the segmentation budget is clamped inside the write budget', async () => {
+  // It shipped at 8s by default, borrowed from the canonical pass (which runs after the deadline).
+  // Eight seconds inside a 2.5s hook does not mean "segmentation falls back" — it means the turn's
+  // write is abandoned, which is a worse failure than the one the setting was meant to avoid.
+  const { root } = await mount(
+    { segment: { enabled: true, timeoutMs: 8000 }, writeTimeoutMs: 2500 },
+    'test-key',
+    (c) => {
+      c.llmPort = fakeLlm('[]')
+      c.defaultModelSelection = { provider: 'p', model: 'test-model' }
+    },
+  )
+  const start = await startEntry(root)
+  const segment = (start as { segment?: { budgetMs?: number } }).segment
+  assert.ok(segment, 'the start line reports the segment state')
+  assert.ok((segment!.budgetMs ?? 0) <= 1250, `budget ${segment!.budgetMs} must fit inside the write budget`)
+})
+
 test('a segmentation the model refuses falls back to the punctuation splitter', async () => {
   // Fail-open in the only direction that is safe: the write path must never depend on a network
   // round trip, so a refusal leaves today's behaviour exactly as it was.

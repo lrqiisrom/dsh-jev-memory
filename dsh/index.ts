@@ -995,7 +995,16 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
    * its own shorter timeout inside that budget, and every failure falls back to the punctuation
    * splitter — the write path must never depend on a network round trip.
    */
-  const segmentSettings: SegmentSettings = { ...SEGMENT_DEFAULTS, ...config.segment }
+  // The segmentation call runs inside the write budget, so its own timeout has to fit *inside*
+  // that budget. It shipped at 8s by default — borrowed from the canonical pass, which runs after
+  // the deadline — and 8s inside a 2.5s hook does not mean "segmentation falls back": it means the
+  // whole turn's write is abandoned when the call is slow. Measured judge latency is ~340ms median,
+  // so half the budget is a generous slice that still leaves room for the judgement and the write.
+  const segmentBudget = Math.min(
+    config.segment.timeoutMs ?? SEGMENT_DEFAULTS.timeoutMs,
+    Math.max(400, Math.floor(config.writeTimeoutMs / 2)),
+  )
+  const segmentSettings: SegmentSettings = { ...SEGMENT_DEFAULTS, ...config.segment, timeoutMs: segmentBudget }
   const segmenter = createSegmenter({
     llm: llmPort,
     settings: segmentSettings,
@@ -1105,7 +1114,11 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           enabled: segmentSettings.enabled,
           window: segmentSettings.window,
           minCoverage: segmentSettings.minCoverage,
-          route: (await segmenter.route()) === null ? null : `${segmentSettings.timeoutMs}ms`,
+          // The *effective* budget, after the clamp above: a config value that would exceed the
+          // write budget is the reason a slow call loses a whole turn, and the start line is where
+          // that becomes visible without reading the code.
+          budgetMs: segmentSettings.timeoutMs,
+          route: (await segmenter.route()) === null ? null : 'configured',
         },
         // The gate, not just the judge. Two runs can both say `judge: jev` while asking the
         // model different questions at different thresholds, and the ledger could not tell
@@ -1553,17 +1566,24 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
             text: window[segment.messageIndex]!.text.slice(segment.start, segment.end),
           }))
       }
-      void store.ledger({
-        kind: 'segment',
-        ok: segmented !== null,
-        reason: segmenter.lastReason(),
-        model: segmented?.model ?? null,
-        window: window.length,
-        units: segmented?.segments.length ?? 0,
-        userUnits: units?.length ?? 0,
-        pasted: segmented?.segments.filter((segment) => segment.attribution === 'pasted').length ?? 0,
-        coverage: segmented ? Number(segmented.coverage.toFixed(2)) : null,
-      })
+      // A line per turn only when something happened. "No route" is a property of the install and
+      // is already on the `start` line; copying it onto every turn would bury the timeouts, which
+      // are the lines worth reading.
+      const segmentReason = segmenter.lastReason()
+      if (segmentReason !== 'no-route') {
+        void store.ledger({
+          kind: 'segment',
+          ok: segmented !== null,
+          reason: segmentReason,
+          model: segmented?.model ?? null,
+          window: window.length,
+          units: segmented?.segments.length ?? 0,
+          userUnits: units?.length ?? 0,
+          pasted: segmented?.segments.filter((segment) => segment.attribution === 'pasted').length ?? 0,
+          coverage: segmented ? Number(segmented.coverage.toFixed(2)) : null,
+          budgetMs: segmentSettings.timeoutMs,
+        })
+      }
 
       const candidates = extractCandidates(events, {
         ...config.extract,
