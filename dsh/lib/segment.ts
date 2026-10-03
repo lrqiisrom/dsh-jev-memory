@@ -216,6 +216,13 @@ export interface Segmenter {
   /** why the last call returned null; `'ok'` after a success. */
   lastReason(): string
   /**
+   * The shape of the last answer, for the ledger.
+   *
+   * `lastReason` alone cannot separate "the answer was cut off by the budget" from "the answer was
+   * unreadable", and those need different fixes. `null` before any call.
+   */
+  lastAnswer(): { finish: string; chars: number; reasoningChars: number } | null
+  /**
    * Segment one window.
    *
    * @param messages - the window, oldest first.
@@ -247,8 +254,10 @@ export function createSegmenter({
   log?: LogSink
 }): Segmenter {
   let lastReason = 'not-attempted'
+  let lastAnswer: { finish: string; chars: number; reasoningChars: number } | null = null
   return {
     lastReason: () => lastReason,
+    lastAnswer: () => lastAnswer,
     route: async () => {
       if (!settings.enabled || llm === undefined) return null
       const route = await resolveRoute().catch(() => null)
@@ -287,6 +296,7 @@ export function createSegmenter({
           reasoningEffort: 'off',
         })
         const answer = await readAnswer(stream)
+        lastAnswer = { finish: answer.finish, chars: answer.text.length, reasoningChars: answer.reasoningChars }
         const decided = explainSegments(answer.text, messages, settings)
         lastReason = decided.segments === null ? (answerFailure(answer) ?? decided.reason) : decided.reason
         if (decided.segments === null) {

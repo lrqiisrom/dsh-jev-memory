@@ -108,6 +108,20 @@ export interface ExtractOptions {
    * over the same 120 rows). Without the field the gate would overrule it and write nothing.
    */
   units?: ReadonlyArray<{ seq: number; text: string; type?: string | null }> | null
+  /**
+   * The message seqs a model was actually shown, when `units` came from a window.
+   *
+   * Without this, "the model answered" was read as "the model answered about every message in the
+   * turn" — and it only ever saw the last few. A turn long enough for the person's message to fall
+   * outside that window therefore produced **no candidates at all**: `provided` was empty for it, the
+   * authoritative rule above suppressed the splitter, and the turn recorded nothing. Real turns in
+   * this very session are that long (five consecutive assistant messages after the human's), so this
+   * is not a corner case.
+   *
+   * `null` (the default) keeps the older, narrower meaning — every message — which is what a caller
+   * that genuinely segmented the whole turn wants.
+   */
+  decidedSeqs?: ReadonlySet<number> | null
   onVeto: ((sentence: string, reason: string | null, seq?: number) => void) | null
 }
 
@@ -307,7 +321,13 @@ function fromUserMessage(message: EventData | null | undefined, seq: number, con
   // The unit's `type` rides along with its text rather than being looked up again after cleaning,
   // because both `stripPastedPrefixes` and `clipAtClause` may edit the text and the association
   // would then have to be re-derived from a string comparison that could silently mismatch.
-  const answered = config.units !== null && config.units !== undefined
+  const answered =
+    config.units !== null &&
+    config.units !== undefined &&
+    // Only the messages the model was shown. A message outside its window keeps the punctuation
+    // splitter, which is the whole point of the fallback: the model's silence about a message it never
+    // saw must not be read as the model's judgement about it.
+    (config.decidedSeqs === null || config.decidedSeqs === undefined || config.decidedSeqs.has(seq))
   const provided = config.units?.filter((unit) => unit.seq === seq) ?? []
   const sources: Array<{ raw: string; modelType: string | null }> = answered
     ? provided.map((unit) => ({ raw: unit.text, modelType: unit.type ?? null }))

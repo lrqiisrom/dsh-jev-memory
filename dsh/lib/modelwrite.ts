@@ -172,6 +172,8 @@ export interface ModelWriter {
   route(): Promise<{ provider: string; model: string } | null>
   /** why the last call returned null; `'ok'` after a success. */
   lastReason(): string
+  /** The shape of the last answer, for the ledger; `null` before any call. */
+  lastAnswer(): { finish: string; chars: number; reasoningChars: number } | null
   /**
    * Decide what to remember from one window.
    *
@@ -203,8 +205,10 @@ export function createModelWriter({
   log?: LogSink
 }): ModelWriter {
   let lastReason = 'not-attempted'
+  let lastAnswer: { finish: string; chars: number; reasoningChars: number } | null = null
   return {
     lastReason: () => lastReason,
+    lastAnswer: () => lastAnswer,
     route: async () => {
       if (!settings.enabled || llm === undefined) return null
       const route = await resolveRoute().catch(() => null)
@@ -251,6 +255,7 @@ export function createModelWriter({
             reasoningEffort: 'off',
           })
           const answer = await readAnswer(stream)
+          lastAnswer = { finish: answer.finish, chars: answer.text.length, reasoningChars: answer.reasoningChars }
           const decided = explainModelWrite(answer.text, messages)
           // A truncated answer is not a refused one, and the two used to share the word `unparsable`:
           // one means the prompt or the model, the other means the budget. The caller retries both, but

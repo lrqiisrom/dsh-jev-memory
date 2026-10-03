@@ -605,7 +605,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.20.0'
+export const version = '0.21.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -1238,9 +1238,8 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         modelWrite: {
           window: modelWriteSettings.window,
           budgetMs: modelWriteSettings.timeoutMs,
-          // Thinking off, for the reason measured on this route: with it on the call's median was
-          // 3623ms and 2 of 7 answers were cut off mid-JSON; with it off, 596ms and none.
-          thinking: 'off',
+          // Requested, not observed — see `segment.requestedReasoningEffort` above.
+          requestedReasoningEffort: 'off',
           // Same three states as `segment.route` above, for the same reason: "no route" and "turned
           // off" produce the same absence of writes and are not the same problem.
           route:
@@ -1263,11 +1262,13 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           // write budget is the reason a slow call loses a whole turn, and the start line is where
           // that becomes visible without reading the code.
           budgetMs: segmentSettings.timeoutMs,
-          // The field that decides whether this call works at all on a reasoning route, recorded
-          // because it changed after the live failures: thinking tokens come out of the same budget,
-          // and with thinking on a dense window came back truncated (`finish_reason: length`) — which
-          // the ledger reported as `unparsable`, the word that sends you to the prompt.
-          thinking: 'off',
+          // What is *requested*, not what was observed. The first version of this line said
+          // `thinking: 'off'` as a literal, which is a claim that cannot be false — and a live
+          // `unparsable` looked like evidence the option was being ignored, when the real cause was a
+          // window too big for its own answer. The service validates this value against the model's
+          // declared efforts and *throws* if unsupported (`dsh-llm` `resolveCallWithInfo`), so a
+          // rejection would surface as `error:...` on the call's own line rather than as silence.
+          requestedReasoningEffort: 'off',
           // Three different states, three different words. `null` used to mean any of them at once,
           // which is the same mistake as `ready: false` with no `source`: the first start line after
           // this shipped said `route: null` next to `enabled: false`, and there was no way to tell
@@ -1761,10 +1762,16 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       // *stop*, never to a second round trip. Doing both would turn a timeout into a lost turn
       // instead of a slower decision.
       const window = archiveMessages(events).slice(-writeWindow)
+      // A window with nothing the person wrote cannot produce a memory, and both callers below exist
+      // only to find the person's own spans. Measured in this very session: five consecutive assistant
+      // messages, 4664 characters, and the segmentation call spent **7 seconds and 2400 tokens** to
+      // answer `no-user-text`. That is the whole write budget spent on a call whose answer is known
+      // before it is made.
+      const hasHumanText = window.some((message) => message.role === 'user')
       let units: Array<{ seq: number; text: string; type?: string | null }> | null = null
       let modelWrite: { ok: boolean; reason: string; model: string | null; items: number; kept: number; worth: number } | null =
         null
-      if (config.writeMode === 'model' && window.length > 0) {
+      if (config.writeMode === 'model' && hasHumanText) {
         const written = await modelWriter.decide(
           window.map((message) => ({ seq: message.seq, role: message.role, text: message.text })),
           signal,
@@ -1798,7 +1805,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         }
         void store.ledger({ kind: 'write-path', mode: 'model', window: window.length, ...modelWrite })
       } else {
-        const segmented = window.length > 0 ? await segmenter.segment(window, signal) : null
+        const segmented = hasHumanText ? await segmenter.segment(window, signal) : null
         if (segmented) {
           // Only the person's own spans become candidates. A block the model marked `pasted`,
           // `quoted` or `tool-output` is real text — it stays in the archive — but it is not their
@@ -1826,6 +1833,14 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
             pasted: segmented?.segments.filter((segment) => segment.attribution === 'pasted').length ?? 0,
             coverage: segmented ? Number(segmented.coverage.toFixed(2)) : null,
             budgetMs: segmentSettings.timeoutMs,
+            // Why it failed, in the line itself. Without these three the live failures read
+            // `unparsable` for a week and that word points at the prompt, while the cause was the token
+            // budget: on a reasoning route the thinking eats it, and on a big window the answer does.
+            // Two different fixes, indistinguishable from the old line.
+            windowChars: window.reduce((total, message) => total + message.text.length, 0),
+            finish: segmenter.lastAnswer()?.finish ?? null,
+            answerChars: segmenter.lastAnswer()?.chars ?? null,
+            reasoningChars: segmenter.lastAnswer()?.reasoningChars ?? null,
           })
         }
       }
@@ -1833,6 +1848,10 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const candidates = extractCandidates(events, {
         ...config.extract,
         units,
+        // Which messages that answer covers. The extractor walks the whole turn, and in a long turn
+        // the person's message is not in the window at all — reading "the model answered" as "the
+        // model answered about everything" made such a turn produce no candidates, silently.
+        decidedSeqs: units === null ? null : new Set(window.map((message) => message.seq)),
         // The extractor reports every rejection; the ledger records the reasons that carry
         // information (see isNoteworthyVeto), because a line per question and per "好的"
         // would bury the lines that matter.
