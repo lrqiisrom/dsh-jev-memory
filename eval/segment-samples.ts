@@ -152,6 +152,10 @@ const segmenter = createSegmenter({
 
 const lines: string[] = ['# 分段抽样：模型切出来的边界与归属', '']
 const reasons = new Map<string, number>()
+/** Wall-clock of each call, because the budget it has to fit inside is the thing that decides
+ *  whether this feature exists in practice: 1250ms inside the hook, and a call that usually exceeds
+ *  it means every turn falls back to the splitter while the ledger says the feature is on. */
+const latencies: number[] = []
 let windows = 0
 let pasted = 0
 let quoted = 0
@@ -176,11 +180,14 @@ for (const file of await sessionFiles()) {
   // right to return nothing. Counting those as failures would make the refusal rate meaningless.
   if (!window.some((message) => message.role === 'user')) continue
   windows += 1
+  const started = Date.now()
   const result = await segmenter.segment(window)
+  const elapsed = Date.now() - started
+  latencies.push(elapsed)
   const reason = segmenter.lastReason()
   reasons.set(reason, (reasons.get(reason) ?? 0) + 1)
   lines.push(`<!-- lastReason=${reason} -->`)
-  lines.push(`## 窗口 ${windows}｜${window.length} 条消息｜判定：${reason}`)
+  lines.push(`## 窗口 ${windows}｜${window.length} 条消息｜判定：${reason}｜耗时 ${elapsed}ms`)
   lines.push('')
   lines.push('**确定性切句（现状）**')
   for (const message of window) {
@@ -211,6 +218,13 @@ for (const file of await sessionFiles()) {
 
 lines.push('## 汇总')
 lines.push('')
+if (latencies.length > 0) {
+  const sorted = [...latencies].sort((left, right) => left - right)
+  const over = latencies.filter((value) => value > 1250).length
+  lines.push(
+    `- 延迟：中位 ${sorted[Math.floor(sorted.length / 2)]}ms｜最慢 ${sorted[sorted.length - 1]}ms｜超过 1250ms 预算的 ${over}/${latencies.length}`,
+  )
+}
 lines.push(`- 窗口数：${windows}`)
 lines.push(`- 判定分布：${[...reasons.entries()].map(([reason, count]) => `${reason} ${count}`).join('、')}`)
 lines.push(`- 标为 \`pasted\` 的片段：${pasted}｜标为 \`quoted\` 的片段：${quoted}`)

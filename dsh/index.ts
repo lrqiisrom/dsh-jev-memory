@@ -1010,14 +1010,20 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
    * its own shorter timeout inside that budget, and every failure falls back to the punctuation
    * splitter — the write path must never depend on a network round trip.
    */
-  // The segmentation call runs inside the write budget, so its own timeout has to fit *inside*
-  // that budget. It shipped at 8s by default — borrowed from the canonical pass, which runs after
-  // the deadline — and 8s inside a 2.5s hook does not mean "segmentation falls back": it means the
-  // whole turn's write is abandoned when the call is slow. Measured judge latency is ~340ms median,
-  // so half the budget is a generous slice that still leaves room for the judgement and the write.
+  // The segmentation call runs inside the write budget, so its own timeout has to fit *inside* that
+  // budget. It shipped at 8s by default — borrowed from the canonical pass, which runs after the
+  // deadline — and 8s inside a 2.5s hook does not mean "segmentation falls back": it means the whole
+  // turn's write is abandoned when the call is slow.
+  //
+  // The number is now measured rather than halved for safety: over 11 real conversation windows the
+  // call took a median of 851ms and at most 1271ms, with 1 of 11 past a 1250ms budget. The judge
+  // answers in a median 342ms, so 900ms of headroom covers the rest of the turn and segmentation
+  // gets 1600ms — enough for every call in that sample, still inside 2500ms in the normal case.
   const segmentBudget = Math.min(
     config.segment.timeoutMs ?? SEGMENT_DEFAULTS.timeoutMs,
-    Math.max(400, Math.floor(config.writeTimeoutMs / 2)),
+    // The rest of the turn needs room: a judge call (median 342ms measured) and the document write.
+    // 900ms of headroom, so with the shipped 2500ms budget segmentation gets 1600ms.
+    Math.max(400, config.writeTimeoutMs - 900),
   )
   const segmentSettings: SegmentSettings = { ...SEGMENT_DEFAULTS, ...config.segment, timeoutMs: segmentBudget }
   const segmenter = createSegmenter({

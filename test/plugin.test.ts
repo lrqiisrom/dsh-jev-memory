@@ -1687,7 +1687,9 @@ test('the segmentation budget is clamped inside the write budget', async () => {
   const start = await startEntry(root)
   const segment = (start as { segment?: { budgetMs?: number } }).segment
   assert.ok(segment, 'the start line reports the segment state')
-  assert.ok((segment!.budgetMs ?? 0) <= 1250, `budget ${segment!.budgetMs} must fit inside the write budget`)
+  // 1600ms with the shipped 2500ms budget: measured segmentation latency is a median 851ms / max
+  // 1271ms, the judge a median 342ms, so the rest of the turn still fits.
+  assert.equal(segment!.budgetMs, 1600, 'the segment budget leaves room for the judge and the write')
 })
 
 test('a segmentation the model refuses falls back to the punctuation splitter', async () => {
