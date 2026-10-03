@@ -29,7 +29,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-import { createBm25Scorer } from '../dsh/lib/conflict.ts'
+import { createBm25Scorer, tokenList } from '../dsh/lib/conflict.ts'
 import { cosineSimilarity, createEmbeddingClient, createVectorCache, vectorKey } from '../dsh/lib/embedding.ts'
 import { estimateTokens } from '../dsh/lib/text.ts'
 import { DEFAULT_QUOTA, NAME_LIKE, searchMemories, selectMemories, renderRecall } from '../dsh/lib/recall.ts'
@@ -278,6 +278,42 @@ const embeddingPinRanker = (maxDocumentFrequency: number): Ranker => (query) => 
   return [...new Set([...pinned, ...ordered])]
 }
 
+/**
+ * Pseudo-relevance feedback: re-rank with the terms the first pass found.
+ *
+ * The default retriever's weak spot is the far question (MRR 0.46): someone asks about a memory without
+ * reusing its words, so a purely lexical score has little to work with. The classic zero-dependency
+ * answer is to let the first pass expand the query — take the terms the top hits have in common and that
+ * the query did not contain, and search again. The risk is symmetric and real: if the first pass is
+ * wrong, this reinforces the mistake, which is why it is measured rather than assumed.
+ *
+ * Terms come from the same tokenizer BM25 uses, so a CJK word stays a word; the expansion is capped at
+ * a handful of terms and each is added once, so the original query still dominates the score.
+ */
+const prfRanker = (topK: number, terms: number): Ranker => (query) => {
+  const first = searchRanker(query)
+  if (first.length === 0) return first
+  const seen = new Set<string>()
+  const counts = new Map<string, number>()
+  for (const id of first.slice(0, topK)) {
+    for (const token of new Set(tokenList(byId.get(id)?.text ?? ''))) {
+      if (token.length < 2 || seen.has(token)) continue
+      counts.set(token, (counts.get(token) ?? 0) + 1)
+    }
+  }
+  const queryTokens = new Set(tokenList(query))
+  const added = [...counts.entries()]
+    // "Appears in several of the top hits" is the evidence that a term is about the topic; with only
+    // one hit there is nothing to be common *with*, so the threshold has to follow `topK` — a fixed
+    // `count >= 2` made the top-1 variant a no-op that measured the baseline twice.
+    .filter(([token, count]) => !queryTokens.has(token) && count >= Math.min(2, topK) && /[\u3400-\u9fff]/u.test(token))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, terms)
+    .map(([token]) => token)
+  if (added.length === 0) return first
+  return searchRanker(`${query} ${added.join(' ')}`)
+}
+
 const legacyRanker: Ranker = (query) => {
   const needle = query.trim().toLowerCase()
   const tokens = needle.split(/[\s,，。、;；]+/u).filter((token) => token.length >= 2)
@@ -349,6 +385,8 @@ if (embeddingReady) {
   rankers.push(['BM25 + embedding 各归一化后相加', hybridRanker])
   rankers.push(['RRF 融合（按名次而不是分数）', rrfRanker])
   rankers.push(['RRF 融合（用上线的词面检索）+ 名字钉住', fusedPinRanker])
+  rankers.push(['伪相关反馈（前 3 条共同词，最多 4 个）', prfRanker(3, 4)])
+  rankers.push(['伪相关反馈（前 1 条，最多 4 个）', prfRanker(1, 4)])
   rankers.push(['**embedding + 名字钉住（名字只出现在 ≤1 条记忆里）**', embeddingPinRanker(1)])
   rankers.push(['embedding + 名字钉住（≤2 条）', embeddingPinRanker(2)])
   rankers.push(['embedding + 名字钉住（不限，钉子很钝）', embeddingPinRanker(records.length)])
@@ -627,6 +665,20 @@ say(`| 类型过滤（\`types\` 白名单） | ${typeBlocked} | 与排序无关�
 say(`| 类型配额（4/3/2）挤掉 | ${quotaBlocked} | 排序对了，但同类更好的名额已满 |`)
 say(`| token 预算挤掉 | ${budgetBlocked} | 排序对了，但预算装不下 |`)
 say(`| 相关性没排进 | ${rankMissed} | 检索/排序的问题 |`)
+say('')
+// The denominator the funnel implies, and it is the one that describes a live store rather than the
+// frozen corpus. Sixteen of the 36 targets are typed `fact`, and the live pipeline refuses to store
+// those at all — the write gate's own ledger shows `type-disabled:fact` skips on real turns. They are
+// here because the corpus builder types a record by its signal (`matchTypeSignals(text).type ?? 'fact'`)
+// rather than by re-running the gate, so the corpus contains sentences the shipped writer would have
+// refused. Restricted to the targets that could exist live, coverage is a different number.
+const storable = all.filter((probe) => byId.get(probe.targetId) !== undefined && types.includes(byId.get(probe.targetId)!.type)).length
+say(
+  `**按"线上真的可能存在"的目标算**：排除那 ${typeBlocked} 条 \`fact\`（写入闸门根本不写这类句子，` +
+    `实测台账里有 \`type-disabled:fact\` 的 skip 行），分母是 ${storable}，注入覆盖 **${funnelInjected} / ${storable}（${percent(funnelInjected / Math.max(1, storable))}）**。`,
+)
+say('')
+say('（这不改变结论，但改变了它的适用范围：排序满分的结论是**可迁移**的，50% 这个分母不是——它含了 16 条线上写不出来的句子。）')
 say('')
 for (const example of blockedExamples) say(`- ${example}`)
 say('')
