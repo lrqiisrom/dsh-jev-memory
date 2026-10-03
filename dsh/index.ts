@@ -614,7 +614,11 @@ export const DEFAULT_CONFIG: PluginConfig = {
   writeEnabled: true,
   writeGate: 'deterministic',
   searchArchive: true,
-  segment: { ...SEGMENT_DEFAULTS },
+  // The library defaults `segment.enabled` to false so consumers opt in deliberately; the shipped
+  // plugin turns it on, because the deterministic splitter was measured against the labelled notes
+  // and the rows it cannot handle are the ones where a message mixes the person's words with a block
+  // they pasted. Every failure path still falls back to the splitter.
+  segment: { ...SEGMENT_DEFAULTS, enabled: true },
   /**
    * Skip delegated child sessions when learning.
    *
@@ -1118,7 +1122,17 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           // write budget is the reason a slow call loses a whole turn, and the start line is where
           // that becomes visible without reading the code.
           budgetMs: segmentSettings.timeoutMs,
-          route: (await segmenter.route()) === null ? null : 'configured',
+          // Three different states, three different words. `null` used to mean any of them at once,
+          // which is the same mistake as `ready: false` with no `source`: the first start line after
+          // this shipped said `route: null` next to `enabled: false`, and there was no way to tell
+          // whether the model was unreachable or the feature was simply off.
+          route: !segmentSettings.enabled
+            ? 'disabled'
+            : llmPort === undefined
+              ? 'no-llm-service'
+              : (await segmenter.route()) === null
+                ? 'no-default-model'
+                : `${(await segmenter.route())!.provider}/${(await segmenter.route())!.model}`,
         },
         // The gate, not just the judge. Two runs can both say `judge: jev` while asking the
         // model different questions at different thresholds, and the ledger could not tell

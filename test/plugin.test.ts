@@ -1586,6 +1586,36 @@ test('the write path uses the model\'s segmentation, and a pasted span is not a 
   assert.ok(archivedHits(await search.execute({ query: '改成 9000' }, { agent: { session } })).length >= 1)
 })
 
+test('the start line distinguishes "off" from "no llm service" from "no default model"', async () => {
+  // The first start line after this shipped said `enabled: false, route: null` — and `null` there
+  // meant any of three different things at once, which is the same mistake as `ready: false` with no
+  // `source`. The value that was actually wrong (the feature was off) could not be told from the one
+  // that would have been fine (no model route).
+  const off = await mount({ segment: { enabled: false } }, 'test-key', (c) => {
+    c.llmPort = fakeLlm('[]')
+    c.defaultModelSelection = { provider: 'p', model: 'test-model' }
+  })
+  assert.equal((await startEntry(off.root)).segment.route, 'disabled')
+
+  const noService = await mount({ segment: { enabled: true } }, 'test-key')
+  assert.equal((await startEntry(noService.root)).segment.route, 'no-llm-service')
+
+  const noModel = await mount({ segment: { enabled: true } }, 'test-key', (c) => {
+    c.llmPort = fakeLlm('[]')
+  })
+  assert.equal((await startEntry(noModel.root)).segment.route, 'no-default-model')
+
+  // And the shipped default is on, because the whole point of the feature is the case the
+  // deterministic splitter cannot see.
+  const shipped = await mount({}, 'test-key', (c) => {
+    c.llmPort = fakeLlm('[]')
+    c.defaultModelSelection = { provider: 'p', model: 'test-model' }
+  })
+  const start = await startEntry(shipped.root)
+  assert.equal(start.segment.enabled, true)
+  assert.equal(start.segment.route, 'p/test-model')
+})
+
 test('the segmentation budget is clamped inside the write budget', async () => {
   // It shipped at 8s by default, borrowed from the canonical pass (which runs after the deadline).
   // Eight seconds inside a 2.5s hook does not mean "segmentation falls back" — it means the turn's
