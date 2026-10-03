@@ -346,6 +346,18 @@ export interface RecallConfig {
   queryMessages: number
   /** Importance against relevance; see `DEFAULT_RELEVANCE_WEIGHT` for the sweep. */
   relevanceWeight: number
+  /**
+   * Which types may be injected, when that should differ from which types may be written.
+   *
+   * These were one value, and they are two decisions. Widening what gets stored is a change to what
+   * the plugin considers a memory; widening what gets injected is a change to how much of the store
+   * the model sees. The funnel measurement showed the coupling has a cost: 16 of 36 probe targets are
+   * typed `fact`, the injection filter refuses them, and *because the same list gates the write path*
+   * there was no way to see what allowing them would buy without also loosening the writer.
+   *
+   * Absent means "the same as `types`", which is the shipped behaviour.
+   */
+  types?: string[]
 }
 
 /** The fully resolved plugin config: every field present and validated. */
@@ -1370,7 +1382,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const query = recallQueryOf(agent?.session, config.recall.queryMessages)
       const chosen = selectMemories(store.all(), {
         cwd,
-        types: config.types,
+        types: config.recall.types ?? config.types,
         quota: config.recall.quota,
         maxTokens: config.recall.maxTokens,
         now: Date.now(),

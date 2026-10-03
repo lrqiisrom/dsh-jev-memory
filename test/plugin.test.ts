@@ -2012,3 +2012,42 @@ test('injection leads with what the session is about, and falls back when there 
   )
   assert.match(warmText, /蓝色系/, 'and the unrelated-but-important one is still injected, not filtered out')
 })
+
+test('the injection whitelist is its own value, and defaults to the write whitelist', async () => {
+  // These were one list, and the funnel measurement showed what that cost: 16 of 36 probe targets are
+  // typed `fact`, the injection filter refuses them, and because the same list gates the writer there
+  // was no way to ask "what would allowing them buy?" without also loosening what gets stored.
+  const asIs = await mount()
+  const written = toolFor<WriteArgs, MemoryWriteResult>(asIs.captured, 'memory_write')
+  await written.execute({ text: '颜色统一用蓝色系。', type: 'constraint' }, { agent: { session: fakeSession({ events: [] }) } })
+  await settle()
+  assert.match(asIs.captured.contexts[0]!.text({ agent: { session: fakeSession({ events: [] }) } }), /蓝色系/)
+
+  // The surprise worth pinning: widening the whitelist **alone changes nothing**, because a type with
+  // no `quota` entry is refused by the next gate (`quota[type] ?? 0`). Both have to open — a knob that
+  // looks like it does nothing is worse than no knob, so the behaviour is written down here rather
+  // than discovered again.
+  const widenedOnly = await mount({ recall: { types: ['constraint', 'fact'] } })
+  await toolFor<WriteArgs, MemoryWriteResult>(widenedOnly.captured, 'memory_write').execute(
+    { text: '颜色统一用蓝色系。', type: 'fact' },
+    { agent: { session: fakeSession({ events: [] }) } },
+  )
+  await settle()
+  assert.equal(
+    widenedOnly.captured.contexts[0]!.text({ agent: { session: fakeSession({ events: [] }) } }),
+    '',
+    'a type with no quota entry is still refused: the whitelist is not the only gate',
+  )
+
+  // With both gates open the memory is injected, and it keeps its own type so the model can weigh it —
+  // while the write whitelist stays exactly as it was, which is the point of splitting the two lists.
+  const split = await mount({ recall: { types: ['constraint', 'fact'], quota: { constraint: 4, fact: 2 } } })
+  await toolFor<WriteArgs, MemoryWriteResult>(split.captured, 'memory_write').execute(
+    { text: '颜色统一用蓝色系。', type: 'fact' },
+    { agent: { session: fakeSession({ events: [] }) } },
+  )
+  await settle()
+  const text = split.captured.contexts[0]!.text({ agent: { session: fakeSession({ events: [] }) } })
+  assert.match(text, /蓝色系/)
+  assert.match(text, /\[fact\]/, 'it keeps its own type')
+})

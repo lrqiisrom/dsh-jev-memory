@@ -32,7 +32,7 @@ import { join } from 'node:path'
 import { createBm25Scorer } from '../dsh/lib/conflict.ts'
 import { cosineSimilarity, createEmbeddingClient, createVectorCache, vectorKey } from '../dsh/lib/embedding.ts'
 import { estimateTokens } from '../dsh/lib/text.ts'
-import { NAME_LIKE, searchMemories, selectMemories, renderRecall } from '../dsh/lib/recall.ts'
+import { DEFAULT_QUOTA, NAME_LIKE, searchMemories, selectMemories, renderRecall } from '../dsh/lib/recall.ts'
 import { buildCorpus, recordsOf } from './lib/recall-corpus.ts'
 import { parseCsvRecords } from './lib/csv.ts'
 
@@ -572,6 +572,55 @@ say(`| 相关性没排进 | ${rankMissed} | 检索/排序的问题 |`)
 say('')
 for (const example of blockedExamples) say(`- ${example}`)
 say('')
+
+// The type filter is the binding gate (16 of 36). It is now a *separate* config value from the write
+// whitelist (`recall.types`), precisely so that this ceiling can be measured without also loosening
+// what the plugin stores — the two were one list, which is why the number below could not be seen.
+say('**如果注入白名单也放行 `fact`**（`recall.types`，与写入白名单现在是两个值）：')
+say('')
+{
+  const widened = [...types, 'fact']
+  // Two gates have to open, and the first attempt at this measurement opened only one: adding `fact`
+  // to the whitelist changed nothing at all, because a type with no `quota` entry is refused by the
+  // quota check (`quota[type] ?? 0`). A knob that appears to do nothing is worse than no knob, so
+  // both gates are opened here and the table says so.
+  const rows: string[] = [
+    `| ${types.join(' / ')}（今天） | ${DEFAULT_QUOTA.constraint} / ${DEFAULT_QUOTA.pitfall} / ${DEFAULT_QUOTA.decision} | ${best.covered} / ${all.length}（${percent(best.covered / all.length)}） | ${best.meanTokens.toFixed(0)} |`,
+  ]
+  for (const factQuota of [4, 8]) {
+    let covered = 0
+    let used = 0
+    for (const probe of all) {
+      const selected = selectMemories(records, {
+        cwd: null,
+        types: widened,
+        quota: { ...DEFAULT_QUOTA, fact: factQuota },
+        maxTokens,
+        query: probe.query,
+        relevanceWeight: best.weight,
+      })
+      if (selected.some((entry) => entry.record.id === probe.targetId)) covered += 1
+      const rendered = renderRecall(selected)
+      used += rendered === '' ? 0 : estimateTokens(rendered)
+    }
+    rows.push(
+      `| ${widened.join(' / ')} | 再加 fact ${factQuota} | **${covered} / ${all.length}（${percent(covered / all.length)}）** | ${(used / all.length).toFixed(0)} |`,
+    )
+  }
+  say(['| 注入白名单 | 配额 | 覆盖率 | 每轮 token |', '|---|---|---|---|', ...rows].join('\n'))
+  say('')
+  say('**78% 是上限，不是可以现在打开的开关**，而且它把决定交回给你：')
+  say('')
+  say('1. **只改注入**（`recall.types` + `recall.quota.fact`）：今天**没有任何效果**——线上库里一条 `fact` 都没有')
+  say('   （核对过 `memory.json`：16 条全是 constraint / decision / pitfall），只是把两个决定拆开、为以后留出位置。')
+  say('2. **要真正拿到这 11 个探针，得先改写入侧**：决定"没有类型关键词的句子写不写"。那是有标注依据的决定')
+  say('   （写入侧已知"21 条正例里 8 条死在白名单上"），而且要连带解决"用什么类型存"——')
+  say('   存成 `fact` 就等于承认第四种记忆类型存在，存成 `decision`/`constraint` 则是让类型信号更宽。')
+  say('')
+  say('注意配额不是越大越好：`fact` 配额 4 是 28/36，8 反而掉到 27/36——同一条预算下，')
+  say('放进来更多 `fact` 就会把分数更低的其它类型挤出去。')
+  say('')
+}
 
 // The budget is the one gate here the person can move with a config value, so its price is worth a
 // number rather than a sentence. Coverage per probe at the shipped weight, as the budget grows.
