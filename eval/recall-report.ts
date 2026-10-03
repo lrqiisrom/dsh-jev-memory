@@ -409,7 +409,9 @@ if (identifierProbes.length === 0) {
 
 say('## 自动注入：不看问题的那条路')
 say('')
-say('自动注入（每个会话开头塞进提示的那段）**完全不看问题**：它按"重要度 ×0.85 + 时间衰减 ×0.15"排序，再按类型配额（硬约束 4 / 坑 3 / 已定决策 2）和 token 预算挑选。所以对它来说没有 Hit@K 可言，能测的是**覆盖率**：')
+say('先看**不看问题**的那条路，也就是 2026-10-03 之前的行为（它仍然被量着，因为基线是它冻结的）：')
+say('它按"重要度 ×0.85 + 时间衰减 ×0.15"排序，再按类型配额（硬约束 4 / 坑 3 / 已定决策 2）和 token 预算挑选。')
+say('所以对它来说没有 Hit@K 可言，能测的是**覆盖率**——这个数字就是当初要做下面那件事的理由：')
 say('')
 let injectedHits = 0
 const injectionMisses: string[] = []
@@ -697,6 +699,21 @@ try {
           `| ${key} | ${metric} | ${percent(before)} | ${percent(after)} | ${movement === 0 ? '持平' : `${movement > 0 ? '+' : ''}${movement} 个点`} |`,
         )
       }
+    }
+    // The injection path is a different retriever and was the one that changed most, so it belongs in
+    // the comparison rather than only in its own section — a change a reader has to hunt for is a
+    // change nobody checks. Two rows, because there are two things to see: the query-aware path
+    // against the baseline (the improvement), and the query-independent path against the baseline
+    // (the cost of finally charging the block's header to its own budget).
+    if (previous.injection) {
+      const coveredMovement = best.covered - previous.injection.covered
+      const shippedMovement = injectedHits - previous.injection.covered
+      say(
+        `| 自动注入（**按当前对话排序**，权重 ${best.weight}） | 覆盖（探针目标真的被注入） | ${previous.injection.covered} / ${previous.injection.total} | **${best.covered} / ${all.length}** | ${coveredMovement > 0 ? '+' : ''}${coveredMovement} 条 |`,
+      )
+      say(
+        `| 自动注入（不看问题，**已不是线上行为**） | 覆盖 | ${previous.injection.covered} / ${previous.injection.total} | ${injectedHits} / ${all.length} | ${shippedMovement === 0 ? '持平' : `${shippedMovement} 条`}（预算终于算上了标题与撤销提示：641 → 594 token） |`,
+      )
     }
     say('')
   }
