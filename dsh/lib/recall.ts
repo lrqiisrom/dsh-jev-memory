@@ -16,6 +16,7 @@
 
 import { createBm25Scorer } from './conflict.ts'
 import { estimateTokens } from './text.ts'
+import { signatureOf } from './signals.ts'
 
 /** Default per-type quota; the sum is the effective injection ceiling. */
 export const DEFAULT_QUOTA: Record<string, number> = { constraint: 4, pitfall: 3, decision: 2 }
@@ -67,6 +68,20 @@ export interface RecallOptions {
   includeNeedsReview?: boolean
   /** inject the canonical rendering when a record has one. */
   preferCanonical?: boolean
+  /**
+   * Leave out an id that is nothing but the sentence's own signature.
+   *
+   * On by default, and it is not cosmetic: for every memory the turn-end writer stores, `id` *is*
+   * `signatureOf(text)` — the same sentence with digits and quotes folded to `<n>`/`<str>` — so the
+   * rendered line was printing the memory twice. Measured on the live store, 16 of 16 records. Half the
+   * block's tokens were a duplicate, and the block was already over its own budget, so this is the
+   * cheapest coverage win available: the same 600 tokens hold roughly twice the memories.
+   *
+   * Ids that carry information are kept: an archive hit (`l0:...`), or any record written before the
+   * signature rule settled. `memory_forget` takes a `query` as well as an `id`, so nothing becomes
+   * unretractable.
+   */
+  omitRedundantId?: boolean
   /**
    * What the session is currently about, so injection can look at the conversation.
    *
@@ -207,6 +222,7 @@ export function selectMemories(records: RecallableRecord[], options: RecallOptio
     now = Date.now(),
     includeNeedsReview = false,
     preferCanonical = false,
+    omitRedundantId = true,
   } = options
 
   // Relevance is computed for the whole store and normalised by the best hit, so the blended score
@@ -261,7 +277,7 @@ export function selectMemories(records: RecallableRecord[], options: RecallOptio
     const used = perType.get(entry.record.type) ?? 0
     const limit = quota[entry.record.type] ?? 0
     if (limit <= 0 || used >= limit) continue
-    const rendered = renderLine(entry, preferCanonical)
+    const rendered = renderLine(entry, preferCanonical, omitRedundantId)
     const cost = estimateTokens(rendered)
     if (tokens + cost > maxTokens) continue
     perType.set(entry.record.type, used + 1)
@@ -281,14 +297,14 @@ export function selectMemories(records: RecallableRecord[], options: RecallOptio
   const reserved: RecalledMemory[] = []
   for (const entry of recent) {
     if (reserved.length >= recentSlots) break
-    const cost = estimateTokens(renderLine(entry, preferCanonical))
+    const cost = estimateTokens(renderLine(entry, preferCanonical, omitRedundantId))
     // It *takes* a slot rather than asking for a spare one. The first version only added when the
     // budget happened to have room, and the measurement showed it doing nothing at all: at the shipped
     // 600-token budget the block is already at 592, so there was never room. A reserve that only fires
     // when nothing needs reserving is not a reserve. The entry it evicts is the lowest-ranked one.
     while (tokens + cost > maxTokens && chosen.length > 0) {
       const dropped = chosen.pop()!
-      tokens -= estimateTokens(renderLine(dropped, preferCanonical))
+      tokens -= estimateTokens(renderLine(dropped, preferCanonical, omitRedundantId))
       perType.set(dropped.record.type, Math.max(0, (perType.get(dropped.record.type) ?? 1) - 1))
     }
     if (tokens + cost > maxTokens) break
@@ -327,10 +343,10 @@ export function fixedCost(): number {
  */
 export function renderRecall(
   chosen: readonly RecalledMemory[] | null | undefined,
-  options: { includeHelp?: boolean; preferCanonical?: boolean } = {},
+  options: { includeHelp?: boolean; preferCanonical?: boolean; omitRedundantId?: boolean } = {},
 ): string {
   if (!chosen || chosen.length === 0) return ''
-  const lines = chosen.map((entry) => renderLine(entry, options.preferCanonical === true))
+  const lines = chosen.map((entry) => renderLine(entry, options.preferCanonical === true, options.omitRedundantId !== false))
   const help = options.includeHelp === false ? '' : RECALL_HELP
   return `${RECALL_HEADER}\n${lines.join('\n')}${help}`
 }
@@ -347,13 +363,17 @@ export const RECALL_HELP = '\n（这些记忆由插件自动写入，可随时�
  * @param entry - one selection entry.
  * @returns the rendered line.
  */
-export function renderLine(entry: RecalledMemory, preferCanonical = false): string {
+export function renderLine(entry: RecalledMemory, preferCanonical = false, omitRedundantId = false): string {
   const date = new Date(entry.record.createdAt).toISOString().slice(0, 10)
   // The canonical form is a cleaned rendering of the same sentence; the verbatim one stays
   // on the record and in the ledger either way.
   const canonical = preferCanonical ? entry.record.canonical : null
   const text = typeof canonical === 'string' && canonical !== '' ? canonical : entry.record.text
-  return `- [${entry.record.type}] ${text} (${entry.record.id}, ${date})`
+  // Checked against the *rendered* text, so a record injected in its canonical form still shows the id
+  // when that id is the verbatim signature: those differ, and the difference is the only handle the
+  // model has for a verbatim record it can no longer see.
+  const redundant = omitRedundantId && signatureOf(text) === entry.record.id
+  return redundant ? `- [${entry.record.type}] ${text} (${date})` : `- [${entry.record.type}] ${text} (${entry.record.id}, ${date})`
 }
 
 /**

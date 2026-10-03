@@ -224,6 +224,60 @@ const rrfRanker: Ranker = (query) => {
   return [...fused.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id)
 }
 
+/**
+ * RRF over *the shipped lexical retriever* and embeddings, with quoted names pinned to the front.
+ *
+ * The fusion above fuses plain BM25, which is not what `memory_search` does — the shipped retriever
+ * adds a verbatim-name bonus that took identifier probes from MRR 0.31 to 1.00, and dropping it is why
+ * the fused row shows 0.31 there. Fusing the retriever that ships is the like-for-like comparison.
+ *
+ * The pin covers what neither score can: when a query quotes a file, a symbol or an error code, the
+ * memory containing it is the one being asked about, and embeddings measured **0.00** on exactly those
+ * probes. Pinning is deliberately blunt — the lexical evidence is a verbatim string match, not a
+ * similarity, so there is nothing to weigh.
+ */
+const fusedPinRanker: Ranker = (query) => {
+  const lexical = searchRanker(query)
+  const embedding = embeddingRanker(query)
+  const fused = new Map<string, number>()
+  for (const [order, weight] of [[lexical, 1], [embedding, 1]] as const) {
+    for (const [index, id] of order.entries()) fused.set(id, (fused.get(id) ?? 0) + weight / (60 + index + 1))
+  }
+  const ordered = [...fused.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id)
+  const names = query.match(NAME_LIKE) ?? []
+  if (names.length === 0) return ordered
+  const pinned = records.filter((record) => names.some((name) => record.text.includes(name))).map((record) => record.id)
+  return [...new Set([...pinned, ...ordered])]
+}
+
+/**
+ * Embeddings, with quoted names pinned — the candidate for what `searchRanking: embedding` should do.
+ *
+ * Measured because the fusion above answered a different question badly. Fusing the shipped lexical
+ * retriever with embeddings scored **worse** than fusing plain BM25 (overall MRR 0.78 against 0.83),
+ * and its near-question MRR fell to 0.88 while *every* retriever here scores 0.97 on those — because
+ * `searchMemories` returns only positively-scoring records, so its rank list is short and RRF's flat
+ * 1/(60+rank) makes the fusion a coin toss at the top. The pin is the part that worked (identifiers
+ * 0.31 → 0.98), and on embeddings it fixes a hole rather than trading against one: embeddings score
+ * **0.00** on identifier probes, and a verbatim name match is evidence no similarity score can beat.
+ */
+const embeddingPinRanker = (maxDocumentFrequency: number): Ranker => (query) => {
+  const ordered = embeddingRanker(query)
+  const names = query.match(NAME_LIKE) ?? []
+  if (names.length === 0) return ordered
+  // Only names that identify *one* memory. Pinning every verbatim match was measured and it costs the
+  // near-question probes (MRR 0.97 → 0.88): those queries reuse the memory's own words, so they contain
+  // ordinary tokens that also look like names and that several records share, and the pin promoted the
+  // wrong ones to the front. A name in exactly one record is the case where the lexical evidence is
+  // unambiguous — which is also how the identifier probes were built ("只在这一条里出现过的名字").
+  const pinned: string[] = []
+  for (const name of names) {
+    const holding = records.filter((record) => record.text.includes(name))
+    if (holding.length > 0 && holding.length <= maxDocumentFrequency) pinned.push(...holding.map((record) => record.id))
+  }
+  return [...new Set([...pinned, ...ordered])]
+}
+
 const legacyRanker: Ranker = (query) => {
   const needle = query.trim().toLowerCase()
   const tokens = needle.split(/[\s,，。、;；]+/u).filter((token) => token.length >= 2)
@@ -294,6 +348,10 @@ if (embeddingReady) {
   rankers.push(['embedding（Zhipu embedding-3，512 维）', embeddingRanker])
   rankers.push(['BM25 + embedding 各归一化后相加', hybridRanker])
   rankers.push(['RRF 融合（按名次而不是分数）', rrfRanker])
+  rankers.push(['RRF 融合（用上线的词面检索）+ 名字钉住', fusedPinRanker])
+  rankers.push(['**embedding + 名字钉住（名字只出现在 ≤1 条记忆里）**', embeddingPinRanker(1)])
+  rankers.push(['embedding + 名字钉住（≤2 条）', embeddingPinRanker(2)])
+  rankers.push(['embedding + 名字钉住（不限，钉子很钝）', embeddingPinRanker(records.length)])
 }
 for (const [name, ranker] of rankers) {
   for (const [label, subset] of [['全部', all], ['近问法', close], ['远问法', far]] as const) {

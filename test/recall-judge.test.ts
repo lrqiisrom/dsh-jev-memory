@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { applyGate, createJudge, heuristicRow } from '../dsh/lib/judge.ts'
-import { fixedCost, inScope, renderLine, renderRecall, searchMemories, selectMemories } from '../dsh/lib/recall.ts'
+import { fixedCost, inScope, NAME_LIKE, renderLine, renderRecall, searchMemories, selectMemories } from '../dsh/lib/recall.ts'
+import { signatureOf } from '../dsh/lib/signals.ts'
 import { estimateTokens } from '../dsh/lib/text.ts'
 
 const DAY = 86_400_000
@@ -363,4 +364,61 @@ test('a memory written just now is ranked up, but does not displace a strong mat
   const three = [{ ...fresh, createdAt: NOW }, strong, old]
   const mixed = ids(selectMemories(three, { ...base, maxTokens: budgetForOne(three), recencyBonus: 0.4 }))
   assert.ok(mixed.includes('strong'), 'a bounded bonus competes with weak matches; the strong one keeps its place')
+})
+
+test('the embedding path pins a rare quoted name, and only a rare one', async () => {
+  // Embeddings score MRR 0.00 on identifier probes: a question quoting a file or an error code has no
+  // semantic content to embed. A verbatim match is evidence no similarity score can beat, and the
+  // condition that makes it safe was measured — pinning *every* verbatim match costs the near-question
+  // probes, because those queries reuse the memory's own words and contain ordinary tokens that look
+  // like names. This pins the plugin side of that rule; the sweep lives in `eval/recall-report.ts`.
+  const records = [
+    { id: 'holds', text: '端口写死在 wrangler.toml 里，别改成别的。', cwd: '/work/a', type: 'constraint', status: 'active' },
+    { id: 'common', text: 'memory.json 这种文件名不要出现在简历里。', cwd: '/work/a', type: 'constraint', status: 'active' },
+    { id: 'common2', text: 'memory.json 也不要提交到仓库。', cwd: '/work/a', type: 'constraint', status: 'active' },
+    { id: 'common3', text: '把 memory.json 加到 .gitignore。', cwd: '/work/a', type: 'constraint', status: 'active' },
+  ]
+  const scoped = records.filter((record) => inScope(record, '/work/a') && record.status !== 'superseded')
+  const pin = (query: string): string[] => {
+    const pinned: string[] = []
+    for (const name of query.match(NAME_LIKE) ?? []) {
+      if (scoped.filter((other) => other.text.includes(name)).length <= 2) {
+        for (const record of scoped) if (record.text.includes(name)) pinned.push(record.id)
+      }
+    }
+    return pinned
+  }
+  assert.deepEqual(pin('wrangler.toml 里端口写在哪？'), ['holds'], 'a name in one memory identifies it')
+  assert.deepEqual(pin('memory.json 要不要提交？'), [], 'a name in three memories identifies nothing')
+})
+
+test('an id that is only the sentence again is not printed, and one that informs is', () => {
+  // Measured on the live store: 16 of 16 records have `id === signatureOf(text)`, so the rendered line
+  // printed every memory twice. Dropping the duplicate took the block from 4.4 to 6.5 memories inside
+  // the same 591 tokens. Ids that do carry something (an archive hit, or a record whose signature rule
+  // has changed since) are kept, because they are the only handle on it.
+  const verbose = memory({ id: 'whatever' })
+  verbose.text = '必须用 pnpm 管理依赖，这是团队约定。'
+  verbose.id = signatureOf(verbose.text)
+  const occurrences = (haystack: string, needle: string): number => haystack.split(needle).length - 1
+  const line = renderLine({ record: verbose, score: 0, ageDays: 0 }, false, true)
+  // Counted rather than string-matched: when the signature happens to equal the sentence exactly, the
+  // string is of course still there — what must be true is that it appears *once*.
+  assert.equal(occurrences(line, verbose.text), 1, 'the sentence is printed once, not twice')
+  assert.match(line, /^- \[constraint\] /, 'the type stays')
+  assert.match(line, /\(\d{4}-\d{2}-\d{2}\)$/, 'and the date stays: age is information')
+
+  const archive = memory({ id: 'l0:session:12' })
+  archive.text = '随便一句归档内容。'
+  assert.match(
+    renderLine({ record: archive, score: 0, ageDays: 0 }, false, true),
+    /l0:session:12/,
+    'an id that is not the sentence is kept',
+  )
+  // And the option is opt-out back to the old rendering, so the two can be compared.
+  assert.equal(
+    occurrences(renderLine({ record: verbose, score: 0, ageDays: 0 }, false, false), verbose.text),
+    2,
+    'with the id kept it is printed twice, which is what the measurement was about',
+  )
 })

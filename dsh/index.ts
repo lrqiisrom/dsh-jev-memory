@@ -75,6 +75,7 @@ import { createModelWriter, MODEL_WRITE_DEFAULTS, WRITE_TYPES, type ModelWriteSe
 import {
   DEFAULT_QUOTA,
   DEFAULT_RELEVANCE_WEIGHT,
+  NAME_LIKE,
   inScope,
   renderRecall,
   searchMemories,
@@ -358,6 +359,15 @@ export interface RecallConfig {
   /** Slots reserved for the newest memories; measured and left off — see `recentSlots` in lib/recall. */
   recentSlots: number
   /**
+   * Leave an id out of the injected line when it is only the sentence's own signature.
+   *
+   * On, and measured: the turn-end writer's ids *are* `signatureOf(text)` (16 of 16 records in the live
+   * store), so the id was printing the memory a second time. Dropping it took the block from 4.4 to
+   * **6.5 memories inside the same 591 tokens**, coverage 17/36 → 18/36, and the budget-blocked cases
+   * in the funnel from 3 to 1.
+   */
+  omitRedundantId: boolean
+  /**
    * Which types may be injected, when that should differ from which types may be written.
    *
    * These were one value, and they are two decisions. Widening what gets stored is a change to what
@@ -616,7 +626,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.22.0'
+export const version = '0.23.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -752,6 +762,7 @@ export const DEFAULT_CONFIG: PluginConfig = {
     // the lowest-ranked answer. See the recency table in the report.
     recencyBonus: 0.4,
     recentSlots: 0,
+    omitRedundantId: true,
   },
   /** Prompt context ordering; the harness runtime contexts occupy 110–120. */
   contextOrder: 130,
@@ -1409,6 +1420,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         relevanceWeight: config.recall.relevanceWeight,
         recencyBonus: config.recall.recencyBonus,
         recentSlots: config.recall.recentSlots,
+        omitRedundantId: config.recall.omitRedundantId,
       })
       if (chosen.length === 0) return { text: '', ids: [] }
 
@@ -1424,10 +1436,12 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           cwd,
           via,
           ids,
-          tokens: estimateTokens(renderRecall(chosen, { includeHelp: false, preferCanonical: config.normalize.inject })),
+          tokens: estimateTokens(
+            renderRecall(chosen, { includeHelp: false, preferCanonical: config.normalize.inject, omitRedundantId: config.recall.omitRedundantId }),
+          ),
         })
       }
-      return { text: renderRecall(chosen, { preferCanonical: config.normalize.inject }), ids }
+      return { text: renderRecall(chosen, { preferCanonical: config.normalize.inject, omitRedundantId: config.recall.omitRedundantId }), ids }
     } catch (error) {
       log('warn', 'recall failed; injecting nothing', { error: String(error) })
       return { text: '', ids: [] }
@@ -2327,7 +2341,34 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           .all()
           .filter((record) => inScope(record, cwdOf(exec)) && record.status !== 'superseded')
         const ranked = await embeddingSearchRanker(asked, scoped, wanted)
-        if (ranked) hits = ranked.map((record) => ({ record, score: 0 }))
+        if (ranked) {
+          // Rare quoted names first, then the semantic order.
+          //
+          // Measured on the 36-probe baseline: embeddings alone score **MRR 0.00 on identifier
+          // probes** — a question quoting a file or an error code has no semantic content to embed, so
+          // the target is nowhere near the top. A verbatim name match is evidence no similarity score
+          // can beat, and pinning is the lexically unambiguous case: the name occurs in one or two
+          // memories. With that condition the embedding path goes 0.90 → **0.92** overall, near
+          // questions 0.97 → **1.00**, far unchanged at 0.83, and identifiers 0.00 → **0.98**.
+          //
+          // The condition matters and was measured: pinning *every* verbatim match costs the near
+          // questions (0.97 → 0.88), because those queries reuse the memory's own words and therefore
+          // contain ordinary tokens that look like names and that several records share.
+          const rare = (record: typeof scoped[number], name: string): boolean =>
+            scoped.filter((other) => other.text.includes(name)).length <= 2 && record.text.includes(name)
+          const pinned: typeof ranked = []
+          for (const name of asked.match(NAME_LIKE) ?? []) {
+            for (const record of scoped) if (rare(record, name)) pinned.push(record)
+          }
+          const ordered: typeof ranked = []
+          const seen = new Set<string>()
+          for (const record of [...pinned, ...ranked]) {
+            if (seen.has(record.id)) continue
+            seen.add(record.id)
+            ordered.push(record)
+          }
+          hits = ordered.map((record) => ({ record, score: 0 }))
+        }
       }
       const matches: MemorySearchMatch[] = hits
         .filter((hit) => (type ? hit.record.type === type : true))
@@ -2412,7 +2453,10 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     parameters: {
       type: 'object',
       properties: {
-        id: { type: 'string', description: '记忆 id（注入的每条记忆后面都带 id）' },
+        id: {
+          type: 'string',
+          description: '记忆 id，只在注入的那条后面带 id 时使用（id 与原文相同的话就不显示了，那时用 query）',
+        },
         query: { type: 'string', description: '按关键词删除，匹配到的全部删除' },
       },
       additionalProperties: false,
