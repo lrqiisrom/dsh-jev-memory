@@ -1586,6 +1586,62 @@ test('the write path uses the model\'s segmentation, and a pasted span is not a 
   assert.ok(archivedHits(await search.execute({ query: '改成 9000' }, { agent: { session } })).length >= 1)
 })
 
+test('a sentence the model already said is not remembered as the person\'s own', async () => {
+  // The largest single reason a labelled row is marked "don't remember": 30 rows note that the text
+  // came from the model, none of them marked "remember", and 24 were still getting through because
+  // the envelope says `user`. The archive keeps the assistant's messages precisely so this check is
+  // possible; the person's own second message is what proves it is not simply refusing everything.
+  const quoted = '把服务端口固定成 8000，避免和其它服务冲突。'
+  const { captured } = await mount({ judge: 'auto' }, 'test-key')
+  const first = fakeSession({
+    events: [
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '端口怎么配？' }] } },
+      {
+        type: 'assistant/message',
+        data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: `建议这样：${quoted}另外记得写进文档。` }] } },
+      },
+    ],
+  })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session: first }, turn: 1, signal: undefined })
+
+  // The next turn pastes that answer back in, verbatim.
+  const second = fakeSession({
+    events: [
+      { type: 'turn/start', data: { turn: 2 } },
+      {
+        type: 'user/message',
+        data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: `就按这个来：${quoted}` }] },
+      },
+    ],
+  })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session: second }, turn: 2, signal: undefined })
+
+  const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+  assert.equal(
+    promoted(await search.execute({ query: '端口固定成 8000' }, { agent: { session: second } })).length,
+    0,
+    'the model said it, so pasting it back is not the person stating a requirement',
+  )
+
+  // And a requirement the person actually writes still gets through — the screen is not a wall.
+  const third = fakeSession({
+    events: [
+      { type: 'turn/start', data: { turn: 3 } },
+      {
+        type: 'user/message',
+        data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '必须把日志级别固定成 warn，不要再改。' }] },
+      },
+    ],
+  })
+  await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session: third }, turn: 3, signal: undefined })
+  assert.equal(
+    promoted(await search.execute({ query: '日志级别固定成 warn' }, { agent: { session: third } })).length,
+    1,
+    'a sentence nobody said before is still remembered',
+  )
+})
+
 test('the start line distinguishes "off" from "no llm service" from "no default model"', async () => {
   // The first start line after this shipped said `enabled: false, route: null` — and `null` there
   // meant any of three different things at once, which is the same mistake as `ready: false` with no

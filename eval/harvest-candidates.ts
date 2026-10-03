@@ -355,7 +355,9 @@ for (const log of await sessionFiles()) {
     }
     if (type === 'turn/start' || type === 'turn/end') {
       flush()
-      seq = 0
+      // `seq` is deliberately *not* reset. It is the join key back into the session, and a number
+      // that repeats every turn joins to the wrong message — the live plugin numbers events
+      // session-globally, so resetting here also made the recorded provenance disagree with it.
       continue
     }
     if (type === 'user/message') {
