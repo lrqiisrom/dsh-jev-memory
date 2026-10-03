@@ -102,7 +102,7 @@ const unique = new Map(rows.map((row) => [row.id, row]))
 const labelled = [...unique.values()]
 console.log(`已标行 ${labelled.length} 条，正在从会话里找它们的位置…`)
 
-const sessions = await readSessions()
+const sessions = await readSessions({ includeChildren: true })
 const located = new Map<string, { session: Session; seq: number }>()
 for (const session of sessions) {
   for (const [key, seq] of session.keyToSeq) {
@@ -117,15 +117,33 @@ interface Finding {
   coverage: number
   /** the note says the text came from the model — the ground truth for this screen. */
   modelNote: boolean
+  /** the same test, but against every session, oldest-first by timestamp. */
+  global: 'echo' | 'clear' | 'na'
 }
 
 const MODEL_NOTE = /模型的输出|模型的回答|模型先说的|模型给了|粘贴的模型|引用的模型|是模型说的/u
+
+/**
+ * Everything the model said anywhere, with a timestamp, for the cross-session test.
+ *
+ * Ordered by time so the comparison can be restricted to what came *before* the candidate: a
+ * sentence cannot be an echo of something said later, and without that bound the whole corpus of
+ * assistant text would match almost anything short.
+ */
+const allAssistant: Array<{ role: string; text: string; time: number | null }> = []
+for (const session of sessions) {
+  for (const message of session.messages) {
+    if (message.role === 'user') continue
+    allAssistant.push({ role: message.role, text: message.text, time: message.time })
+  }
+}
+
 const findings: Finding[] = []
 for (const row of labelled) {
   const place = located.get(row.id)
   const modelNote = MODEL_NOTE.test(row.note)
   if (!place) {
-    findings.push({ row, verdict: 'unlocated', coverage: 0, modelNote })
+    findings.push({ row, verdict: 'unlocated', coverage: 0, modelNote, global: 'na' })
     continue
   }
   // Self-check first: the located message has to actually contain this row's text. Without it, a
@@ -134,11 +152,21 @@ for (const row of labelled) {
   const here = place.session.messages.find((message) => message.seq === place.seq)
   const anchored = here !== undefined && normalizeForEcho(here.text).includes(normalizeForEcho(row.text).slice(0, 24))
   if (!anchored) {
-    findings.push({ row, verdict: 'unlocated', coverage: 0, modelNote })
+    findings.push({ row, verdict: 'unlocated', coverage: 0, modelNote, global: 'na' })
     continue
   }
   const match = findEcho(row.text, earlierMessages(place.session, place.seq))
-  findings.push({ row, verdict: match ? 'echo' : 'clear', coverage: match?.coverage ?? 0, modelNote })
+  const before = here?.time ?? null
+  const global =
+    before === null
+      ? 'na'
+      : findEcho(
+          row.text,
+          allAssistant.filter((message) => message.time !== null && message.time < before),
+        ) !== null
+        ? 'echo'
+        : 'clear'
+  findings.push({ row, verdict: match ? 'echo' : 'clear', coverage: match?.coverage ?? 0, modelNote, global })
 }
 
 const locatedFindings = findings.filter((finding) => finding.verdict !== 'unlocated')
@@ -157,6 +185,12 @@ lines.push(`| note 说"这是模型的输出"的行（在可定位范围内） |
 lines.push(`| 其中被检测出来的 | **${caught.length}** |`)
 lines.push(`| 被误杀的"该记"行 | **${killed.length}**（必须为 0） |`)
 lines.push(`| 被拦下的"不该记"行（它的价值所在） | ${falseAlarm.length} |`)
+const globalCaught = noteRows.filter((finding) => finding.global === 'echo').length
+const globalKilled = positives.filter((finding) => finding.global === 'echo').length
+const globalBlocked = locatedFindings.filter((finding) => finding.global === 'echo' && finding.row.label === '0').length
+lines.push(`| **跨会话比对**：同一批里检出 | ${globalCaught} |`)
+lines.push(`| **跨会话比对**：误杀"该记"行 | **${globalKilled}**（必须为 0） |`)
+lines.push(`| **跨会话比对**：拦下"不该记"行 | ${globalBlocked} |`)
 lines.push('')
 lines.push('## note 说"模型的输出"、但**没**被检测出来的')
 lines.push('')

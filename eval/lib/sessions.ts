@@ -27,6 +27,8 @@ export interface SessionMessage {
   /** `user`, `assistant`, or an injected kind such as `session-reference`. */
   role: string
   text: string
+  /** epoch ms from the event, when the log carries one. */
+  time: number | null
 }
 
 /** One session, ready to be asked about a row. */
@@ -102,13 +104,14 @@ export function parseSession(raw: string, id: string): Session {
     // candidates and reported "no windows recovered" with no hint why.
     turn.push({ seq, type, data: event.data })
     const data = event.data as { source?: { kind?: string }; content?: unknown; message?: { content?: unknown } } | null
+    const time = typeof (event as { time?: unknown }).time === 'number' ? (event as { time: number }).time : null
     if (type === 'user/message') {
       const text = textOf(data?.content)
       const kind = data?.source?.kind
-      if (text !== '') messages.push({ seq, role: typeof kind === 'string' && kind !== '' ? kind : 'user', text })
+      if (text !== '') messages.push({ seq, role: typeof kind === 'string' && kind !== '' ? kind : 'user', text, time })
     } else if (type === 'assistant/message') {
       const text = textOf(data?.message?.content)
-      if (text !== '') messages.push({ seq, role: 'assistant', text })
+      if (text !== '') messages.push({ seq, role: 'assistant', text, time })
     }
     seq += 1
   }
@@ -117,7 +120,7 @@ export function parseSession(raw: string, id: string): Session {
 }
 
 /** Every session log under the harness home, newest generation per session, child sessions skipped. */
-export async function readSessions(options: { max?: number } = {}): Promise<Session[]> {
+export async function readSessions(options: { max?: number; includeChildren?: boolean } = {}): Promise<Session[]> {
   const root = join(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh'), 'sessions')
   const files: Array<{ file: string; id: string }> = []
   for (const workspace of await readdir(root)) {
@@ -146,7 +149,10 @@ export async function readSessions(options: { max?: number } = {}): Promise<Sess
     const raw = readLog(file.file)
     if (raw === '') continue
     // A delegated child's "user" message is the parent agent's own prompt, so judging those would
-    // mean judging words the person never wrote. Same rule as the harvester.
+    // mean judging words the person never wrote. Same rule as the harvester. `includeChildren` is
+    // for the one question that needs the opposite: whether a sentence the person pasted came from a
+    // subagent's *output*, which lives in the child session and nowhere else.
+    if (!options.includeChildren)
     try {
       const head: unknown = JSON.parse(raw.slice(0, raw.indexOf('\n')))
       if (((head as { delegationDepth?: number } | null)?.delegationDepth ?? 0) > 0) continue

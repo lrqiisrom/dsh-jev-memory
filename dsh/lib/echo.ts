@@ -15,6 +15,12 @@
  * rows caught, **0 of the positives killed**, 20 negatives blocked. Lowering the length floor to 6
  * gains nothing; raising coverage to 0.8 drops the catch to 9.
  *
+ * The comparison is deliberately scoped to the same session, and that was measured too rather than
+ * assumed. Broadening it to every session's assistant messages, bounded by timestamp, caught the
+ * same 15 and killed the same zero — so the rows it misses are not quotes of a subagent's output or
+ * of another conversation; they are from other agents, other machines, or hand-edited. A wider net
+ * would only add false-positive risk, so the narrow one is the one that shipped.
+ *
  * @module dsh/lib/echo
  */
 
