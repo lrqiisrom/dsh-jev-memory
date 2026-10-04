@@ -116,8 +116,9 @@ test('prose around the JSON is tolerated, nonsense is not', () => {
 
 test('the prompt carries the window, the indexes and the attributions', () => {
   const prompt = buildSegmentPrompt(WINDOW)
-  assert.match(prompt, /消息 0（角色：user）/)
-  assert.match(prompt, /消息 2（角色：user）/)
+  // The role label now carries the source/context marker too — see the dedicated test below for why.
+  assert.match(prompt, /消息 0（角色：user｜可分段）/)
+  assert.match(prompt, /消息 2（角色：user｜可分段）/)
   assert.match(prompt, /就用刚才那个项目/)
   assert.match(SEGMENT_SYSTEM, /只输出 JSON 数组/)
   assert.match(SEGMENT_SYSTEM, /一字不差的原文片段/)
@@ -210,4 +211,20 @@ test('a truncated answer is called truncated, and the shipped call asks for no t
   assert.equal(segmenter.lastReason(), 'truncated', 'and the ledger names the budget, not the prompt')
   assert.equal(asked[0]?.reasoningEffort, 'off', 'thinking is off, which is what makes the budget go to the answer')
   assert.equal(asked[0]?.maxTokens, 2500)
+})
+
+test('the prompt says which messages may be mined and which are only context', () => {
+  // Borrowed from TencentDB-Agent-Memory, whose extraction prompt separates 背景对话 ("严禁从中提取记忆")
+  // from 待提取的新消息 ("只从这里提取记忆"). We had the same distinction but only in the validator, so the
+  // model spent output enumerating spans inside its own answers — which the caller then threw away.
+  // Measured on three real windows: the person's spans were identical (5/5/7) with and without the
+  // labels, while background spans went 5/0/5 → 0/0/0, answer length fell 3.8× and latency 2.9×.
+  const prompt = buildSegmentPrompt(WINDOW)
+  assert.match(prompt, /角色：user｜可分段/u, "the person's message is marked as the extraction source")
+  assert.match(prompt, /角色：assistant｜仅背景，不要切分/u, "the assistant's is marked as context only")
+  assert.match(SEGMENT_SYSTEM, /不要从里面切分/u, 'and the instruction says so, not just the rendering')
+
+  // An assistant-only window still renders (the caller skips the call, but the prompt must not crash).
+  const onlyAssistant = WINDOW.filter((message) => message.role === 'assistant')
+  assert.match(buildSegmentPrompt(onlyAssistant), /仅背景/u)
 })

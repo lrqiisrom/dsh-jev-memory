@@ -96,7 +96,10 @@ export const SEGMENT_SYSTEM =
   '其中 `text` 必须是那条消息里**一字不差的原文片段**（直接复制，不要改写、不要补标点、不要翻译）。\n' +
   '**不要输出字符下标**，不要解释。\n' +
   '注意：一条消息里可能混着用户自己的话和粘贴块（例如"我觉得应该改成这样：<粘贴一大段>"），' +
-  '这种情况必须切成至少两段，粘贴块标 `pasted`，用户自己的话标 `user`。'
+  '这种情况必须切成至少两段，粘贴块标 `pasted`，用户自己的话标 `user`。\n' +
+  '**哪些消息可以切**：窗口中只有标注为「可分段」的消息是提取源；标注为「仅背景」的消息' +
+  '（助手的回答）**只用来判断用户是不是在粘贴/引用它们**，' +
+  '**不要从里面切分，也不要为它们返回任何 JSON 项**。'
 
 /**
  * Render the window the model reads.
@@ -108,8 +111,32 @@ export const SEGMENT_SYSTEM =
  * @returns the user message for the model.
  */
 export function buildSegmentPrompt(messages: readonly SegmentMessage[]): string {
+  // Borrowed from TencentDB-Agent-Memory's write path, which says this out loud: `【背景对话】（仅供理解
+  // 上下文推断关系/时间，严禁从中提取记忆）` and `【待提取的新消息】（只从这里提取记忆！）`
+  // (`MemoryCore/src/core/prompts/l1-extraction.ts:406-416`). Their guarantee does not depend on the model
+  // marking attribution correctly, because the prompt structure decides what may be mined.
+  //
+  // Ours carried the same distinction only in the validator: the assistant's lines are in the window for
+  // one reason — telling a pasted block apart from the person's own words — and the caller drops spans
+  // attributed to anything but `user`. Saying so costs nothing and saves real work. Measured on three
+  // real windows (`eval/segment-prompt-ab.ts`, 2026-10-03):
+  //
+  //   | variant | their spans | background spans | answer chars | ms |
+  //   |---|---|---|---|---|
+  //   | chronological, unlabelled | 5 / 5 / 7 | 5 / 0 / 5 | 1716 / 395 / 1835 | 3109 / 901 / 3544 |
+  //   | labelled per line | 5 / 5 / 7 | 0 / 0 / 0 | 449 / 395 / 568 | 1110 / 971 / 1226 |
+  //
+  // The person's spans are identical in every window, so the split costs no extraction; what disappears
+  // is the model enumerating spans inside its own answers, which the caller discarded anyway. Answer
+  // length fell 3.8× and latency 2.9× on the two windows that had any.
+  //
+  // Labels go on the line rather than into separate sections (the alternative measured the same) because
+  // attribution leans on adjacency: the answer a block was pasted from is usually the one just before it.
   const body = messages
-    .map((message, index) => `--- 消息 ${index}（角色：${message.role}）---\n${message.text}`)
+    .map((message, index) => {
+      const label = message.role === 'user' ? '可分段' : '仅背景，不要切分'
+      return `--- 消息 ${index}（角色：${message.role}｜${label}）---\n${message.text}`
+    })
     .join('\n')
   return `以下是对话窗口，共 ${messages.length} 条消息。请按要求输出 JSON 数组。\n\n${body}`
 }
