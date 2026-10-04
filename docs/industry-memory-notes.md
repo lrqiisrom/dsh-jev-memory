@@ -151,6 +151,34 @@ L2/L3 的生成也是 LLM 写文件：L2 用 read/write/edit 工具在 `scene_bl
 
 有一个**诚实的小文档集补丁**值得记：BM25 在 1–3 条记录时 IDF→0、绝对分不可靠，所以当 FTS 原始命中数 ≤ maxResults 时**无视阈值直接返回** → 出处：[auto-recall.ts:560-569](https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/29bb8dffa9b11617316d50f21d7a8af9f47240be/MemoryCore/src/core/hooks/auto-recall.ts#L560)
 
+**注入块的封顶情况（2026-10-03 逐行核实 `auto-recall.ts` / `scene-navigation.ts` / `scene-index.ts` / `config.ts`）**：
+
+两块注入，封顶情况**完全不同**：
+
+| 块 | 内容 | 封顶 |
+|---|---|---|
+| `prependContext`（用户消息前，每轮变） | L1 相关记忆 `<relevant-memories>` | **条数封顶 `maxResults=5`**（+ `scoreThreshold=0.3`）；**字符上限默认 `0` = 关闭** |
+| `appendSystemContext`（system prompt 末尾，为缓存而稳定） | L3 persona + **L2 场景导航** + 工具指南 | **全量注入，无截断、无摘要、无上限** |
+
+- 字符预算默认关闭有代码依据：`config.ts:597-598` 两个上限默认 `0`（文档原话 "0 disables the per-memory limit"），
+  `auto-recall.ts:850-852` 直接短路 `if (!maxCharsPerMemory && !maxTotalRecallChars) return lines;`。
+  **全文件找不到任何 token 上限**（`maxInputChars=5000` 限的是 embedding 查询输入，不是注入内容）。
+- L2 全量注入的注释原文在 `auto-recall.ts:10`：`L2 scene navigation (full injection, LLM decides relevance)`；
+  注入处 `231-234`、`273-275` 无长度判断；渲染 `scene-navigation.ts:107-118` 只 `sort by heat` 后 `map`，**没有 slice/limit**；
+  `scene-index.ts:125-155` 把场景目录里**每个 `.md`** 都列进索引。persona 只 `.trim()`（`212-220`）。
+- **没有跨轮去重**：全仓 grep `alreadyInjected|lastInjected|dedupWindow` 在召回路径零命中，每轮按当前用户文本重新搜、重新拼。
+  稳定块逐字节相同（为缓存），L1 块随查询变化。
+- 失败/积压路径：**空**。没有任何"太大就摘要/重压"的分支（`NOT FOUND`）。
+
+> **所以"会不会越用越占 token"的准确答案**：累加的不是对话历史——写入侧抽完即清（`pipeline-manager.ts:684-686` 先清缓冲、
+> `751-754` 归零计数、游标前移；仅失败时放回重试 ≤5 次），每次抽取只吃增量、后台跑。
+> **会随使用时间增长的是"场景文件 + persona"，它们被全量注入且渲染路径无上限**——这是唯一的开放增长点，
+> 而它放进 system prompt 正是为了 prompt cache（`auto-recall.ts:259-268`）：场景一变，缓存失效、按新长度重算。
+>
+> **三处未验证（别当结论用）**：① runner 内部批大小 N 的具体值（在 L1 runner 文件，未读）；
+> ② L2 写入侧是否合并/退休场景以压低总数（渲染路径可验证无上限，写侧未读）；
+> ③ 宿主 OpenClaw/Hermes 拼进 prompt 前是否再裁剪（本文件只组装字符串）。
+
 **注入到哪**——按 prompt 缓存友好切分，这点我们没做：
 
 - `appendSystemContext`（system prompt 末尾，**稳定可缓存**）：L3 persona（`<user-persona>`）、L2 scene navigation（`<scene-navigation>`）、记忆工具使用指南；
