@@ -150,3 +150,34 @@ test('cleaning changes the stored text but never the sentence identity', () => {
   assert.equal(candidate.text, '端口固定 8000，不要改，否则部署会连不上。', 'stored text is cleaned')
   assert.equal(candidate.key, signatureOf(raw), 'identity still comes from the original sentence')
 })
+
+test('a model answer binds only the messages it was shown', () => {
+  // The rule lives here because this is where the two halves meet: the caller walks the whole turn,
+  // while the model only ever read a window of it. Reading "a model answered" as "a model answered
+  // about every message" made a turn produce no candidates at all whenever the person's message fell
+  // outside that window — silently, and with the splitter suppressed as the only explanation.
+  //
+  // The window shape has since changed (it is rounds now, so the person's newest message is always in
+  // it), which makes the old plugin-level scenario unreachable; the rule still has to hold, because a
+  // turn can carry more messages than any window, and because the fallback window still exists.
+  const events: TurnEvent[] = [
+    { seq: 0, type: 'turn/start', data: { turn: 1 } },
+    { seq: 1, type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '必须把端口固定成 8000。' }] } },
+    { seq: 2, type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '好的，我看一下。' }] } } },
+    { seq: 3, type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '另外日志按天切分。' }] } },
+  ]
+  const options = { units: [{ seq: 3, text: '另外日志按天切分。' }], onVeto: null }
+
+  // The model answered about seq 3 only. Seq 1 was never shown to it, so the splitter keeps it.
+  const scoped = extractCandidates(events, { ...options, decidedSeqs: new Set([3]) } as never)
+  assert.deepEqual(
+    scoped.map((candidate) => candidate.text).sort(),
+    ['另外日志按天切分。', '必须把端口固定成 8000。'].sort(),
+    'a message outside the window keeps the punctuation splitter',
+  )
+
+  // Claiming the answer covers the whole turn suppresses the splitter for seq 1 — the old behaviour,
+  // pinned so the difference between the two is visible rather than remembered.
+  const overclaimed = extractCandidates(events, { ...options, decidedSeqs: null } as never)
+  assert.deepEqual(overclaimed.map((candidate) => candidate.text), ['另外日志按天切分。'])
+})

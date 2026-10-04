@@ -438,6 +438,26 @@ export interface PluginConfig {
   /** Settings for the model write path; `window` is read by both paths. */
   modelWrite: Partial<ModelWriteSettings>
   /**
+   * What "the recent conversation" means when a model reads it: **rounds**, not messages.
+   *
+   * A round is one thing the person said plus the final answer they got. Counting *messages* instead
+   * was measured and is the wrong shape: a turn in this very session produced 47 messages, so the last
+   * five were five of the assistant's own lines with nothing of the person's in them — the model was
+   * asked to find their words in a window that could not contain any. Measured on the live log, on the
+   * same session:
+   *
+   * | window | characters | their messages | segment call |
+   * |---|---|---|---|
+   * | last 5 messages (old) | 6779 | 1 (33 chars) | valid, **2807ms** |
+   * | 5 rounds, answers untruncated | 12276 | 5 (239 chars) | valid, 1216ms |
+   * | 5 rounds, answers capped at 150 | **989** | 5 | valid, **1268ms** |
+   *
+   * Counter-intuitive but consistent across the runs: the call's latency tracks the length of *its own
+   * answer* (it quotes every span it keeps), not the size of the window. Capping each round's answer
+   * therefore makes the window smaller *and* more informative at the same time.
+   */
+  conversationWindow: { rounds: number; answerChars: number }
+  /**
    * Whether a sentence the session already said — by the model — may become a memory.
    *
    * On by default, and this is the one screen whose cost was measured against the person's own
@@ -626,7 +646,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.24.0'
+export const version = '0.25.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -711,6 +731,11 @@ export const DEFAULT_CONFIG: PluginConfig = {
   // abort, and a high share of the two latter means the budget, not the prompt, is the problem.
   writeMode: 'pipeline',
   modelWrite: { ...MODEL_WRITE_DEFAULTS },
+  // Five rounds is what the person asked for, and the cap is measured rather than chosen for tidiness:
+  // at 400 characters the model started enumerating spans inside the assistant's answers too (10
+  // segments, 5074ms), while at 150 it returned exactly the five human spans in 1268ms. 200 sits in
+  // that regime with room for a longer reply.
+  conversationWindow: { rounds: 5, answerChars: 200 },
   searchArchive: true,
   // The library defaults `segment.enabled` to false so consumers opt in deliberately; the shipped
   // plugin turns it on, because the deterministic splitter was measured against the labelled notes
@@ -802,6 +827,10 @@ export function resolveConfig(raw: unknown): { config: PluginConfig; problems: s
     ...DEFAULT_CONFIG,
     ...(source as Partial<PluginConfig>),
     recall: { ...DEFAULT_CONFIG.recall, ...((source.recall ?? {}) as Partial<RecallConfig>) },
+    conversationWindow: {
+      ...DEFAULT_CONFIG.conversationWindow,
+      ...((source.conversationWindow ?? {}) as Partial<PluginConfig['conversationWindow']>),
+    },
     jev: { ...((source.jev ?? {}) as Partial<JevSettings>) },
     normalize: { ...DEFAULT_CONFIG.normalize, ...((source.normalize ?? {}) as Partial<NormalizeSettings>) },
   }
@@ -1448,6 +1477,54 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     }
   }
 
+  /**
+   * The conversation a model reads on the write path: the last few **rounds**, oldest first.
+   *
+   * One round is a message the person wrote plus the final answer that followed it. The intermediate
+   * assistant lines and tool traffic of a long turn are deliberately left out: they are what the turn
+   * *did*, not what was said to the person, and including them is what made the old window (the last
+   * five messages) capable of containing nothing the person wrote.
+   *
+   * Walked backwards from the end of the session log so a long session costs five rounds, not its
+   * whole history. Returns null when the session cannot be walked — the caller then keeps the old
+   * message-count window, which is also what its own tests exercise.
+   *
+   * @param session - the session being written from.
+   * @param rounds - how many rounds to include.
+   * @param answerChars - cap on each round's answer; the person's own words are never truncated.
+   * @returns the window in reading order, or null.
+   */
+  function conversationWindowOf(
+    session: SessionLike | null | undefined,
+    rounds: number,
+    answerChars: number,
+  ): Array<{ seq: number; role: string; text: string }> | null {
+    if (!session?.eventAt || rounds <= 0) return null
+    const limit = typeof session.seq === 'number' ? session.seq : 0
+    const collected: Array<{ seq: number; role: string; text: string }> = []
+    // Assistant lines of the round being walked, newest first. The first one collected is that round's
+    // final answer, which is the only one the next round's reader needs.
+    let answers: Array<{ seq: number; text: string }> = []
+    let found = 0
+    for (let seq = limit - 1; seq >= 0 && found < rounds; seq -= 1) {
+      const event = session.eventAt(seq)
+      if (!event) continue
+      const message = archiveMessages([{ ...event, seq } as TurnEvent])[0]
+      if (!message) continue
+      if (message.role === 'assistant') {
+        answers.push({ seq, text: message.text })
+        continue
+      }
+      if (message.role !== 'user') continue
+      collected.push({ seq, role: 'user', text: message.text })
+      const answer = answers[0]
+      if (answer && answerChars > 0) collected.push({ seq: answer.seq, role: 'assistant', text: answer.text.slice(0, answerChars) })
+      answers = []
+      found += 1
+    }
+    return collected.reverse()
+  }
+
   const recallText = (assembleCtx: AssembleContext): string => renderRecallFor(assembleCtx?.agent, 'context').text
 
   ctx.inject(['systemPrompt'], (scope) => {
@@ -1794,7 +1871,15 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       // the whole budget — so a failed model write must fall back to the deterministic splitter and
       // *stop*, never to a second round trip. Doing both would turn a timeout into a lost turn
       // instead of a slower decision.
-      const window = archiveMessages(events).slice(-writeWindow)
+      // The model reads rounds; the fallback is the old message-count window for a session that cannot
+      // be walked (and for the tests that drive the hook with a hand-built event list).
+      const conversation = conversationWindowOf(
+        agent?.session,
+        config.conversationWindow.rounds,
+        config.conversationWindow.answerChars,
+      )
+      const window =
+        conversation && conversation.length > 0 ? conversation : archiveMessages(events).slice(-writeWindow)
       // A window with nothing the person wrote cannot produce a memory, and both callers below exist
       // only to find the person's own spans. Measured in this very session: five consecutive assistant
       // messages, 4664 characters, and the segmentation call spent **7 seconds and 2400 tokens** to

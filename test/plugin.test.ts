@@ -2052,56 +2052,44 @@ test('the injection whitelist is its own value, and defaults to the write whitel
   assert.match(text, /\[fact\]/, 'it keeps its own type')
 })
 
-test('a long turn still remembers what the person said outside the window', async () => {
-  // The bug this pins is silent, and long agentic turns are the shape that triggers it. The extractor
-  // walks the whole turn, but a segmentation answer covers only the window it was shown — and reading
-  // "the model answered" as "the model answered about every message" suppressed the splitter for the
-  // person's earlier message too, so the turn recorded **nothing**. It stayed masked in production
-  // because the segmenter was failing on every call, which kept `units` null and the splitter in
-  // charge; fixing the segmenter would have activated it.
-  //
-  // The window here does contain human text (so the call happens and `units` is a real, non-null
-  // answer) while the sentence that must be remembered sits outside it. Without that arrangement the
-  // guard in the other new test short-circuits the call and this test would pass for the wrong reason.
-  const outside = '必须把端口固定成 8000。'
-  const inside = '另外颜色统一用蓝色系，这条也要记住。'
+test('a long turn still shows the model what the person said', async () => {
+  // The window used to be the last five *messages*, and a turn in this session produced 47 of them — so
+  // the last five were five of the assistant's own lines and the person's message, at the start of the
+  // turn, was not in the window at all. The model was asked to find their words in a window that could
+  // not contain any. The window is now five *rounds*: their prompt plus the final answer of each, which
+  // is both what the person asked for and what makes the question answerable.
+  const own = '必须把端口固定成 8000。'
   const assistant = (note: string): TurnEvent => ({
     type: 'assistant/message',
     data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: note }] } },
   })
   const events: TurnEvent[] = [
     { type: 'turn/start', data: { turn: 1 } },
-    { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: outside }] } },
-    assistant('先看一下现有配置。'),
-    assistant('再看一下文档。'),
-    assistant('然后开始改。'),
-    // Inside the window from here on: this one makes the window contain human text, and the model
-    // returns it as a span. The answer has to be **valid and non-empty** for this test to isolate the
-    // scoping at all — an empty answer is refused as `empty`, which leaves `units` null and hands every
-    // message to the splitter, so the test would pass against the bug (it did, first attempt).
-    { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: inside }] } },
-    assistant('查一下。'),
-    assistant('看到了。'),
-    assistant('还有别的问题吗？'),
+    { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: own }] } },
+    ...Array.from({ length: 12 }, (_, at) => assistant(`第 ${at} 段工具输出，没有任何用户内容。`)),
   ]
+  let prompt = ''
   const { captured } = await mount({ judge: 'auto', segment: { enabled: true } }, 'test-key', (c) => {
-    // `message: 1` is the window's own human message: window = the last five events, so index 0 is the
-    // third assistant line and index 1 is this one.
-    c.llmPort = fakeLlm(JSON.stringify([{ message: 1, text: inside, who: 'user' }]))
+    c.llmPort = {
+      stream: (options: { messages: Array<{ content: Array<{ text: string }> }> }) => {
+        prompt = options.messages[0]?.content[0]?.text ?? ''
+        return (async function* () {
+          yield { type: 'text-delta', text: JSON.stringify([{ message: 0, text: own, who: 'user' }]) }
+          yield { type: 'finish', reason: 'stop' }
+        })()
+      },
+    }
     c.defaultModelSelection = { provider: 'p', model: 'test-model' }
   })
   const session = fakeSession({ events })
   await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
 
+  assert.match(prompt, /必须把端口固定成 8000/, 'the person\'s own message is in the window the model reads')
   const found = await toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search').execute(
     { query: '端口固定成 8000' },
     { agent: { session } },
   )
-  assert.equal(
-    promoted(found).length,
-    1,
-    'a message the model never saw keeps the punctuation splitter, however long the turn is',
-  )
+  assert.equal(promoted(found).length, 1, 'and the span it returned for it becomes the memory')
 })
 
 test('no call is made when the window holds nothing the person wrote', async () => {
