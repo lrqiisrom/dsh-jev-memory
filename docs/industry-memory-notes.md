@@ -91,6 +91,25 @@ agent_end 钩子
 
 → 出处：[auto-capture.ts:1-11](https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/29bb8dffa9b11617316d50f21d7a8af9f47240be/MemoryCore/src/core/hooks/auto-capture.ts#L1)（注释原文："Extraction is NOT triggered here. The pipeline manager decides when."）、[pipeline-manager.ts:37-68](https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/29bb8dffa9b11617316d50f21d7a8af9f47240be/MemoryCore/src/utils/pipeline-manager.ts#L37)、[persona-trigger.ts](https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/29bb8dffa9b11617316d50f21d7a8af9f47240be/MemoryCore/src/core/persona/persona-trigger.ts)
 
+**"窗口"不是"最近 N 轮"，而是"自上次抽取以来的增量"**（2026-10-03 重读 `pipeline-manager.ts` 补齐的细节，
+笔记第一版只记了阈值）：
+
+- 钩子侧**只缓冲**：`auto-capture` 取本轮新消息 → `notifyConversation` 把消息 `push` 进**按会话的内存缓冲**
+  并重置空闲计时器，**没有任何"取最近 N 条/轮"的动作** → 出处：[pipeline-manager.ts 类注释与 `notifyConversation`](https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/29bb8dffa9b11617316d50f21d7a8af9f47240be/MemoryCore/src/utils/pipeline-manager.ts)（原文："Messages are buffered locally per-session — NO remote call happens at this stage."）
+- 三条触发路径：A **轮数阈值**（主）/ B **空闲兜底** / C **收尾冲洗**（优雅退出或显式 `flushSession`）。
+- **warmup 默认开**：新会话阈值从 **1** 起、每次 L1 成功后**翻倍**（1→2→4→8→…→`everyNConversations`），
+  所以早期是"每轮立刻抽"，成熟后才降到 5 轮一次（`advanceWarmupThreshold`）。
+- **空闲计时器可重置**（debounce）：每来一轮新对话重置回 `l1IdleTimeoutSeconds`；阈值命中时直接返回、**不重置**。
+- `pipeline-manager` **不截断**：`runL1` 把缓冲里**全部**消息一次性交给 runner（`msg: buffer`），
+  这一层没有条数/token 上限。**真正的输入是 L0 表按游标捞的行**——runner 注释写明 "query 2N rows but process
+  at most N"，用 `hasFullBacklog` / `hasMore` 决定是否立刻再排一轮排空积压。**N 的取值在 runner 里，我没读到（未确认）**。
+- 失败语义：消息**放回缓冲**、30 秒后重试，连续最多 **5** 次，超了留待下一次用户对话（`L1_MAX_RETRIES`）。
+
+> **和我们对照**：我们按"最后 N 条消息"切是**滑动窗口**语义，长回合里可能切到全是模型自己的输出
+> （本会话有一轮 47 条消息）；腾讯按"上次抽取以来的全部"切是**累积批**语义，天然含用户每一句。
+> 2026-10-03 我们把窗口改成"最近 5 轮（用户提示词 + 该轮最终回答，回答截 200 字）"——
+> 仍然比腾讯"小"得多：它是**攒够 5 轮或静默 60 秒后一次性抽全部**，且抽完才推游标。
+
 **是异步后台抽取**：钩子只写 L0 + 通知，抽取由 pipeline manager 在后台批量跑 → 出处同上 [auto-capture.ts:305-308](https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/29bb8dffa9b11617316d50f21d7a8af9f47240be/MemoryCore/src/core/hooks/auto-capture.ts#L305)。
 
 **谁决定"这条值得记"**：抽取 LLM（一次调用同时做"情境切分 + 记忆提取"）→ 出处：[l1-extraction.ts](https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/29bb8dffa9b11617316d50f21d7a8af9f47240be/MemoryCore/src/core/prompts/l1-extraction.ts)（"System prompt handles scene segmentation + memory extraction in a single LLM call"）。
