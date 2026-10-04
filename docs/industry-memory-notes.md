@@ -112,6 +112,42 @@ agent_end 钩子
 
 **是异步后台抽取**：钩子只写 L0 + 通知，抽取由 pipeline manager 在后台批量跑 → 出处同上 [auto-capture.ts:305-308](https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/29bb8dffa9b11617316d50f21d7a8af9f47240be/MemoryCore/src/core/hooks/auto-capture.ts#L305)。
 
+**写入侧窗口到底给模型什么（2026-10-03 逐行核实，这是最反直觉的一处）**：
+
+不是"最近 N 轮"，也**不是** pipeline manager 传的那个内存缓冲——**那个缓冲被 runner 忽略了**：
+
+- runner 只解构 `sessionKey`（`pipeline-factory.ts:416` `return async ({ sessionKey }) => {`），
+  自己按游标去 L0 表读：`queryL0GroupedBySessionId(sessionKey, l1Cursor, L1_BATCH_QUERY)`（`:442-445`）。
+- 条数封顶由常量定，**不是 token/字符**：`L1_BATCH_PROCESS = 10`、`L1_BATCH_QUERY = 2N = 20`（`:89-90`）；
+  抽取器再叠一层 `maxMessagesPerExtraction ?? 10` 与 `maxBackgroundMessages ?? 5`（`l1-extractor.ts:149-150`），
+  取 `slice(-maxNewMessages)` = **最新 10 条**（`:178`）；`maxMessagesPerExtraction` 全仓无生产调用点设置 → 恒为 10。
+  10 条消息 ≈ **5 轮**（一轮 = user + assistant）。
+- 提示词只有三段数据（`l1-extraction.ts:406-416`）：**【上一个情境】**（上个场景名）、
+  **【背景对话】**（紧挨着的 ≤5 条，prompt 原话"仅供理解上下文推断关系/时间，**严禁从中提取记忆**"）、
+  **【待提取的新消息】**（≤10 条，prompt 原话"只从这里提取记忆！"）。**没有**已存记忆、persona、去重候选——
+  去重候选是抽取**之后**另起一次调用检索的（`l1-dedup.ts:284`）。
+- **对话正文没有任何字符/token 上限**：唯一 5000 字上限是 embedding 输入（`embedding.ts:513-517`、`config.ts:613`），
+  而 sanitize 里的长度过滤**被注释掉了**（`sanitize.ts:139-143`，含 `if (text.length > 5000) return false;`）。
+- **工具消息在 L0 落盘时就排除**（`l0-recorder.ts:557-559` 只留 user/assistant），不是提示词层过滤。
+- 游标每次成功后前移（`pipeline-factory.ts:655-658`）→ **每条消息恰好被看一遍**。
+
+> **残留截断路径（注释与代码不符）**：同毫秒边界对齐会把处理片推到 10 条以上（`pipeline-factory.ts:523-530`），
+> 而抽取器 `slice(-maxNewMessages)` 只留最后 10 条（`l1-extractor.ts:178`）→ 前面的行静默丢失。
+> 注释（`pipeline-factory.ts:84-88`）却写 "…silently truncate… Trade-off: drain rounds double under backlog,
+> **but zero data loss**"。**生产是否触发：未验证。**
+
+**和我们写入侧窗口的对照**：
+
+| | 腾讯 | 我们 |
+|---|---|---|
+| 窗口来源 | DB 里游标之后的 L0 行（内存缓冲被忽略） | 会话日志最近 **5 轮**（你的那句 + 该轮最终回答） |
+| 封顶方式 | **条数**（新 10 + 背景 5），**无 token/字符上限** | **轮数** 5；你的原文不截断，**我的回答截 200 字** |
+| 上下文 vs 提取源 | **提示词里显式切分**（背景"严禁提取"） | **不切分**，靠模型标归属、校验器只取 `user` 段 |
+| 上一情境 | 传上个场景名 | 无场景层 |
+| 已存记忆 | 抽取时不进；去重另起一次调用 | 抽取时不进；**判定层**那次调用拿 top-20 已存记忆 |
+| 读几遍 | 恰好一遍（游标前移） | 每轮重看（窗口滑动，靠签名去重兜住） |
+| 时机 | 后台批量，攒 5 轮或静默 60s | 回合结束同步，预算 1600ms，失败退回标点切句 |
+
 **谁决定"这条值得记"**：抽取 LLM（一次调用同时做"情境切分 + 记忆提取"）→ 出处：[l1-extraction.ts](https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/29bb8dffa9b11617316d50f21d7a8af9f47240be/MemoryCore/src/core/prompts/l1-extraction.ts)（"System prompt handles scene segmentation + memory extraction in a single LLM call"）。
 
 **去重/合并/冲突**：两阶段批量处理 → 出处：[l1-dedup.ts](https://github.com/TencentCloud/TencentDB-Agent-Memory/blob/29bb8dffa9b11617316d50f21d7a8af9f47240be/MemoryCore/src/core/record/l1-dedup.ts)
