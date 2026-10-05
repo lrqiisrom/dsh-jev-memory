@@ -1553,7 +1553,9 @@ test('the write path uses the model\'s segmentation, and a pasted span is not a 
   const pasted = '不要用 8000 了，改成 9000 更稳。'
   const message = `${own}下面这段是我从模型回答里复制过来的：${pasted}`
   const { captured } = await mount(
-    { judge: 'auto', segment: { enabled: true } },
+    // `pipeline` explicitly: the model write call does its own splitting, so under the shipped default
+    // (`writeMode: 'model'`) the segmenter is never asked. This test is about the segmenter.
+    { judge: 'auto', writeMode: 'pipeline', segment: { enabled: true } },
     'test-key',
     (c) => {
       c.llmPort = fakeLlm(
@@ -1806,7 +1808,9 @@ test('writeMode: model writes a requirement the local type whitelist refuses, an
 
   const model = await mount({ writeMode: 'model' }, undefined, (c) => {
     c.llmPort = llmRouting(
-      JSON.stringify([{ message: 0, text: sentence, who: 'user', worth: true, type: 'constraint' }]),
+      JSON.stringify([
+        { message: 0, source: sentence, summary: '用户决定把配置流程再简化一些，改成一条约束记住。', who: 'user', worth: true, type: 'constraint' },
+      ]),
     )
     c.defaultModelSelection = { provider: 'p', model: 'test-model' }
   })
@@ -1818,13 +1822,23 @@ test('writeMode: model writes a requirement the local type whitelist refuses, an
     { agent: { session } },
   )
   assert.equal(promoted(found).length, 1, 'the same sentence, decided by the call instead of the keyword')
-  assert.equal(promoted(found)[0]!.text, sentence)
+  assert.equal(
+    promoted(found)[0]!.text,
+    '用户决定把配置流程再简化一些，改成一条约束记住。',
+    'what recall sees is the model\'s summary, not the fragment it was drawn from',
+  )
   // The type stored is the one the gate acted on. Storing the local hint instead would write a
   // record that recall then filters out, which is a failure no search-based assertion would see.
   const document = JSON.parse(await readFile(join(model.root, 'memory.json'), 'utf8')) as {
     records?: Array<Record<string, unknown>>
   }
   assert.equal((document.records ?? [])[0]?.type, 'constraint')
+  // On this path the record's text is the model's summary, not the person's sentence — that is the
+  // change — and the verbatim source is kept beside it so every summary can be traced back to what was
+  // actually said.
+  assert.equal((document.records ?? [])[0]?.text, '用户决定把配置流程再简化一些，改成一条约束记住。')
+  const record = (document.records ?? [])[0] as { source?: { quote?: string } } | undefined
+  assert.match(String(record?.source?.quote ?? ''), /配置流程应该再简化/)
 
   const writePath = (await ledgerEntries(model.root)).find((entry) => entry.kind === 'write-path')
   assert.equal(writePath?.reason, 'ok')
@@ -1843,9 +1857,9 @@ test('the model path keeps only what the person said and called worth rememberin
   const { root, captured } = await mount({ writeMode: 'model' }, undefined, (c) => {
     c.llmPort = llmRouting(
       JSON.stringify([
-        { message: 0, text: own, who: 'user', worth: true, type: 'decision' },
-        { message: 0, text: pasted, who: 'pasted', worth: true, type: 'constraint' },
-        { message: 0, text: pasted, who: 'user', worth: true, type: 'other' },
+        { message: 0, source: own, summary: '用户决定状态机的边界情况先不做。', who: 'user', worth: true, type: 'decision' },
+        { message: 0, source: pasted, summary: '用户要求报错信息带上上下文。', who: 'pasted', worth: true, type: 'constraint' },
+        { message: 0, source: pasted, summary: '用户要求报错信息带上上下文。', who: 'user', worth: true, type: 'other' },
       ]),
     )
     c.defaultModelSelection = { provider: 'p', model: 'test-model' }
@@ -1883,7 +1897,12 @@ test('a model answer that is not verbatim falls back to the deterministic path, 
   const sentence = '必须把端口固定成 8000。'
   const { root, captured } = await mount({ writeMode: 'model' }, undefined, (c) => {
     c.llmPort = llmRouting(
-      JSON.stringify([{ message: 0, text: '必须把端口固定为 8000。', who: 'user', worth: true, type: 'constraint' }]),
+      // `source` claims a quotation the message does not contain (固定为 vs 固定成). The summary would
+      // have been accepted — summaries may differ in wording — but a summary attached to a quotation
+      // nobody made is refused, and the turn falls back rather than losing the memory.
+      JSON.stringify([
+        { message: 0, source: '必须把端口固定为 8000。', summary: '用户要求把端口固定为 8000。', who: 'user', worth: true, type: 'constraint' },
+      ]),
     )
     c.defaultModelSelection = { provider: 'p', model: 'test-model' }
   })
@@ -1911,7 +1930,10 @@ test('a message the model marked entirely as pasted writes nothing, though the s
   // it. Measured from the other side: note on the labelled rows says 30 of them came from the model.
   const block = '必须把端口固定成 8000。'
   const segmented = await mount({ judge: 'auto', segment: { enabled: true } }, 'test-key', (c) => {
-    c.llmPort = fakeLlm(JSON.stringify([{ message: 0, text: block, who: 'pasted' }]))
+    // A complete answer that marks the whole message as pasted. The summary is what makes it an
+    // *answer* rather than a malformed one: without it the item is refused and the caller falls back,
+    // which would test the opposite thing.
+    c.llmPort = fakeLlm(JSON.stringify([{ message: 0, source: block, summary: '用户粘贴了一段端口约定。', who: 'pasted' }]))
     c.defaultModelSelection = { provider: 'p', model: 'test-model' }
   })
   const session = fakeSession({ events: turnWith(block) })

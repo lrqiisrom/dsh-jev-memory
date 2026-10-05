@@ -57,7 +57,7 @@ test('the prompt shows every message the model may quote, with its role', () => 
 test('a verbatim span is accepted, and its offsets are found here rather than taken from the model', () => {
   const span = '另外这个配置流程应该再简化一下。'
   const decided = explainModelWrite(
-    JSON.stringify([{ message: 0, text: span, who: 'user', worth: true, type: 'constraint' }]),
+    JSON.stringify([{ message: 0, source: span, summary: '用户决定把端口固定成 8000。', who: 'user', worth: true, type: 'constraint' }]),
     WINDOW,
   )
   assert.equal(decided.reason, 'ok')
@@ -73,7 +73,7 @@ test('a span that is not in the message it names is refused, not matched loosely
   // model answered "继承" — one character, a different claim, and it was stored under the person's
   // name until the verbatim check existed.
   const decided = explainModelWrite(
-    JSON.stringify([{ message: 0, text: '必须把端口固定成 9000。', who: 'user', worth: true, type: 'constraint' }]),
+    JSON.stringify([{ message: 0, source: '必须把端口固定成 9000。', summary: '用户决定把端口固定成 9000。', who: 'user', worth: true, type: 'constraint' }]),
     WINDOW,
   )
   assert.equal(decided.reason, 'all-refused')
@@ -97,10 +97,10 @@ test('an unknown attribution is refused here; a type is a judgement the caller f
   const good = '必须把端口固定成 8000。'
   const decided = explainModelWrite(
     JSON.stringify([
-      { message: 0, text: good, who: 'user', worth: true, type: 'constraint' },
-      { message: 0, text: good, who: 'someone-else', worth: true, type: 'constraint' },
-      { message: 0, text: good, who: 'user', worth: true, type: 'invented-type' },
-      { message: 0, text: good, who: 'user', worth: true, type: 'other' },
+      { message: 0, source: good, summary: '用户要求把端口固定成 8000。', who: 'user', worth: true, type: 'constraint' },
+      { message: 0, source: good, summary: '用户要求把端口固定成 8000。', who: 'someone-else', worth: true, type: 'constraint' },
+      { message: 0, source: good, summary: '用户要求把端口固定成 8000。', who: 'user', worth: true, type: 'invented-type' },
+      { message: 0, source: good, summary: '用户要求把端口固定成 8000。', who: 'user', worth: true, type: 'other' },
     ]),
     WINDOW,
   )
@@ -125,7 +125,7 @@ test('an empty array is an answer, not a failure', () => {
 test('prose around the JSON is tolerated, and text with no JSON at all is not', () => {
   const span = '必须把端口固定成 8000。'
   assert.equal(
-    explainModelWrite(`好的，如下：\n${JSON.stringify([{ message: 0, text: span, who: 'user', worth: true, type: 'constraint' }])}\n`,
+    explainModelWrite(`好的，如下：\n${JSON.stringify([{ message: 0, source: span, summary: '用户决定把端口固定成 8000。', who: 'user', worth: true, type: 'constraint' }])}\n`,
       WINDOW).reason,
     'ok',
   )
@@ -161,7 +161,7 @@ test('a retry is spent on a broken answer, and the model id travels back', async
     llm: {
       stream: () => {
         calls += 1
-        const text = calls === 1 ? '我不太确定。' : JSON.stringify([{ message: 0, text: span, who: 'user', worth: true, type: 'constraint' }])
+        const text = calls === 1 ? '我不太确定。' : JSON.stringify([{ message: 0, source: span, summary: '用户决定把端口固定成 8000。', who: 'user', worth: true, type: 'constraint' }])
         return (async function* () {
           yield { type: 'text-delta', text }
           yield { type: 'finish' }
@@ -181,4 +181,39 @@ test('every type this path may write is one the store and the recall filter alre
   // A type outside the store's own list would be written and then never injected, which is the
   // silent failure the write ledger's `judgeType` field was added to catch.
   assert.deepEqual([...WRITE_TYPES], ['constraint', 'pitfall', 'decision'])
+})
+
+test('a summary may reword, but may not invent an identifier', () => {
+  // This is the only thing standing between a model-written memory and a changed fact. The failure it
+  // comes from is measured: quoting a sentence about 集成, an earlier version answered 继承 and it was
+  // stored under the person's name. A different filename or number is a different claim; a different
+  // ordinary word is a wording choice, which is the point of summarising at all.
+  const source = '必须把 memory.json 从简历里去掉。'
+  const window = [{ seq: 1, role: 'user', text: source }]
+
+  const reworded = explainModelWrite(
+    JSON.stringify([{ message: 0, source, summary: '用户要求简历里不要出现这个配置文件。', who: 'user', worth: true, type: 'constraint' }]),
+    window,
+  )
+  assert.equal(reworded.reason, 'ok', 'rewording is allowed')
+  assert.equal(reworded.items?.[0]?.summary, '用户要求简历里不要出现这个配置文件。')
+
+  const invented = explainModelWrite(
+    JSON.stringify([{ message: 0, source, summary: '用户要求把 memory.txt 从简历里去掉。', who: 'user', worth: true, type: 'constraint' }]),
+    window,
+  )
+  assert.equal(invented.reason, 'drifted:memory.txt', 'a different filename is refused, and named')
+  assert.equal(invented.items, null, 'null so the caller falls back rather than silently dropping it')
+})
+
+test('an item without a summary is refused, because the summary is the memory', () => {
+  // The record's text is the summary on this path. An item that quotes but does not summarise has
+  // nothing to store, and storing the quotation instead would quietly reintroduce the verbatim path.
+  const source = '必须把端口固定成 8000。'
+  const decided = explainModelWrite(
+    JSON.stringify([{ message: 0, source, who: 'user', worth: true, type: 'constraint' }]),
+    [{ seq: 1, role: 'user', text: source }],
+  )
+  assert.equal(decided.reason, 'all-refused')
+  assert.equal(decided.items, null)
 })

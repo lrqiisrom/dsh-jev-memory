@@ -81,7 +81,7 @@ import {
   searchMemories,
   selectMemories,
 } from './lib/recall.ts'
-import { isNoteworthyVeto, signatureOf } from './lib/signals.ts'
+import { isNoteworthyVeto, screenSentence, signatureOf } from './lib/signals.ts'
 import { archiveId, createMemoryStore, MEMORY_TYPES, type L0Entry, type MemoryRecord } from './lib/store.ts'
 import { ECHO_DEFAULTS, findEcho, type EchoSettings } from './lib/echo.ts'
 import { estimateTokens, excerpt, hashText } from './lib/text.ts'
@@ -646,7 +646,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.27.0'
+export const version = '0.28.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -729,7 +729,7 @@ export const DEFAULT_CONFIG: PluginConfig = {
   // and it costs one call per turn on every install. Turning it on is a deliberate choice with the
   // ledger's `write-path` line as the thing to watch: `reason` there says `ok`, `unparsable` or an
   // abort, and a high share of the two latter means the budget, not the prompt, is the problem.
-  writeMode: 'pipeline',
+  writeMode: 'model',
   modelWrite: { ...MODEL_WRITE_DEFAULTS },
   // Five rounds is what the person asked for, and the cap is measured rather than chosen for tidiness:
   // at 400 characters the model started enumerating spans inside the assistant's answers too (10
@@ -1887,8 +1887,21 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       // before it is made.
       const hasHumanText = window.some((message) => message.role === 'user')
       let units: Array<{ seq: number; text: string; type?: string | null }> | null = null
-      let modelWrite: { ok: boolean; reason: string; model: string | null; items: number; kept: number; worth: number } | null =
-        null
+      let modelWrite: {
+        ok: boolean
+        reason: string
+        model: string | null
+        items: number
+        /** how many items came back with a summary, which is the only shape the store can use */
+        summaries: number
+        kept: number
+        worth: number
+      } | null = null
+      // The model path's candidates: the model's own summaries, not verbatim spans.
+      //
+      // This is the point of the path — the stored sentence is readable on its own, and neither a typo
+      // nor a clause cut can survive into it. The verbatim `source` travels beside it as provenance.
+      let modelCandidates: Candidate[] | null = null
       if (config.writeMode === 'model' && hasHumanText) {
         const written = await modelWriter.decide(
           window.map((message) => ({ seq: message.seq, role: message.role, text: message.text })),
@@ -1905,20 +1918,30 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           // nobody measured. `worth` is kept separately in the ledger because the two refusals mean
           // different things: "not worth remembering" is the model doing its job, "typed other" is
           // the type whitelist still refusing a sentence the model said was worth keeping.
+          summaries: (written?.items ?? []).filter((item) => item.summary !== '').length,
           kept: (written?.items ?? []).filter(
             (item) => item.who === 'user' && item.worth && (WRITE_TYPES as readonly string[]).includes(item.type),
           ).length,
           worth: (written?.items ?? []).filter((item) => item.who === 'user' && item.worth).length,
         }
         if (written) {
-          units = written.items
+          modelCandidates = written.items
             .filter((item) => item.who === 'user' && item.worth && (WRITE_TYPES as readonly string[]).includes(item.type))
+            // A runaway answer should not be able to write more than the deterministic path ever could.
+            .slice(0, config.extract.maxPerTurn)
             .map((item) => ({
+              kind: 'user' as const,
+              // What gets stored, injected and searched: the model's summary.
+              text: item.summary,
+              key: signatureOf(item.summary),
               seq: item.seq,
-              // Sliced here from the original message by the offsets `explainModelWrite` located, so
-              // the stored text is the person's characters and not the model's rendering of them.
-              text: window[item.messageIndex]!.text.slice(item.start, item.end),
-              type: item.type,
+              // What the person actually wrote — provenance, and the evidence behind the summary.
+              quote: window[item.messageIndex]!.text.slice(item.start, item.end),
+              hintedType: item.type,
+              signalScore: 1,
+              signals: [],
+              tool: null,
+              modelType: item.type,
             }))
         }
         void store.ledger({ kind: 'write-path', mode: 'model', window: window.length, ...modelWrite })
@@ -1963,7 +1986,19 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         }
       }
 
-      const candidates = extractCandidates(events, {
+      // The screens and the extractor are the *fallback* path's way of deciding what is worth keeping.
+      // When the model answered, it decided that itself — re-deciding it locally is the thing this path
+      // exists to stop doing. One exception is kept deliberately: a secret must not reach the store, and
+      // that is a data-safety rule rather than a judgement about worth.
+      const candidates =
+        modelCandidates !== null
+          ? modelCandidates.filter((candidate) => {
+              const screen = screenSentence(`${candidate.text} ${candidate.quote}`)
+              if (screen.keep || screen.reason !== 'secret') return true
+              void store.ledger({ kind: 'skip', reason: 'veto:secret', id: candidate.key, quote: excerpt(candidate.quote, 120) })
+              return false
+            })
+          : extractCandidates(events, {
         ...config.extract,
         units,
         // Which messages that answer covers. The extractor walks the whole turn, and in a long turn
@@ -1984,7 +2019,8 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       // not their requirement — and the envelope cannot tell the difference, so the comparison is
       // against what this session actually said earlier. Measured on the labelled rows: 15 of 28
       // caught, none of the positives killed.
-      const decided = config.echo.enabled
+      const decided =
+        config.echo.enabled && modelCandidates === null
         ? candidates.filter((candidate) => {
             const earlier = store
               .recentArchive()
