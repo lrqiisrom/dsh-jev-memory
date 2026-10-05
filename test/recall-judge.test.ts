@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { applyGate, createJudge, heuristicRow } from '../dsh/lib/judge.ts'
+import { applyGate, applyModelGate, createJudge, heuristicRow } from '../dsh/lib/judge.ts'
 import { fixedCost, inScope, NAME_LIKE, renderLine, renderRecall, searchMemories, selectMemories } from '../dsh/lib/recall.ts'
 import { signatureOf } from '../dsh/lib/signals.ts'
 import { estimateTokens } from '../dsh/lib/text.ts'
@@ -421,4 +421,36 @@ test('an id that is only the sentence again is not printed, and one that informs
     2,
     'with the id kept it is printed twice, which is what the measurement was about',
   )
+})
+
+test('an unsure conflict probability asks the person instead of being decided locally', () => {
+  // The verdict alone cannot tell "nothing is near the line" from "the threshold is cutting real
+  // conflicts off": 0.02 and 0.68 both read as `no`. The band is [0.3, 0.7) — measured on 16 real
+  // near-miss candidates, two landed in it, while a real reversal scored 0.97 and an unrelated sentence
+  // 0.10. Inside it the record is written as `needs-review` (stored, withheld from recall) and the
+  // person is asked: that is what having a person available is for.
+  const config = { types: ['constraint'], minImportance: 0.6, minRemember: 0.12, reviewOnConflict: true, conflictReviewMinScore: 0.3 }
+  const row = (conflict: string, conflictScore: number | null): Parameters<typeof applyGate>[0] => ({
+    type: 'constraint',
+    importance: 0.8,
+    remember: null,
+    conflict,
+    conflictScore,
+  })
+
+  const unsure = applyGate(row('no', 0.5), config)
+  assert.deepEqual(unsure, { write: true, review: true, reason: 'conflict-uncertain' })
+  assert.equal(applyGate(row('no', 0.68), config).review, true, 'the top of the band still asks')
+  assert.equal(applyGate(row('no', 0.2), config).review, undefined, 'clearly unrelated writes without asking')
+  assert.equal(applyGate(row('yes', 0.95), config).reason, 'conflict', 'a stated conflict keeps its own reason')
+  // A judge that reported no probability cannot land in the band: `null` is not `0`, and treating a
+  // missing number as "unsure" would ask about everything the heuristic path ever wrote.
+  assert.equal(applyGate(row('unknown', null), config).review, undefined)
+  // `0` disables it, which is the escape hatch for a deployment that must not ask.
+  assert.equal(applyGate(row('no', 0.5), { ...config, conflictReviewMinScore: 0 }).review, undefined)
+
+  // And the same band applies when the model wrote the memory's text: the question is about who should
+  // decide, not about who typed the sentence.
+  assert.deepEqual(applyModelGate(row('no', 0.5), config), { write: true, review: true, reason: 'conflict-uncertain' })
+  assert.deepEqual(applyModelGate(row('no', 0.1), config), { write: true, reason: 'model-write' })
 })

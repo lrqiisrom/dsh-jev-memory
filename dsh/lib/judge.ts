@@ -162,6 +162,8 @@ export interface GateInput {
   /** the judge's "worth remembering" probability, when it answered that question. */
   remember?: number | null
   conflict: string
+  /** the raw probability behind `conflict`, for the unsure band; `null` when the judge had none. */
+  conflictScore?: number | null
 }
 
 /** The config fields the write gate reads. */
@@ -171,6 +173,16 @@ export interface GateConfig {
   /** threshold on the judge's "worth remembering" Noul answer. */
   minRemember: number
   reviewOnConflict: boolean
+  /**
+   * Below the conflict threshold but at or above this, the answer is treated as "unsure" and the person
+   * is asked instead of the plugin guessing. `0` disables the band.
+   *
+   * The band exists because the number behind the verdict is the useful part: 0.02 and 0.68 both read as
+   * `no`, and they call for opposite decisions. Measured on 16 real near-miss candidates, two landed in
+   * 0.3-0.7 while the anchors separated cleanly (a real reversal 0.97, an unrelated sentence 0.10), so
+   * the band is narrow enough to be worth someone's attention.
+   */
+  conflictReviewMinScore?: number
 }
 
 /** The write gate's decision, and why. */
@@ -401,6 +413,18 @@ export function applyGate(judgement: GateInput | null | undefined, config: GateC
   }
 
   if (judgement.conflict === 'yes' && config.reviewOnConflict) return { write: true, review: true, reason: 'conflict' }
+  // Unsure, not absent: the judge did not call it a conflict, but it was not confident that it is not
+  // one either. Asking is the whole point of having a person available, and the record is written first
+  // (as `needs-review`) so an unanswered question leaves it stored and merely withheld from recall.
+  const band = config.conflictReviewMinScore ?? 0
+  if (
+    config.reviewOnConflict &&
+    band > 0 &&
+    typeof judgement.conflictScore === 'number' &&
+    judgement.conflictScore >= band
+  ) {
+    return { write: true, review: true, reason: 'conflict-uncertain' }
+  }
   return { write: true, reason: 'ok' }
 }
 
@@ -425,5 +449,16 @@ export function applyGate(judgement: GateInput | null | undefined, config: GateC
  */
 export function applyModelGate(judgement: GateInput | null | undefined, config: GateConfig): GateDecision {
   if (judgement?.conflict === 'yes' && config.reviewOnConflict) return { write: true, review: true, reason: 'conflict' }
+  // The unsure band applies here too. It is a question about who should decide — the model was not
+  // confident either way — and that does not change just because the model wrote the memory's text.
+  const band = config.conflictReviewMinScore ?? 0
+  if (
+    config.reviewOnConflict &&
+    band > 0 &&
+    typeof judgement?.conflictScore === 'number' &&
+    judgement.conflictScore >= band
+  ) {
+    return { write: true, review: true, reason: 'conflict-uncertain' }
+  }
   return { write: true, reason: 'model-write' }
 }

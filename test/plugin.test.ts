@@ -2212,3 +2212,54 @@ test('a conflict the pair question resolved is counted, not asked, and not lost'
     globalThis.fetch = original
   }
 })
+
+test('an unsure conflict probability asks the person, and the record waits in needs-review', async () => {
+  // The band: Jev did not call it a conflict, but was not confident it isn't one either (0.5). The
+  // record is written first and withheld (`needs-review`), then the person is asked — so an unanswered
+  // question leaves the memory stored rather than lost, and recall never sees an unreviewed guess.
+  const realFetch = globalThis.fetch
+  globalThis.fetch = (async (_url: string, init?: { body?: unknown }) => {
+    const body = JSON.parse(String(init?.body ?? '{}'))
+    if (body?.questions?.partner) {
+      return new Response(
+        JSON.stringify({ model: 'jev-1.13.0', answers: { partner: { type: 'choice', choice: 'm0', confidence: 0.6 } } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    return new Response(
+      JSON.stringify({
+        model: 'jev-1.13.0',
+        answers: {
+          'remember:0': { type: 'noul', noul: 0.9 },
+          'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
+          'importance:0': { type: 'score', score: 3, legend: {}, confidence: 0.9 },
+          // Not `yes` (>= 0.7), but inside the band [0.3, 0.7): the model is unsure.
+          'conflict:0': { type: 'noul', noul: 0.5 },
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )
+  }) as unknown as typeof fetch
+  try {
+    const { captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } }, undefined, (c) => {
+      c.askAnswer = [CONFLICT_CHOICES.replace]
+    })
+    const seed = toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write')
+    await seed.execute({ text: '可以随便改 data/ 目录下的文件', type: 'constraint' }, { agent: { session: fakeSession({ events: [] }) } })
+
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: CONFLICTING_TURN }) },
+      turn: 1,
+      signal: undefined,
+    })
+
+    assert.equal(captured.asked.length, 1, 'an unsure answer is a question for the person, not a local decision')
+    const question = captured.asked[0]!.questions[0]
+    // The card quotes both sides verbatim: the person is overruling one of their own statements, so they
+    // need to see what each said rather than a summary the plugin wrote.
+    assert.match(String(question?.detail ?? ''), /不要改动 data\/ 目录下的任何文件/)
+    assert.match(String(question?.detail ?? ''), /可以随便改 data\/ 目录下的文件/)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})

@@ -391,9 +391,22 @@ export interface PluginConfig {
   /** threshold on the judge's "worth remembering" answer; the heuristic ignores it. */
   minRemember: number
   reviewOnConflict: boolean
+  /**
+   * The "unsure" band's lower edge on the judge's conflict probability; `0` turns the band off.
+   *
+   * Paired with the judge's own conflict threshold (0.7) as the upper edge: [this, 0.7) means "the model
+   * did not call it a conflict and was not sure it isn't one", which is a question for the person rather
+   * than a decision for the plugin.
+   */
+  conflictReviewMinScore: number
   /** whether a suspected conflict is put to the human instead of only being withheld. */
   askOnConflict: boolean
   /** how long to wait for that answer before leaving the record in `needs-review`. */
+  /**
+   * Deadline for one question, in ms. **0 means no deadline**, which is what the harness does: its ask
+   * service has no timeout of its own and resolves only when the person answers (it throws if the signal
+   * aborts or nothing accepts the request). The plugin's ten-minute limit was its own invention.
+   */
   askOnConflictTimeoutMs: number
   /** how many times one unresolved conflict may be asked about, in total. */
   askOnConflictMaxAttempts: number
@@ -646,7 +659,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.29.0'
+export const version = '0.30.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -684,6 +697,7 @@ export const DEFAULT_CONFIG: PluginConfig = {
   minRemember: 0.12,
   /** A suspected conflict is stored but withheld from recall until a human confirms. */
   reviewOnConflict: true,
+  conflictReviewMinScore: 0.3,
   /**
    * Put a suspected conflict to the human.
    *
@@ -702,7 +716,10 @@ export const DEFAULT_CONFIG: PluginConfig = {
    * Expiry is not the end of the question — the record stays `needs-review` and is
    * re-asked at the start of the next turn (see `askOnConflictMaxAttempts`).
    */
-  askOnConflictTimeoutMs: 600_000,
+  // Aligned with the harness, which imposes none: a question card sits until it is answered. The cost
+  // is that the turn does not finish until then — the same trade the harness's own `ask` makes, on
+  // purpose, for the person's sake.
+  askOnConflictTimeoutMs: 0,
   /**
    * How many times one unresolved conflict may be put to the human.
    *
@@ -1857,7 +1874,11 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     // interrogation, not a memory system.
     if (pending.length > 0 && config.askOnConflict) {
       try {
-        await withDeadline(askAboutConflict(pending[0], agent, signal), config.askOnConflictTimeoutMs)
+        // No deadline by default — see `askOnConflictTimeoutMs`. A deployment that must not block (a
+        // headless runner) sets one, and then an expired question leaves the record in `needs-review`
+        // for the next-turn retry instead of holding the turn open.
+        const asked = askAboutConflict(pending[0], agent, signal)
+        await (config.askOnConflictTimeoutMs > 0 ? withDeadline(asked, config.askOnConflictTimeoutMs) : asked)
       } catch (error) {
         log('warn', `conflict question left unanswered (fail-open): ${String(error)}`)
         void store.ledger({ kind: 'conflict-resolved', id: pending[0].incomingId, choice: 'unanswered', error: String(error) })
@@ -2410,7 +2431,8 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   ctx.on('agent/pre-step', async (payload, next) => {
     try {
       if (config.askOnConflict && ready && (payload?.step ?? 1) === 1) {
-        await withDeadline(retryPendingConflict(payload.agent, payload.signal), config.askOnConflictTimeoutMs)
+        const retried = retryPendingConflict(payload.agent, payload.signal)
+        await (config.askOnConflictTimeoutMs > 0 ? withDeadline(retried, config.askOnConflictTimeoutMs) : retried)
       }
     } catch (error) {
       log('warn', `conflict retry skipped (fail-open): ${String(error)}`)

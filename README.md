@@ -61,8 +61,9 @@ dsh plugin --profile web add /absolute/path/to/dsh-jev-memory
         writeMode: pipeline                      # pipeline = 分段+抽取+判定+闸门；model = 一次调用全判（见下）
         minImportance: 0.6                       # 确定性写入阈值
         minRemember: 0.6                         # Jev 的"值得记吗"阈值
+        conflictReviewMinScore: 0.3              # 冲突概率落在 [0.3, 0.7) 就问你（0 = 关闭这条）
         askOnConflict: true                      # 发现矛盾时问你一句（HITL）
-        askOnConflictTimeoutMs: 600000           # 等你回答的预算（10 分钟）
+        askOnConflictTimeoutMs: 0                # 0 = 不设截止，和 DSH 自己的 ask 一致（它也没有超时）
         askOnConflictMaxAttempts: 3              # 超时后在下一次对话开始前重问，最多几次
         repeatFailuresToWrite: 2                 # 同一个错重复几次才算"坑"
         writeSkipSubagents: true                 # 见下方"实测发现"
