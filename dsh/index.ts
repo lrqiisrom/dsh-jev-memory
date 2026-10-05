@@ -659,7 +659,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.30.0'
+export const version = '0.31.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -1720,10 +1720,12 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     if (config.writeSkipSubagents && (header?.delegationDepth ?? 0) > 0) return
     const cwd = header?.cwd ?? null
     const records = store.all()
+    // Selected by *state*, not by the reason it was parked: a question now comes from the unsure band,
+    // whose record says `conflict: 'no'`. Requiring `yes` here made every band question unanswerable
+    // after the first attempt — caught by the test that asserts the next turn resumes it.
     const pending = records.find(
       (record) =>
         record.status === 'needs-review' &&
-        record.judge.conflict === 'yes' &&
         inScope(record, cwd) &&
         // asked at least once (the turn-end path already tried) but not too often
         store.askedCount(record.id) > 0 &&
@@ -2318,14 +2320,12 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
               quote: excerpt(candidate.quote, 120),
             })
           }
-        } else if (gate.review && (replaced !== undefined || updated !== undefined)) {
-          // The judge flagged a conflict and the pair question resolved it as "the same rule, newer
-          // wording" — so no question is asked, by design ("asking them to re-decide what the model just
-          // decided, with less context"). Measured rather than argued: this line is how we find out
-          // whether that suppression ever swallows a *reversal*, which is the case a person would want
-          // to arbitrate. Counting it changes no behaviour; the fix, if the count says so, is a
-          // `reversal` label inside the pair question rather than a reordering of these steps (the
-          // in-place update exists to fix a real bug, and reordering would put it back).
+        } else if (judgement.conflict === 'yes' && (replaced !== undefined || updated !== undefined)) {
+          // A *confident* conflict that the pair judgement then resolved as the same rule in newer
+          // wording: the person's decision is that this is Jev's to resolve, so no question is asked and
+          // the old memory is replaced. Counted rather than argued about — this line is how we learn how
+          // often a confident conflict silently overwrites an earlier statement, and whether any of them
+          // were reversals somebody would have wanted to arbitrate. Counting changes no behaviour.
           void store.ledger({
             kind: 'conflict-preempted',
             id: candidate.key,

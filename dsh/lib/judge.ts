@@ -412,14 +412,18 @@ export function applyGate(judgement: GateInput | null | undefined, config: GateC
     return { write: false, reason: 'below-min-importance' }
   }
 
-  if (judgement.conflict === 'yes' && config.reviewOnConflict) return { write: true, review: true, reason: 'conflict' }
-  // Unsure, not absent: the judge did not call it a conflict, but it was not confident that it is not
-  // one either. Asking is the whole point of having a person available, and the record is written first
-  // (as `needs-review`) so an unanswered question leaves it stored and merely withheld from recall.
+  // The person's decision: a *confident* conflict is Jev's to resolve, through its same-update /
+  // same-duplicate / different judgement, and the human is only the tie-breaker. So the question is asked
+  // in one situation only — the judge was not confident either way (the band) — and the record is written
+  // first, as `needs-review`, so an unanswered question leaves it stored and merely withheld from recall.
   const band = config.conflictReviewMinScore ?? 0
   if (
     config.reviewOnConflict &&
     band > 0 &&
+    // The upper edge is "the judge called it a conflict" itself, so it needs no second number: a
+    // confident conflict is Jev's to resolve and must not fall into the band. Without this clause the
+    // band swallows every conflict — which an existing test caught the moment the branch above went away.
+    judgement.conflict !== 'yes' &&
     typeof judgement.conflictScore === 'number' &&
     judgement.conflictScore >= band
   ) {
@@ -448,13 +452,14 @@ export function applyGate(judgement: GateInput | null | undefined, config: GateC
  * @returns a decision; `write` is always true and `reason` names the path.
  */
 export function applyModelGate(judgement: GateInput | null | undefined, config: GateConfig): GateDecision {
-  if (judgement?.conflict === 'yes' && config.reviewOnConflict) return { write: true, review: true, reason: 'conflict' }
-  // The unsure band applies here too. It is a question about who should decide — the model was not
-  // confident either way — and that does not change just because the model wrote the memory's text.
+  // The band applies here too — it is a question about who should decide, and that does not change just
+  // because the model wrote the memory's text. A confident conflict is left to the pair judgement, as
+  // above.
   const band = config.conflictReviewMinScore ?? 0
   if (
     config.reviewOnConflict &&
     band > 0 &&
+    judgement?.conflict !== 'yes' &&
     typeof judgement?.conflictScore === 'number' &&
     judgement.conflictScore >= band
   ) {

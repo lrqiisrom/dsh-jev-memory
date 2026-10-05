@@ -184,8 +184,9 @@ test('the write gate is a deterministic threshold, not a probability rule', () =
   assert.deepEqual(applyGate({ type: 'constraint', importance: 0.6, conflict: 'no' }, config), { write: true, reason: 'ok' })
   assert.equal(applyGate({ type: 'constraint', importance: 0.59, conflict: 'no' }, config).write, false)
   assert.equal(applyGate({ type: 'fact', importance: 1, conflict: 'no' }, config).reason, 'type-disabled:fact')
-  const conflict = applyGate({ type: 'decision', importance: 0.9, conflict: 'yes' }, config)
-  assert.deepEqual(conflict, { write: true, review: true, reason: 'conflict' })
+  // A confident conflict is written, not questioned: Jev resolves it through its same-update /
+  // same-duplicate / different judgement, and the human is only the tie-breaker for the unsure band.
+  assert.deepEqual(applyGate({ type: 'decision', importance: 0.9, conflict: 'yes' }, config), { write: true, reason: 'ok' })
   assert.equal(applyGate(null, config).write, false)
 })
 
@@ -442,7 +443,7 @@ test('an unsure conflict probability asks the person instead of being decided lo
   assert.deepEqual(unsure, { write: true, review: true, reason: 'conflict-uncertain' })
   assert.equal(applyGate(row('no', 0.68), config).review, true, 'the top of the band still asks')
   assert.equal(applyGate(row('no', 0.2), config).review, undefined, 'clearly unrelated writes without asking')
-  assert.equal(applyGate(row('yes', 0.95), config).reason, 'conflict', 'a stated conflict keeps its own reason')
+  assert.equal(applyGate(row('yes', 0.95), config).review, undefined, 'a confident conflict is Jev\'s to resolve, not the person\'s')
   // A judge that reported no probability cannot land in the band: `null` is not `0`, and treating a
   // missing number as "unsure" would ask about everything the heuristic path ever wrote.
   assert.equal(applyGate(row('unknown', null), config).review, undefined)

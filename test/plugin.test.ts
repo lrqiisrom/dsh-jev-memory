@@ -703,7 +703,9 @@ function jevConflictResponse(): Response {
         'remember:0': { type: 'noul', noul: 0.9 },
         'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
         'importance:0': { type: 'score', score: 3, legend: {}, confidence: 0.9 },
-        'conflict:0': { type: 'noul', noul: 0.95 },
+        // Inside the unsure band. The person's decision: a *confident* conflict is Jev's to resolve
+        // through its pair judgement, so the band is the only thing that asks.
+        'conflict:0': { type: 'noul', noul: 0.55 },
       },
     }),
     { status: 200, headers: { 'content-type': 'application/json' } },
