@@ -78,24 +78,49 @@ if (wants('ask')) {
   // The only message that goes to the *person* rather than to a model. Both sides are quoted
   // verbatim and dated, because the person is being asked to overrule their own past statement
   // and must see exactly what each side said.
+  //
+  // The record id here is the *real* shape — a folded signature, where numbers became `<n>` and
+  // quoted strings became `<str>` — because that is what the first live card printed. An earlier
+  // version of this file made up a tidy-looking `mem_7f3a91`, which hid the one defect the example
+  // existed to expose. An example that is prettier than the system is a lie about the system.
   console.log('#'.repeat(78))
   console.log('④ HITL —— 问人的那句话（只在"拿不准"的中段出现）')
   console.log('#'.repeat(78))
   console.log(JSON.stringify(
     buildConflictQuestion(
       {
-        incoming: '可以随便改 data/ 目录下的文件',
+        incoming: '用户定了关系判定三选一规则：同一条规矩的新说法则新替换旧（旧的留档不再注入）、完全同义则新不记、不同规矩则两条都留。',
         existing: {
-          id: 'mem_7f3a91',
-          text: '不要改动 data/ 目录下的任何文件。',
-          createdAt: Date.parse('2026-09-28T10:12:00Z'),
+          id: '<n>.<n> 到 <n>.<n>（它拿不准） → 先入库但标成<str>（不注入），然后问你，三选一：用新的覆盖旧的 / 保留旧的那条 / 两条都留着；',
+          text: '0.3 到 0.7（它拿不准） → 先入库但标成"待确认"（不注入），然后问你，三选一：用新的覆盖旧的 / 保留旧的那条 / 两条都留着；',
+          createdAt: Date.parse('2026-10-05T09:38:19Z'),
         },
-        score: 0.75,
-        shared: ['data', '改', '目录'],
+        score: 0.323,
+        shared: ['三', '选', '一', '的', '旧', '注入', '不', '两'],
       } as never,
-      '可以随便改 data/ 目录下的文件',
+      '用户定了关系判定三选一规则：同一条规矩的新说法则新替换旧（旧的留档不再注入）、完全同义则新不记、不同规矩则两条都留。',
     ),
     null,
     2,
   ))
+  console.log('\n--- 渲染出来给人看的样子 ---\n')
+  const card = buildConflictQuestion(
+    {
+      incoming: '用户定了关系判定三选一规则：同一条规矩的新说法则新替换旧（旧的留档不再注入）、完全同义则新不记、不同规矩则两条都留。',
+      existing: {
+        id: '<n>.<n> 到 <n>.<n>（它拿不准） → 先入库但标成<str>（不注入），然后问你，三选一：用新的覆盖旧的 / 保留旧的那条 / 两条都留着；',
+        text: '0.3 到 0.7（它拿不准） → 先入库但标成"待确认"（不注入），然后问你，三选一：用新的覆盖旧的 / 保留旧的那条 / 两条都留着；',
+        createdAt: Date.parse('2026-10-05T09:38:19Z'),
+      },
+      score: 0.323,
+      shared: ['三', '选', '一', '的', '旧', '注入', '不', '两'],
+    } as never,
+    'incoming-id',
+  )
+  console.log(card.header)
+  console.log(card.question)
+  console.log('')
+  console.log(card.detail)
+  console.log('')
+  card.options.forEach((option, at) => console.log(`  ${at + 1}. ${option.label}    ${option.description}`))
 }

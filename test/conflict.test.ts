@@ -68,6 +68,32 @@ test('buildConflictQuestion quotes both sides verbatim and dates the earlier one
   )
 })
 
+test('the card never shows the record id, and never says "矛盾"', () => {
+  // The first real card this produced printed `pair.existing.id` as the provenance, and record ids
+  // are folded signatures — numbers become `<n>`, quoted strings become `<str>`. So the person saw
+  // `0.3 到 0.7` rendered as `<n>.<n> 到 <n>.<n>` immediately after the sentence itself: a mangled
+  // copy of the text, presented as if it were evidence, and the only place in the UI where those
+  // placeholders could ever appear. The id is our fingerprint, not the person's words.
+  const text = '0.3 到 0.7（它拿不准） → 先入库但标成"待确认"（不注入）'
+  const pair = findConflictPartner(text, [memory('<n>.<n> 到 <n>.<n>（它拿不准） → 先入库但标成<str>（不注入）', text)])
+  assert.ok(pair)
+  const question = buildConflictQuestion(pair, 'incoming-id')
+  assert.doesNotMatch(question.detail, /<n>|<str>/, 'no folded-signature placeholders reach the person')
+  assert.doesNotMatch(question.detail, /<n>\.<n> 到/, 'and not the folded form of the sentence either')
+  assert.match(question.detail, /0\.3 到 0\.7/, 'the real sentence is what is shown')
+
+  // "矛盾" is the wrong claim: the band fires because the model split between "the same rule,
+  // restated" and "a different rule". Two facets of one policy are not a contradiction, and a person
+  // told to look for one hunts for a clash that is not there.
+  assert.doesNotMatch(question.header, /矛盾/)
+  assert.doesNotMatch(question.question, /矛盾/)
+
+  // Both sides on their own line, separated widely enough to see the boundary at a glance.
+  assert.match(question.detail, /\n\n/)
+  // And the new memory is held back from recall until this is answered, so say so.
+  assert.match(question.detail, /还没生效/)
+})
+
 test('choiceFromAnswer maps labels back and refuses to guess', () => {
   assert.equal(choiceFromAnswer({ selected: [CONFLICT_CHOICES.replace] }), 'replace')
   assert.equal(choiceFromAnswer({ selected: [CONFLICT_CHOICES['keep-both']] }), 'keep-both')

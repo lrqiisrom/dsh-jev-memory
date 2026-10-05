@@ -299,6 +299,20 @@ export function findConflictPartner(incoming: string, records: readonly MemoryRe
  * to overrule one of their own past statements, so they need to see exactly what
  * each one said and when, not a summary the plugin wrote.
  *
+ * Three things this deliberately does *not* do, all of them learned from the
+ * first real card it produced:
+ *
+ * - It does not print the record id. Ids are folded signatures — `0.3 到 0.7`
+ *   becomes `<n>.<n> 到 <n>.<n>` — so the first version showed the person a
+ *   mangled copy of the sentence right after the sentence itself. An internal
+ *   fingerprint is not evidence and does not belong on a card read by a human.
+ * - It does not say "矛盾". What the band actually detects is that the model
+ *   split between "the same rule, restated" and "a different rule" — the
+ *   same-or-different axis, not contradiction. A person told "矛盾" hunts for a
+ *   clash that two facets of one policy do not have.
+ * - It does not silently imply the new memory is already stored. It is held
+ *   back from recall until this is answered, and the card says so.
+ *
  * @param pair - the pairing to ask about.
  * @param incomingId - the incoming record's id, used as the question id.
  * @returns the question item for the harness's ask service.
@@ -313,12 +327,15 @@ export function buildConflictQuestion(pair: ConflictPair, incomingId: string): {
   const date = new Date(pair.existing.createdAt).toISOString().slice(0, 10)
   return {
     id: `conflict:${incomingId}`,
-    header: '长期记忆出现矛盾',
-    question: '这条新记住的信息，和你之前说过的一条看起来矛盾。怎么处理？',
+    header: '长期记忆：两条像是同一件事',
+    question: '这条新记住的，和库里已有的一条可能在讲同一件事。我分不清它是那条的更新说法，还是另一条规矩，所以问你一句。',
+    // Blank lines between the parts: two 60-90 character sentences separated by a single
+    // newline read as one wall of text, and the boundary between them is the whole point.
     detail: [
-      `新记住的：${pair.incoming}`,
-      `你之前说的：${pair.existing.text}（${date}，${pair.existing.id}）`,
-    ].join('\n'),
+      `新的：${pair.incoming}`,
+      `旧的（${date} 记的）：${pair.existing.text}`,
+      '这条新的还没生效——你定了它才生效。',
+    ].join('\n\n'),
     options: [
       { label: CONFLICT_CHOICES.replace, description: '旧的那条不再使用（保留记录，供以后查证）' },
       { label: CONFLICT_CHOICES['keep-old'], description: '丢掉这条新记的' },
