@@ -646,7 +646,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.26.0'
+export const version = '0.27.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -2018,6 +2018,14 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const updates = new Map<string, string>()
       /** candidate key → a different-identity record this one supersedes. */
       const replacements = new Map<string, string>()
+      /**
+       * candidate key → the pair question's verdict, carried out of the dedup loop.
+       *
+       * The two loops are separate (`decided` → `fresh`), so the verdict is not in scope where it is
+       * recorded on the write path; the pre-emption line needs it to say *which* relationship pre-empted
+       * the question.
+       */
+      const pairVerdicts = new Map<string, string | null>()
 
       const fresh: Candidate[] = []
       for (const candidate of decided) {
@@ -2035,9 +2043,11 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         const near = exact ?? findConflictPartner(candidate.text, activePartners, NEAR_DUPLICATE_MIN)?.existing
         let decision: string | null = null
         let asked = false
+        pairVerdicts.set(candidate.key, null)
         if (near && config.pairDecision) {
           const verdict = await judge.decidePair(candidate.text, near.text, { project: cwd, signal })
           decision = verdict.decision
+          pairVerdicts.set(candidate.key, decision)
           // `pair-decision` means "the model was asked". The offline judge answers nothing
           // by construction, and recording a question nobody was asked would make the
           // ledger unreadable: the collision line below already tells that story.
@@ -2206,6 +2216,10 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
             id: candidate.key,
             by: judgement?.by ?? 'none',
             model,
+            // The raw probability, so a later run can tell "nothing near the line" from "the threshold
+            // is cutting real conflicts off" — the verdict alone cannot.
+            conflict: judgement?.conflict ?? null,
+            conflictScore: judgement?.conflictScore ?? null,
             quote: excerpt(candidate.quote, 120),
           })
           continue
@@ -2236,6 +2250,24 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
               quote: excerpt(candidate.quote, 120),
             })
           }
+        } else if (gate.review && (replaced !== undefined || updated !== undefined)) {
+          // The judge flagged a conflict and the pair question resolved it as "the same rule, newer
+          // wording" — so no question is asked, by design ("asking them to re-decide what the model just
+          // decided, with less context"). Measured rather than argued: this line is how we find out
+          // whether that suppression ever swallows a *reversal*, which is the case a person would want
+          // to arbitrate. Counting it changes no behaviour; the fix, if the count says so, is a
+          // `reversal` label inside the pair question rather than a reordering of these steps (the
+          // in-place update exists to fix a real bug, and reordering would put it back).
+          void store.ledger({
+            kind: 'conflict-preempted',
+            id: candidate.key,
+            with: replaced ?? updated ?? null,
+            decision: pairVerdicts.get(candidate.key) ?? null,
+            conflict: judgement?.conflict ?? null,
+            conflictScore: judgement?.conflictScore ?? null,
+            by: judgement?.by ?? 'none',
+            quote: excerpt(candidate.quote, 120),
+          })
         }
         const now = Date.now()
         // Read the previous text *before* the put: afterwards the record already holds the
@@ -2278,6 +2310,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           judgeType: judgement.type,
           modelType: candidate.modelType ?? null,
           remember: judgement.remember,
+          conflictScore: judgement.conflictScore ?? null,
           by: judgement.by,
           model,
           conflict: judgement.conflict,

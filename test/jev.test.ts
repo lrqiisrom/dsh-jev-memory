@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { createJudge } from '../dsh/lib/judge.ts'
-import { REMEMBER_QUESTION, buildRequestBody, createJevClient } from '../dsh/lib/jev.ts'
+import { parseDecisions, REMEMBER_QUESTION, buildRequestBody, createJevClient } from '../dsh/lib/jev.ts'
 
 const CANDIDATE = { key: 'k', text: '必须用 pnpm 管理依赖。', hintedType: 'constraint', signalScore: 0.7, signals: [] }
 
@@ -62,7 +62,9 @@ test('judge auto mode picks up a credential that appears after mount', async () 
     decidePair: async () => ({ decision: null, confidence: null, model: null }),
       decide: async () => ({
         model: 'jev-1.13.0',
-        rows: [{ key: 'k', type: 'constraint', importance: 0.9, remember: 0.9, conflict: 'no', confidence: 0.9 }],
+        rows: [
+          { key: 'k', type: 'constraint', importance: 0.9, remember: 0.9, conflict: 'no', conflictScore: 0.12, confidence: 0.9 },
+        ],
       }),
     },
   })
@@ -127,4 +129,44 @@ test('the gate question asks about lifetime, not about grammar', () => {
   // state fields by backtick; the object form is what this code path sends.
   const asked = body.questions['remember:0']?.instructions
   assert.equal(typeof asked === 'object' ? asked.question : asked, 'SENTINEL QUESTION')
+})
+
+test('the raw conflict probability is carried, not discarded', () => {
+  // The verdict alone cannot answer "is the threshold cutting real conflicts off". 0.02 and 0.68 both
+  // record as `no` and call for opposite decisions, so the number behind the verdict is kept — for the
+  // ledger only, exactly like `confidence`, and never read by a decision.
+  const rows = parseDecisions(
+    {
+      model: 'jev-1.13.0',
+      answers: {
+        'remember:0': { type: 'noul', noul: 0.8 },
+        'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
+        'importance:0': { type: 'score', score: 2 },
+        'conflict:0': { type: 'noul', noul: 0.68 },
+        'remember:1': { type: 'noul', noul: 0.8 },
+        'type:1': { type: 'choice', choice: 'constraint', confidence: 0.9 },
+        'importance:1': { type: 'score', score: 2 },
+        'conflict:1': { type: 'noul', noul: 0.97 },
+      },
+    },
+    [
+      { key: 'near', text: 'a', hintedType: null, signalScore: 0, signals: [] },
+      { key: 'real', text: 'b', hintedType: null, signalScore: 0, signals: [] },
+    ],
+    { conflictThreshold: 0.7, importanceLevels: 3 },
+  )
+  assert.equal(rows[0]?.conflict, 'no', 'just below the line')
+  assert.equal(rows[0]?.conflictScore, 0.68, 'and how close it was is now recorded')
+  assert.equal(rows[1]?.conflict, 'yes')
+  assert.equal(rows[1]?.conflictScore, 0.97)
+
+  // A judge with no probability to report says null, not zero: a missing answer must not look like a
+  // confident "no conflict" once the threshold is set from the distribution.
+  const fallback = createJudge({
+    config: { judge: 'heuristic', types: ['constraint'] },
+    jev: undefined,
+  })
+  return fallback.judge([{ key: 'k', text: '必须用 pnpm。', hintedType: 'constraint', signalScore: 0.7, signals: [] }]).then((result) => {
+    assert.equal(result.rows[0]?.conflictScore ?? null, null)
+  })
 })

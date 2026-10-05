@@ -63,6 +63,14 @@ export interface Judgement {
   remember: number | null
   /** whether it contradicts a known memory. */
   conflict: 'yes' | 'no' | 'unknown'
+  /**
+   * The raw probability behind `conflict`, or null when the judge had none to give.
+   *
+   * Recorded, never decided on: see `JevRow.conflictScore`. `null` rather than `0` for the heuristic,
+   * so a missing answer cannot be mistaken for a confident "no conflict" when the threshold is later
+   * set from the distribution.
+   */
+  conflictScore?: number | null
   /** judge-reported confidence, when available. */
   confidence: number | null
   /** which implementation produced this row. */
@@ -254,6 +262,13 @@ export function createJudge({ config, jev, log = () => {} }: { config: JudgeConf
               importance: clamp01(row.importance ?? candidate.signalScore),
               remember: typeof row.remember === 'number' && Number.isFinite(row.remember) ? clamp01(row.remember) : null,
               conflict: row.conflict === 'yes' || row.conflict === 'no' ? row.conflict : 'unknown',
+              // Carried for the ledger, like `confidence`: the verdict alone cannot say whether the
+              // threshold is cutting real conflicts off. `null` stays `null` rather than becoming 0, so a
+              // missing answer is distinguishable from a confident "no conflict".
+              conflictScore:
+                typeof row.conflictScore === 'number' && Number.isFinite(row.conflictScore)
+                  ? clamp01(row.conflictScore)
+                  : null,
               confidence: Number.isFinite(row.confidence) ? clamp01(row.confidence) : null,
               by: 'jev',
               signals: candidate.signals,
@@ -350,6 +365,9 @@ export function heuristicRow(candidate: JevCandidate, config: { types: string[] 
     // how interesting the sentence looked, so the gate falls back to `importance`.
     remember: null,
     conflict: 'unknown',
+    // The heuristic has no probability to report; `null` is the honest value, and it keeps a
+    // fabricated 0 out of the distribution the threshold will be set from.
+    conflictScore: null,
     confidence: null,
     by: 'heuristic',
     signals: candidate.signals,

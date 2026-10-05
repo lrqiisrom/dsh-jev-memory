@@ -2123,3 +2123,67 @@ test('no call is made when the window holds nothing the person wrote', async () 
   })
   assert.equal(calls, 0, 'no model call for a window with no human text')
 })
+
+test('a conflict the pair question resolved is counted, not asked, and not lost', async () => {
+  // Item 3′: the judge flags a conflict and the pair question resolves it as "the same rule, newer
+  // wording", so by design no question is asked ("don't ask them to re-decide what the model just
+  // decided"). Whether that suppression ever swallows a *reversal* is unknown — zero times in
+  // production so far — so it is counted rather than argued about. Counting changes no behaviour.
+  //
+  // The second sentence only differs in a number, so its signature is identical to the stored one: that
+  // is the arrangement that reaches the in-place update and therefore the pre-emption branch.
+  const original = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        model: 'jev-1.13.0',
+        answers: {
+          'remember:0': { type: 'noul', noul: 0.9 },
+          'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
+          'importance:0': { type: 'score', score: 2 },
+          // ≥0.7 → the judge says a conflict exists → `gate.review` is true.
+          'conflict:0': { type: 'noul', noul: 0.95 },
+          // …and the pair question then resolves it as the same rule, newer wording.
+          pair: { type: 'choice', choice: 'same-update', confidence: 0.9 },
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )) as unknown as typeof fetch
+  try {
+    const { root, captured } = await mount({ judge: 'auto', writeGate: 'deterministic' }, 'test-key')
+    await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+      { text: '必须把端口固定成 8000。', type: 'constraint' },
+      { agent: { session: fakeSession({ events: [] }) } },
+    )
+    await settle()
+
+    const session = fakeSession({
+      events: [
+        { type: 'turn/start', data: { turn: 1 } },
+        {
+          type: 'user/message',
+          data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '必须把端口固定成 9000。' }] },
+        },
+      ],
+    })
+    await listenerFor(captured, 'agent/turn-stopping')({ agent: { id: 's1', session }, turn: 1, signal: undefined })
+
+    const entries = await ledgerEntries(root)
+    const preempted = entries.find((entry) => entry.kind === 'conflict-preempted')
+    assert.ok(preempted, 'the suppression is counted, so it can be judged from data later')
+    assert.equal(preempted?.decision, 'same-update', 'and the line says which relationship pre-empted it')
+    assert.equal(preempted?.conflictScore, 0.95, 'with the probability behind the verdict')
+    assert.equal(
+      entries.filter((entry) => entry.kind === 'conflict-resolved').length,
+      0,
+      'nothing asked the person: this is the branch where the model already decided',
+    )
+    // The update itself still happens — counting must not turn into dropping the person's latest words.
+    const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
+    const found = promoted(await search.execute({ query: '端口固定成 9000' }, { agent: { session } }))
+    assert.equal(found.length, 1)
+    assert.match(found[0]!.text, /9000/)
+  } finally {
+    globalThis.fetch = original
+  }
+})

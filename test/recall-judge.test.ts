@@ -264,7 +264,7 @@ test('judge maps model rows onto candidates and rejects types outside the config
     decidePair: async () => ({ decision: null, confidence: null, model: null }),
       decide: async () => ({
         model: 'jev-1.13.0',
-        rows: [{ key: 'k', type: 'fact', importance: 0.95, remember: 0.9, conflict: 'yes', confidence: 0.8 }],
+        rows: [{ key: 'k', type: 'fact', importance: 0.95, remember: 0.9, conflict: 'yes', conflictScore: null, confidence: 0.8 }],
       }),
     },
   })

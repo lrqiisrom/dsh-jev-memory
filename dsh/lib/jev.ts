@@ -169,6 +169,14 @@ export interface JevRow {
   /** Noul answer to "is this worth remembering at all"; the write gate reads this. */
   remember: number | null
   conflict: string
+  /**
+   * The raw Noul probability behind `conflict`, kept rather than discarded.
+   *
+   * The verdict alone cannot answer "is the threshold cutting real conflicts off, or is there nothing
+   * near the line" — 0.02 and 0.68 both record as `no` and call for opposite decisions. Recorded so the
+   * threshold can be set from a distribution instead of a guess; nothing reads it for a decision.
+   */
+  conflictScore: number | null
   confidence: number | null
   note?: string | null
 }
@@ -724,6 +732,7 @@ export function parseDecisions(
       // 0.28 on the generic importance rubric while a task instruction scored 0.73.
       remember: typeof rememberNoul === 'number' ? clamp01(rememberNoul) : null,
       conflict: (typeof conflictNoul === 'number' ? conflictNoul : 0) >= options.conflictThreshold ? 'yes' : 'no',
+      conflictScore: typeof conflictNoul === 'number' ? clamp01(conflictNoul) : null,
       confidence:
         typeof choiceConfidence === 'number' ? clamp01(choiceConfidence) : typeof scoreConfidence === 'number' ? clamp01(scoreConfidence) : null,
       note: null,
