@@ -66,10 +66,10 @@ dsh plugin --profile web add /absolute/path/to/dsh-jev-memory
         askOnConflictMaxAttempts: 3              # 超时后在下一次对话开始前重问，最多几次
         repeatFailuresToWrite: 2                 # 同一个错重复几次才算"坑"
         writeSkipSubagents: true                 # 见下方"实测发现"
-        writeTimeoutMs: 2500                     # 回合收尾的写入预算，超时放弃
+        writeTimeoutMs: 12000                     # 回合收尾的写入预算（宿主不给这条钩子设超时，所以这是真实上限）
         modelWrite:
           window: 10                             # model 模式下模型能读几条消息
-          timeoutMs: 1500                        # 它自己的预算（会被上面那行夹住）
+          timeoutMs: 10000                       # 它自己的预算（会被上面那行夹住）
           retry: 1                               # 答案缺 JSON / 全被拒时重试几次
         recall:
           maxTokens: 600

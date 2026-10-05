@@ -1678,20 +1678,23 @@ test('the segmentation budget is clamped inside the write budget', async () => {
   // It shipped at 8s by default, borrowed from the canonical pass (which runs after the deadline).
   // Eight seconds inside a 2.5s hook does not mean "segmentation falls back" — it means the turn's
   // write is abandoned, which is a worse failure than the one the setting was meant to avoid.
-  const { root } = await mount(
-    { segment: { enabled: true, timeoutMs: 8000 }, writeTimeoutMs: 2500 },
-    'test-key',
-    (c) => {
+  const budgetOf = async (overrides: Record<string, unknown>): Promise<number | undefined> => {
+    const { root } = await mount({ segment: { enabled: true, timeoutMs: 8000 }, writeTimeoutMs: 2500, ...overrides }, 'test-key', (c) => {
       c.llmPort = fakeLlm('[]')
       c.defaultModelSelection = { provider: 'p', model: 'test-model' }
-    },
-  )
-  const start = await startEntry(root)
-  const segment = (start as { segment?: { budgetMs?: number } }).segment
-  assert.ok(segment, 'the start line reports the segment state')
-  // 1600ms with the shipped 2500ms budget: measured segmentation latency is a median 851ms / max
-  // 1271ms, the judge a median 342ms, so the rest of the turn still fits.
-  assert.equal(segment!.budgetMs, 1600, 'the segment budget leaves room for the judge and the write')
+    })
+    const start = (await startEntry(root)) as { segment?: { budgetMs?: number } }
+    return start.segment?.budgetMs
+  }
+
+  // Pipeline: 1600ms of a 2500ms budget. Measured segmentation latency is a median 851ms / max 1271ms,
+  // the judge a median 342ms, so the rest of the turn still fits.
+  assert.equal(await budgetOf({ writeMode: 'pipeline' }), 1600, 'the segment budget leaves room for the judge and the write')
+
+  // Model: the write call is primary, so the fallback gets what *it* leaves. The two budgets must not
+  // simply add up — 1600 + 8000 inside 2500 means a failed model call abandons the turn instead of
+  // falling back, which is the one outcome the fallback exists to prevent.
+  assert.equal(await budgetOf({ writeMode: 'model' }), 400, 'the fallback gets the floor, not a second full budget')
 })
 
 test('a segmentation the model refuses falls back to the punctuation splitter', async () => {

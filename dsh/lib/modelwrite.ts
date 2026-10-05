@@ -78,7 +78,18 @@ export interface ModelWriteSettings {
 export const MODEL_WRITE_DEFAULTS: ModelWriteSettings = {
   enabled: true,
   window: 10,
-  timeoutMs: 1500,
+  /** Ten seconds, on request. The plugin's write deadline is the real ceiling: nothing above it
+   *  imposes a shorter one (`agent/turn-stopping` is a cordis `serial` dispatch with no timeout). */
+  timeoutMs: 10_000,
+  /**
+   * One retry, but only after a *fast* failure.
+   *
+   * A malformed answer comes back in about a second, so retrying it is nearly free and worth it (8 of
+   * 120 answers arrived without JSON). A timeout is the opposite: a second ten-second attempt cannot fit
+   * inside the write budget, and abandoning the whole turn is worse than falling back to the
+   * deterministic path, which still writes something. So the retry is skipped when the clock, rather
+   * than the answer, was the problem.
+   */
   retry: 1,
 }
 
@@ -305,11 +316,30 @@ export function createModelWriter({
         return null
       }
       const prompt = buildModelWritePrompt(messages)
+      const startedAt = Date.now()
       for (let attempt = 0; attempt <= settings.retry; attempt += 1) {
+        // A retry only earns its place when the first attempt failed on *content*. Once the clock was
+        // the problem, a second attempt of the same length cannot fit the write budget — and the caller
+        // falling back to the deterministic path is strictly better than the turn writing nothing.
+        if (attempt > 0 && Date.now() - startedAt >= settings.timeoutMs / 2) {
+          lastReason = `${lastReason}:no-retry-after-slow-failure`
+          break
+        }
         const controller = new AbortController()
         const onAbort = (): void => controller.abort()
         signal?.addEventListener('abort', onAbort, { once: true })
-        const timer = setTimeout(() => controller.abort(), settings.timeoutMs)
+        // Two jobs, one timer: cancel the request if the transport is willing to be cancelled, and
+        // *stop waiting* regardless. Aborting alone is not enough — a stream that ignores its signal
+        // held this call for five seconds past a 120ms budget in a test, and would hold a real turn for
+        // as long as the transport felt like it. The deadline is ours, not the transport's.
+        let expire: (() => void) | null = null
+        const deadline = new Promise<null>((resolve) => {
+          expire = () => resolve(null)
+        })
+        const timer = setTimeout(() => {
+          controller.abort()
+          expire?.()
+        }, settings.timeoutMs)
         try {
           const stream = llm!.stream({
             provider: route.provider,
@@ -326,7 +356,9 @@ export function createModelWriter({
             // `LlmStreamPort.reasoningEffort` for the mechanism.
             reasoningEffort: 'off',
           })
-          const answer = await readAnswer(stream)
+          const drained = await Promise.race([readAnswer(stream), deadline])
+          if (drained === null) throw new Error(`model write exceeded ${settings.timeoutMs}ms`)
+          const answer = drained
           lastAnswer = { finish: answer.finish, chars: answer.text.length, reasoningChars: answer.reasoningChars }
           const decided = explainModelWrite(answer.text, messages)
           // A truncated answer is not a refused one, and the two used to share the word `unparsable`:

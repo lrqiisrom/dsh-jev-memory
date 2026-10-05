@@ -646,7 +646,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.28.0'
+export const version = '0.29.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -753,8 +753,15 @@ export const DEFAULT_CONFIG: PluginConfig = {
    * hook, so nothing real is lost.
    */
   writeSkipSubagents: true,
-  /** Budget for the whole turn-end write path; the hook is fail-open on expiry. */
-  writeTimeoutMs: 2500,
+  /**
+   * Budget for the whole turn-end write path; the hook is fail-open on expiry.
+   *
+   * Raised from 2500ms on request ("先 10s 内就行"). Verified first that nothing above it imposes a
+   * shorter limit: `agent/turn-stopping` is a cordis `serial` dispatch, which awaits each listener with
+   * no timeout of its own, so this number is the real ceiling. The cost is the wait: a slow model call
+   * now holds the end of the turn for up to ten seconds instead of two and a half.
+   */
+  writeTimeoutMs: 12_000,
   /** Per-call budget for the Jev request inside that path. */
   judgeTimeoutMs: 1800,
   /** How many known memories are shown to the judge for the conflict question. */
@@ -1154,11 +1161,15 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   // call took a median of 851ms and at most 1271ms, with 1 of 11 past a 1250ms budget. The judge
   // answers in a median 342ms, so 900ms of headroom covers the rest of the turn and segmentation
   // gets 1600ms — enough for every call in that sample, still inside 2500ms in the normal case.
+  // The segmentation call is the *fallback* whenever the model write call is primary, so its budget has
+  // to fit in what that call leaves behind. Without this the two budgets simply add up — 10s + 8s inside
+  // a 12s deadline — and a failed model call would not fall back at all, it would abandon the turn and
+  // write nothing, which is the one outcome the fallback exists to prevent.
+  const reservedForModel = config.writeMode === 'model' ? Math.min(config.modelWrite.timeoutMs ?? MODEL_WRITE_DEFAULTS.timeoutMs, Math.max(400, config.writeTimeoutMs - 900)) : 0
   const segmentBudget = Math.min(
     config.segment.timeoutMs ?? SEGMENT_DEFAULTS.timeoutMs,
     // The rest of the turn needs room: a judge call (median 342ms measured) and the document write.
-    // 900ms of headroom, so with the shipped 2500ms budget segmentation gets 1600ms.
-    Math.max(400, config.writeTimeoutMs - 900),
+    Math.max(400, config.writeTimeoutMs - 900 - reservedForModel),
   )
   const segmentSettings: SegmentSettings = { ...SEGMENT_DEFAULTS, ...config.segment, timeoutMs: segmentBudget }
 

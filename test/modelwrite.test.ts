@@ -217,3 +217,48 @@ test('an item without a summary is refused, because the summary is the memory', 
   assert.equal(decided.reason, 'all-refused')
   assert.equal(decided.items, null)
 })
+
+test('a retry is skipped when the first attempt failed on the clock, not on the answer', async () => {
+  // With a ten-second call inside a twelve-second write budget, a second ten-second attempt cannot fit:
+  // the caller would abandon the whole turn instead of falling back to the deterministic path, which
+  // still writes something. So the retry survives for fast, malformed answers and is dropped after a
+  // slow failure.
+  let calls = 0
+  const slow = createModelWriter({
+    llm: {
+      stream: (_options: unknown, ...rest: unknown[]) => {
+        void rest
+        calls += 1
+        // Never yields: the writer's own timeout aborts it.
+        return (async function* () {
+          await new Promise((resolve) => setTimeout(resolve, 5_000))
+        })()
+      },
+    } as never,
+    settings: { enabled: true, window: 5, timeoutMs: 120, retry: 3 },
+    resolveRoute: async () => ({ provider: 'p', model: 'test-model' }),
+  })
+  const started = Date.now()
+  assert.equal(await slow.decide(WINDOW), null)
+  assert.equal(calls, 1, 'one attempt, not four: each would have cost the same 120ms')
+  assert.match(slow.lastReason(), /no-retry-after-slow-failure/)
+  assert.ok(Date.now() - started < 1_000, 'and the writer returns promptly instead of burning the budget')
+
+  // The fast path still retries, which is what `retry` is for.
+  let fast = 0
+  const writer = createModelWriter({
+    llm: {
+      stream: () => {
+        fast += 1
+        return (async function* () {
+          yield { type: 'text-delta', text: fast === 1 ? '我不知道。' : '[]' }
+          yield { type: 'finish', reason: 'stop' }
+        })()
+      },
+    } as never,
+    settings: { enabled: true, window: 5, timeoutMs: 1_000, retry: 1 },
+    resolveRoute: async () => ({ provider: 'p', model: 'test-model' }),
+  })
+  assert.deepEqual(await writer.decide(WINDOW), { items: [], model: 'test-model' })
+  assert.equal(fast, 2, 'an unparsable answer one second in is still worth a second try')
+})
