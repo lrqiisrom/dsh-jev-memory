@@ -708,13 +708,25 @@ Jev @0.7   precision=1.00 recall=0.63 F1=0.77
 ## 测试与验证
 
 ```sh
-node --test test/*.test.ts      # 80 条，全离线，不联网、不启动 harness
+node --test test/*.test.ts      # 208 条，全离线，不联网、不启动 harness
 pnpm run typecheck              # tsc --noEmit，零依赖包也能有真类型检查
 ```
 
 包含一条完整的端到端闭环（用假 ctx 驱动真实代码）：写入 → 下一会话召回 → `memory_search` → `memory_forget`。
 
 **为什么是 TypeScript 而不用构建**：Node 22.23 默认开启类型擦除（`process.features.typescript === 'strip'`），所以 `import('./dsh/index.ts')` 与 `node --test test/*.test.ts` 都能直接跑，**没有构建步骤，也就保住了"零运行时依赖 + 可被 `file:` URL 直接挂载"这个性质**。代价是只能用可擦除语法（无 enum / namespace / 参数属性 / 装饰器），相对导入必须写显式 `.ts` 扩展名。类型检查靠 devDependency 里的 `typescript`（与运行时无关）。
+
+**发给模型/服务的话可以直接打出来核对**，不用读代码、也不会和文档走样（文档会过期，代码不会）：
+
+```sh
+node eval/prompts.ts            # 四段全打
+node eval/prompts.ts segment    # ① 分段：哪些消息能拿去抽记忆
+node eval/prompts.ts write      # ② 总结：把原文改写成一句第三人称记忆
+node eval/prompts.ts jev        # ③ Jev：一条请求里的全部问句与判定标准
+node eval/prompts.ts ask        # ④ HITL：问人的那句话（只在"拿不准"的中段出现）
+```
+
+例子对话是写死的，所以两次运行逐字节相同——任何提示词改动都会在这里变成 diff。
 
 真实 harness 验证已做过一次（记录在 `docs/DESIGN.md` 的"实测记录"一节）：插件热挂进正在运行的 web profile，台账出现 `start`，一次子会话回合触发了 4 条写入，下一轮模型请求的系统提示里出现了 `## 长期记忆` 区块。
 
@@ -742,8 +754,9 @@ dsh/lib/recall.ts     选哪些记忆、怎么渲染
 dsh/lib/conflict.ts   冲突配对（词重叠）+ 三选项卡片 + 答案映射
 dsh/lib/credentials.ts  直读凭据文档的兜底路径（极小的 refs 段解析器）
 dsh/lib/text.ts       文本工具（分句、估算 token、哈希）
-test/                 80 条离线测试（plugin.test.ts 用假宿主驱动完整闭环）
+test/                 208 条离线测试（plugin.test.ts 用假宿主驱动完整闭环）
 eval/write-precision.ts   带标注的写入精确率评测（可对标、可复现）
+eval/prompts.ts       把实际发出的四段提示词原样打出来（见上面「测试与验证」）
 tsconfig.json         noEmit + allowImportingTsExtensions（Node 擦除模式可直接跑）
 docs/jev-api.md       Jev 调用契约调研（带出处链接）
 docs/memsearch-notes.md  同类项目 memsearch 的源码级调研与逐项对比
