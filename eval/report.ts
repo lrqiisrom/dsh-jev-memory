@@ -295,6 +295,15 @@ const arms: Arm[] = [
       '判定层的 `conflict` 仍然参与冲突复核。）' +
       '不需要网络也不需要 key，并且和原文归档配套：被它拒掉的句子不是丢弃，而是留在 L0 里可检索。',
   },
+  {
+    // The ablation, inside this file so it uses the same rows, the same dedup and the same columns.
+    // Recomputing the live arm by hand outside produced two different answers within an hour — one
+    // missing the screens, one missing the cross-batch dedup — which is the same "second copy of the
+    // formula" hazard this project has hit before.
+    name: '规则判定（不含筛子，对照）',
+    write: (index) => applyGate(heuristicRows[index], GATE).write,
+    note: '只跑闸门，跳过确定性筛子。与上一行相减就是筛子的净贡献：换掉多少条误记、代价是丢掉几条该记的。',
+  },
   ...(jevRuns.length > 0
     ? [
         {
