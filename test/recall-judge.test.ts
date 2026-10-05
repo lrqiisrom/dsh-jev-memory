@@ -3,7 +3,7 @@ import { test } from 'node:test'
 
 import { applyGate, applyModelGate, createJudge, heuristicRow, relationActionsDisagree } from '../dsh/lib/judge.ts'
 import { fixedCost, inScope, NAME_LIKE, renderLine, renderRecall, searchMemories, selectMemories } from '../dsh/lib/recall.ts'
-import { signatureOf } from '../dsh/lib/signals.ts'
+import { recordIdOf } from '../dsh/lib/store.ts'
 import { estimateTokens } from '../dsh/lib/text.ts'
 
 const DAY = 86_400_000
@@ -394,13 +394,17 @@ test('the embedding path pins a rare quoted name, and only a rare one', async ()
 })
 
 test('an id that is only the sentence again is not printed, and one that informs is', () => {
-  // Measured on the live store: 16 of 16 records have `id === signatureOf(text)`, so the rendered line
-  // printed every memory twice. Dropping the duplicate took the block from 4.4 to 6.5 memories inside
-  // the same 591 tokens. Ids that do carry something (an archive hit, or a record whose signature rule
-  // has changed since) are kept, because they are the only handle on it.
+  // When ids were `signatureOf(text)` the rendered line printed every memory twice — the same
+  // sentence again with the digits folded — and dropping the duplicate took the block from 4.4 to 6.5
+  // memories inside the same 591 tokens. Ids are content hashes now, so what is omitted is a
+  // 12-character digest rather than a repeated sentence: the reason to omit it is that a digest is not
+  // information, and the win is smaller than the figure above, which was measured under the old scheme.
+  //
+  // Ids that do carry something are kept: an archive hit, or a record injected in a canonical form,
+  // whose id belongs to the verbatim text the model can no longer see.
   const verbose = memory({ id: 'whatever' })
   verbose.text = '必须用 pnpm 管理依赖，这是团队约定。'
-  verbose.id = signatureOf(verbose.text)
+  verbose.id = recordIdOf(verbose.text)
   const occurrences = (haystack: string, needle: string): number => haystack.split(needle).length - 1
   const line = renderLine({ record: verbose, score: 0, ageDays: 0 }, false, true)
   // Counted rather than string-matched: when the signature happens to equal the sentence exactly, the
@@ -416,12 +420,12 @@ test('an id that is only the sentence again is not printed, and one that informs
     /l0:session:12/,
     'an id that is not the sentence is kept',
   )
-  // And the option is opt-out back to the old rendering, so the two can be compared.
-  assert.equal(
-    occurrences(renderLine({ record: verbose, score: 0, ageDays: 0 }, false, false), verbose.text),
-    2,
-    'with the id kept it is printed twice, which is what the measurement was about',
-  )
+  // And the option is opt-out, so the two renderings can be compared. Under the old id scheme this
+  // assertion counted the *sentence* twice, because the id was the sentence; now it checks the thing
+  // the option actually controls, which is whether the id is in the line at all.
+  const kept = renderLine({ record: verbose, score: 0, ageDays: 0 }, false, false)
+  assert.match(kept, new RegExp(verbose.id), 'with the option off the id is printed')
+  assert.doesNotMatch(line, new RegExp(verbose.id), 'and with it on the id is not')
 })
 
 test('the person is asked when the model is torn between outcomes, not between synonyms', () => {

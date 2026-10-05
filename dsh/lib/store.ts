@@ -32,7 +32,11 @@
 import {appendFile, mkdir, readFile, readdir, rename, writeFile} from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
+import { signatureOf } from './signals.ts'
 import { hashText, normalize } from './text.ts'
+
+/** The placeholders a folded fingerprint leaves behind; see {@link rekeyLegacyIds}. */
+const FOLD_MARKER = /<(?:n|str|path|code|hex)>/u
 
 /** On-disk document format version; bumped when the record shape changes. */
 export const MEMORY_FILE_VERSION = 1
@@ -68,8 +72,7 @@ export interface MemoryJudge {
 /** One stored memory, in the shape the document on disk holds. */
 export interface MemoryRecord {
   /** stable content hash, also the dedup key. */
-  id: string
-  /** one of `MEMORY_TYPES`. */
+  id: string  /** one of `MEMORY_TYPES`. */
   type: string
   /** the stored sentence, verbatim (clipped). */
   text: string
@@ -248,7 +251,7 @@ export class MemoryStore {
   #root: string
   #now: () => number
   #log: LogSink
-  /** keyed by record id (a signature hash). */
+  /** keyed by record id (a content hash; see {@link recordIdOf}). */
   #records = new Map<string, MemoryRecord>()
   /** serializes every disk mutation. */
   #chain: Promise<void> = Promise.resolve()
@@ -315,13 +318,27 @@ export class MemoryStore {
       const raw = await readFile(file, 'utf8')
       const parsed: unknown = JSON.parse(raw)
       const records: unknown = asRecord(parsed)?.records ?? []
+      const loaded: MemoryRecord[] = []
       // The assertion keeps the original failure mode exactly: a `records` value
       // that is not iterable throws right here, which is what routes a corrupt
       // document into the recovery branch below.
       for (const record of records as ReadonlyArray<unknown>) {
         const normal = normalizeRecord(record, this.#now())
-        if (normal) this.#index(normal)
+        if (normal) loaded.push(normal)
       }
+      // Legacy ids become content hashes on the way in, so every later reader sees one id scheme.
+      // This is where it happens because the file is the only place the old scheme survives, and the
+      // rewrite is left to the next ordinary persist rather than done here: a reader must not write.
+      // Once that persist happens the file is hash-keyed, and the previous version of this plugin —
+      // which looks records up by folded signature — would not find them.
+      const { records: current, rekeyed, collisions } = rekeyLegacyIds(loaded)
+      if (rekeyed > 0) this.#log('info', 're-keyed legacy ids to content hashes', { rekeyed })
+      if (collisions.length > 0) {
+        // Two records whose texts differ only in case or whitespace now want the same id. Reported
+        // rather than silently merged: with the store keyed by id, silence here is a lost memory.
+        this.#log('warn', 'records share an id after re-keying; one will be dropped', { collisions })
+      }
+      for (const record of current) this.#index(record)
     } catch (error) {
       const code = error !== null && typeof error === 'object' && 'code' in error ? error.code : undefined
       if (code !== 'ENOENT') {
@@ -391,8 +408,11 @@ export class MemoryStore {
           // the observation and then the judgement outcome for the same signature —
           // and "seen twice" would quietly become "seen once".
           if (parsed?.kind === 'observed') {
-            const id = parsed.id
-            if (typeof id === 'string' && id !== '') this.#observed.set(id, (this.#observed.get(id) ?? 0) + 1)
+            // `signature`, not `id`: the counter is about the *shape* of a repeated failure, and the
+            // record id it sits next to is a content hash that would make every near-identical failure
+            // a new one. Older lines predate the field and kept the signature in `id`.
+            const key = typeof parsed.signature === 'string' && parsed.signature !== '' ? parsed.signature : parsed.id
+            if (typeof key === 'string' && key !== '') this.#observed.set(key, (this.#observed.get(key) ?? 0) + 1)
             continue
           }
           if (parsed?.kind === 'conflict-ask') {
@@ -745,6 +765,93 @@ export class MemoryStore {
         this.#log('warn', 'memory document write failed', { file, error: String(error) })
       })
     return this.#chain
+  }
+}
+
+/**
+ * The id of a record, derived from the text it stores and from nothing else.
+ *
+ * Every writer must go through this, because `id` is the primary key: `put` looks the id up and
+ * overwrites what it finds. An id computed from anything other than the stored text — a clipped
+ * form, an unclipped form, a hint the model gave — means the next write of the same sentence
+ * fails to find it and stores a second copy.
+ *
+ * @param text - the text that will be stored.
+ * @returns the record id.
+ */
+export function recordIdOf(text: unknown): string {
+  return hashText(text)
+}
+
+/**
+ * Re-key every record whose id is not the content hash of its own text.
+ *
+ * Ids used to be `signatureOf(text)`, which folds digits, quotes, paths, backticks and hex runs to
+ * `<n>`/`<str>`/`<path>`/`<code>`/`<hex>`. Folding is right for *similarity* — "端口用 3000" and
+ * "端口用 3001" really are nearly the same sentence, and that is what the near-duplicate search
+ * wants — and wrong for *identity*: as a primary key it made those two the same record, so the
+ * second write silently overwrote the first and the card called that "覆盖了同内容的旧条目".
+ * Six realistic pairs were checked and all six collided.
+ *
+ * A record is re-keyed when its id is *visibly a fingerprint of text*: it equals `signatureOf(text)`,
+ * or it still contains a fold marker. Live data supplied the case that rules out the narrower
+ * "equals the signature" test — one record's id was five characters *longer* than its own text,
+ * because the id came from the hard-clipped identity while the stored text came from the
+ * clause-boundary clip, and that id is neither a hash nor the signature of the text.
+ *
+ * The equally important half is what it does *not* touch. Re-keying everything that is "not the
+ * content hash" also rewrites an id a person chose by hand in the file, and a hand-edited memory
+ * file is a supported input. The narrow test leaves `k1` where the person put it.
+ *
+ * The limitation, stated rather than hidden: a stale id whose original text contained no digits,
+ * quotes, paths, backticks or hex runs carries no marker and is left alone. Such a record is not
+ * reachable by a lookup derived from its text. Nothing in the live store is in that state, and the
+ * new write path cannot create one (an in-place update only happens when the id already matches).
+ *
+ * Namespaced ids are left alone: `l0:...` points at something outside the record (an archive day
+ * file), so re-keying it would break the pointer rather than repair it. The test is the namespace
+ * *prefix*, not "contains a colon" — a folded signature of ordinary text can contain one, and the
+ * first version of this function skipped three live records for that reason (`reasoningeffort:
+ * <str>` was enough to look namespaced).
+ *
+ * Cross-references are remapped along with the ids, or `supersedes`/`supersededBy` would point at
+ * ids that no longer exist.
+ *
+ * @param records - normalized records, in file order.
+ * @returns the re-keyed records, how many moved, and any new id that two records wanted.
+ */
+export function rekeyLegacyIds(records: readonly MemoryRecord[]): {
+  records: MemoryRecord[]
+  rekeyed: number
+  collisions: string[]
+} {
+  const moved = new Map<string, string>()
+  for (const record of records) {
+    if (/^[a-z][a-z0-9]*:/u.test(record.id)) continue
+    if (!FOLD_MARKER.test(record.id) && record.id !== signatureOf(record.text)) continue
+    const next = recordIdOf(record.text)
+    if (record.id !== next) moved.set(record.id, next)
+  }
+  if (moved.size === 0) return { records: [...records], rekeyed: 0, collisions: [] }
+
+  const taken = new Map<string, number>()
+  for (const record of records) {
+    const next = moved.get(record.id) ?? record.id
+    taken.set(next, (taken.get(next) ?? 0) + 1)
+  }
+  const collisions = [...taken.entries()].filter(([, count]) => count > 1).map(([id]) => id)
+
+  const remap = (id: string | null | undefined): string | null =>
+    typeof id === 'string' && moved.has(id) ? moved.get(id)! : (id ?? null)
+  return {
+    records: records.map((record) => ({
+      ...record,
+      id: moved.get(record.id) ?? record.id,
+      supersedes: remap(record.supersedes),
+      supersededBy: remap(record.supersededBy),
+    })),
+    rekeyed: moved.size,
+    collisions,
   }
 }
 

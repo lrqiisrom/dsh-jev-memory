@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { createMemoryStore, normalizeRecord } from '../dsh/lib/store.ts'
+import { signatureOf } from '../dsh/lib/signals.ts'
+import { createMemoryStore, normalizeRecord, recordIdOf } from '../dsh/lib/store.ts'
 import type { MemoryRecord } from '../dsh/lib/store.ts'
 
 /** Build a minimal record for store tests. */
@@ -153,4 +154,118 @@ test('superseding keeps the old record, unlike deleting it', async () => {
   assert.equal(persisted?.status, 'superseded')
   assert.equal(persisted?.supersededBy, 'new')
   assert.match(String(persisted?.text), /可以随便改/u)
+})
+
+test('legacy folded ids are re-keyed to content hashes, and links follow them', async () => {
+  // Ids used to be `signatureOf(text)`. The store is keyed by id, so the load path has to move those
+  // records onto the new scheme once, or every lookup written in terms of the new id misses them.
+  // Both directions are checked here: the id moves, and so does the record that points at it.
+  // Two texts with *different* folded signatures, because two legacy records could not have shared
+  // one: the collision meant the second write destroyed the first, so a collided pair is not
+  // recoverable and cannot appear in a file. (Checked against the live store: 31 legacy ids, 0
+  // collisions, so nothing was lost there.)
+  const root = await mkdtemp(join(tmpdir(), 'dshmem-'))
+  const oldText = '服务端口固定 8000，不要改。'
+  const newText = '提交信息用中文写。'
+  const legacyId = signatureOf(oldText)
+  const newLegacyId = signatureOf(newText)
+  assert.notEqual(legacyId, newLegacyId)
+  const file = join(root, 'memory.json')
+  await writeFile(
+    file,
+    JSON.stringify({
+      version: 1,
+      records: [
+        { ...record({ id: legacyId, text: oldText, status: 'superseded', supersededBy: newLegacyId }) },
+        { ...record({ id: newLegacyId, text: newText, supersedes: legacyId }) },
+      ],
+    }),
+  )
+
+  const store = createMemoryStore({ root, now: () => 1_700_000_000_000 })
+  assert.equal((await store.load()).loaded, 2)
+
+  const oldId = recordIdOf(oldText)
+  const newId = recordIdOf(newText)
+  assert.notEqual(oldId, legacyId, 'the folded id is gone')
+  assert.equal(store.has(legacyId), false, 'and nothing is left under it')
+  assert.equal(store.get(oldId)!.text, oldText, 'the record is reachable by its content hash')
+  assert.equal(store.get(oldId)!.supersededBy, newId, 'the link was re-pointed, not left dangling')
+  assert.equal(store.get(newId)!.supersedes, oldId, 'in both directions')
+})
+
+test('fingerprint ids are re-keyed; a hand-chosen id and a namespace are not', async () => {
+  // Four cases, all of them from live data or from the rules the live data forced.
+  //
+  // A stale id: `signatureOf(identity)` where `identity` was hard-clipped, while the stored text came
+  // from the clause-boundary clip — so the id carried a fold marker but was not the signature of its
+  // own text. The "equals the signature" test would miss it; the marker test catches it.
+  //
+  // A colon: the first version of this check treated any id containing `:` as namespaced and skipped a
+  // record whose folded text happened to contain `reasoningeffort: <str>`. A namespace is a prefix.
+  //
+  // And the two it must leave alone: `l0:...` points at an archive file, and `k1` is an id a person
+  // typed into the file by hand. Rewriting either would break what it points at.
+  const root = await mkdtemp(join(tmpdir(), 'dshmem-'))
+  const staleText = '服务端口固定 8000，不要改。'
+  const staleId = signatureOf(`${staleText}后来又加了一句 9000。`)
+  const colonText = '结构化调用必须传 reasoningeffort: off，否则会报错。'
+  await writeFile(
+    join(root, 'memory.json'),
+    JSON.stringify({
+      records: [
+        record({ id: staleId, text: staleText }),
+        record({ id: signatureOf(colonText), text: colonText }),
+        record({ id: 'l0:s1:7', text: '归档里的一句话。' }),
+        record({ id: 'k1', text: '手写的一条。' }),
+      ],
+    }),
+  )
+
+  const store = createMemoryStore({ root, now: () => 1_700_000_000_000 })
+  assert.equal((await store.load()).loaded, 4)
+
+  assert.equal(store.get(recordIdOf(staleText))?.text, staleText, 'the stale fingerprint was replaced')
+  assert.equal(store.has(staleId), false)
+  assert.equal(store.get(recordIdOf(colonText))?.text, colonText, 'a colon in the text is not a namespace')
+  assert.equal(store.get('l0:s1:7')?.text, '归档里的一句话。', 'a namespaced id is left where it is')
+  assert.equal(store.get('k1')?.text, '手写的一条。', 'and so is an id a person chose')
+})
+
+test('a stale id with no fold marker is left alone, and that is a known gap', async () => {
+  // Stated as a test rather than as a comment in the source, because a known gap that no test
+  // describes is a gap nobody will notice.
+  //
+  // An id derived from an older text that contained no digits, quotes, paths, backticks or hex runs
+  // carries no marker, so the re-key cannot recognise it, and it is not reachable by a lookup derived
+  // from the text it now holds. Widening the rule to "anything that is not a content hash" would
+  // repair this case and would also rewrite `k1` — an id a person typed. Nothing in the live store is
+  // in this state (32 records checked: 32 content hashes), and the new write path cannot create one,
+  // because an in-place update only happens when the id already matches the text.
+  const root = await mkdtemp(join(tmpdir(), 'dshmem-'))
+  const text = '必须用 pnpm 管理依赖。'
+  const unmarkedId = signatureOf(`${text}后来补了一句。`)
+  await writeFile(join(root, 'memory.json'), JSON.stringify({ records: [record({ id: unmarkedId, text })] }))
+
+  const store = createMemoryStore({ root, now: () => 1_700_000_000_000 })
+  assert.equal((await store.load()).loaded, 1)
+  assert.equal(store.has(unmarkedId), true, 'left as it was')
+  assert.equal(store.get(recordIdOf(text)), undefined, 'and therefore not reachable by its own text')
+})
+
+test('two texts that differ only in a folded literal are two ids, not one', async () => {
+  // The property the whole id change exists for. `signatureOf` folds 8000 and 9000 to the same `<n>`,
+  // which is exactly what the near-duplicate search wants and exactly what a primary key must not do:
+  // as an id it made these two the same record, so writing the second silently destroyed the first.
+  const pairs: Array<[string, string]> = [
+    ['服务端口固定 8000，不要改。', '服务端口固定 9000，不要改。'],
+    ['超时设成 10s。', '超时设成 30s。'],
+    ['构建产物放 /dist/a。', '构建产物放 /build/b。'],
+  ]
+  for (const [left, right] of pairs) {
+    assert.notEqual(recordIdOf(left), recordIdOf(right), `${left} vs ${right}`)
+    assert.equal(signatureOf(left), signatureOf(right), 'and the fingerprint still calls them the same shape')
+  }
+  assert.equal(recordIdOf('必须用 pnpm。'), recordIdOf('必须用 pnpm。'), 'identical text stays one id')
+  assert.equal(recordIdOf('必须用 pnpm。'), recordIdOf('  必须用  pnpm。 '), 'whitespace is not identity')
 })

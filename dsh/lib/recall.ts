@@ -16,7 +16,7 @@
 
 import { createBm25Scorer } from './conflict.ts'
 import { estimateTokens } from './text.ts'
-import { signatureOf } from './signals.ts'
+import { recordIdOf } from './store.ts'
 
 /** Default per-type quota; the sum is the effective injection ceiling. */
 export const DEFAULT_QUOTA: Record<string, number> = { constraint: 4, pitfall: 3, decision: 2 }
@@ -69,17 +69,21 @@ export interface RecallOptions {
   /** inject the canonical rendering when a record has one. */
   preferCanonical?: boolean
   /**
-   * Leave out an id that is nothing but the sentence's own signature.
+   * Leave out an id that says nothing beyond the sentence it belongs to.
    *
-   * On by default, and it is not cosmetic: for every memory the turn-end writer stores, `id` *is*
-   * `signatureOf(text)` — the same sentence with digits and quotes folded to `<n>`/`<str>` — so the
-   * rendered line was printing the memory twice. Measured on the live store, 16 of 16 records. Half the
-   * block's tokens were a duplicate, and the block was already over its own budget, so this is the
-   * cheapest coverage win available: the same 600 tokens hold roughly twice the memories.
+   * On by default, and it is not cosmetic. When ids were `signatureOf(text)`, the rendered line was
+   * printing the memory twice — the same sentence again, with digits folded to `<n>` — and half the
+   * block's tokens were that duplicate. Measured on the live store at the time: 16 of 16 records, and
+   * removing it took the block from 4.4 to 6.5 memories in 591 tokens.
    *
-   * Ids that carry information are kept: an archive hit (`l0:...`), or any record written before the
-   * signature rule settled. `memory_forget` takes a `query` as well as an `id`, so nothing becomes
-   * unretractable.
+   * Ids are content hashes now, so what is left to omit is a 12-character digest: ~4 tokens per
+   * memory rather than a whole repeated sentence. **The size of the win therefore shrank and the
+   * 4.4 → 6.5 figure above no longer describes this code** — it was measured under the old id scheme.
+   * The switch is kept because a digest is not information to a reader, and `memory_forget` takes a
+   * `query` as well as an `id`.
+   *
+   * Ids that carry information are still kept: an archive hit (`l0:...`), or a record injected in a
+   * canonical form, whose id refers to the verbatim text the model can no longer see.
    */
   omitRedundantId?: boolean
   /**
@@ -369,10 +373,10 @@ export function renderLine(entry: RecalledMemory, preferCanonical = false, omitR
   // on the record and in the ledger either way.
   const canonical = preferCanonical ? entry.record.canonical : null
   const text = typeof canonical === 'string' && canonical !== '' ? canonical : entry.record.text
-  // Checked against the *rendered* text, so a record injected in its canonical form still shows the id
-  // when that id is the verbatim signature: those differ, and the difference is the only handle the
-  // model has for a verbatim record it can no longer see.
-  const redundant = omitRedundantId && signatureOf(text) === entry.record.id
+  // Checked against the *rendered* text, so a record injected in its canonical form still shows the id:
+  // that id belongs to the verbatim text, which differs from what is rendered, and is the only handle
+  // the model has for a record it can no longer see.
+  const redundant = omitRedundantId && recordIdOf(text) === entry.record.id
   return redundant ? `- [${entry.record.type}] ${text} (${date})` : `- [${entry.record.type}] ${text} (${entry.record.id}, ${date})`
 }
 

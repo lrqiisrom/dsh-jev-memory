@@ -1120,7 +1120,7 @@ async function ledgerEntries(root: string): Promise<Array<Record<string, any>>> 
 test('a contradiction the judge did not raise is recorded, not swallowed', async () => {
   const { root, captured } = await mount()
   const session = fakeSession({ events: TURN_EVENTS })
-  await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+  const seeded = await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
     { text: '服务端口固定 8000，不要改。', type: 'constraint' },
     { agent: { session } },
   )
@@ -1130,7 +1130,11 @@ test('a contradiction the judge did not raise is recorded, not swallowed', async
 
   const suspected = (await ledgerEntries(root)).filter((entry) => entry.kind === 'conflict-suspected')
   assert.equal(suspected.length, 1, 'the lexical check disagreed with the judge and said so')
-  assert.match(String(suspected[0].id), /端口/u)
+  // The ledger used to name the candidate by its folded signature — a copy of the text with the
+  // numbers replaced by `<n>` — which is why this assertion used to look for 端口 in the id. It names
+  // the record by the id the record is stored under now, so the stronger check is available.
+  assert.match(String(suspected[0].id), /^[0-9a-f]{12}$/u, 'the id is the content hash')
+  assert.equal(suspected[0].with, seeded.id, 'and the line says which record it contradicts')
   assert.ok(Number(suspected[0].score) > 0, 'the score is recorded so the threshold can be tuned later')
 })
 
@@ -1386,14 +1390,24 @@ function jevPairStub(decision: string): typeof fetch {
 // `<n>`, so the second sentence used to be dropped as a duplicate and the plugin kept
 // believing the old number. Whether that is a correction or a restatement is a
 // judgement, so it is asked — about one named memory, only here.
-test('a changed number updates the memory in place, with the old text in the ledger', async () => {
+test('a changed number supersedes the old memory and keeps both texts readable', async () => {
+  // This used to pass with the two sentences written into *one* record. The mechanism was a
+  // coincidence of the id function: ids were `signatureOf(text)`, which folds 8000 and 9000 both to
+  // `<n>`, so the second write landed on the first record's id and overwrote it in place. The same
+  // fold also merged memories that differed in more than a literal, which is why ids are content
+  // hashes now.
+  //
+  // What the outcome should be did not change: one current memory, the new number believed, and the
+  // previous text still readable. What changed is that the previous text is now a superseded
+  // *record* rather than a line in the ledger — which is what the question promises when it says the
+  // old memory is kept "供以后查证".
   const realFetch = globalThis.fetch
   globalThis.fetch = jevPairStub('same-update')
   try {
     const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } })
     const session = fakeSession({ events: [] })
     const write = toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write')
-    await write.execute({ text: '服务端口固定 8000，不要改。', type: 'constraint' }, { agent: { session } })
+    const seeded = await write.execute({ text: '服务端口固定 8000，不要改。', type: 'constraint' }, { agent: { session } })
 
     await listenerFor(captured, 'agent/turn-stopping')({
       agent: { id: 's1', session: fakeSession({ events: turnWith('服务端口固定 9000，不要改。') }) },
@@ -1407,21 +1421,23 @@ test('a changed number updates the memory in place, with the old text in the led
     assert.match(promoted(found)[0]!.text, /9000/u, 'the new number is what the plugin now believes')
     assert.equal(promoted(found)[0]!.status, 'active', 'and it is reachable — not left superseded')
 
-    // In place, not a second record: the signature is the identity, and `<n>` folds both
-    // numbers into one id. Writing a second record overwrote the first and then superseded
-    // what it had just written, which left the memory unreachable.
     const document = JSON.parse(await readFile(join(root, 'memory.json'), 'utf8')) as {
       records?: Array<Record<string, unknown>>
     }
     const records = document.records ?? []
-    assert.equal(records.length, 1, 'one record, corrected')
-    assert.match(String(records[0]?.text), /9000/u)
+    assert.equal(records.length, 2, 'two records: the current one and the one it replaced')
+    const old = records.find((record) => String(record.id) === seeded.id)
+    assert.ok(old, 'the replaced record is still there under its own id')
+    assert.match(String(old.text), /8000/u, 'with its own words, not the new ones')
+    assert.equal(old.status, 'superseded')
+    assert.equal(old.supersededBy, promoted(found)[0]!.id, 'and it points at what replaced it')
 
     const ledger = await ledgerEntries(root)
     assert.equal(ledger.find((entry) => entry.kind === 'pair-decision')?.decision, 'same-update')
     const applied = ledger.find((entry) => entry.kind === 'pair-updated')
-    assert.equal(applied?.inPlace, true)
-    assert.match(String(applied?.from), /8000/u, 'the previous text stays auditable')
+    assert.equal(applied?.inPlace, false, 'not an in-place overwrite any more')
+    assert.equal(applied?.superseded, seeded.id)
+    assert.match(String(applied?.from), /8000/u, 'the previous text is named')
     assert.match(String(applied?.to), /9000/u)
   } finally {
     globalThis.fetch = realFetch
@@ -1483,13 +1499,15 @@ test('a different rule that merely looks alike is kept as its own memory', async
   }
 })
 
-test('without a model a signature collision is recorded, not dropped in silence', async () => {
-  // The offline judge has no opinion on this by construction. Falling back must not mean
-  // "drop what the person just said" — which is exactly the defect this work started from
-  // — so the latest words win and the collision is written down.
+test('without a model the latest number still wins, and the old text stays readable', async () => {
+  // The offline judge has no opinion here by construction, and this is the case ids used to decide:
+  // `8000` and `9000` folded to the same `<n>`, so the second write silently overwrote the first.
+  // That was the right outcome for the wrong reason. The fingerprint match is now stated as a rule
+  // instead of emerging from the primary key — nothing else about the input class changed, so the
+  // latest words still win and the replaced text is still readable.
   const { root, captured } = await mount({ judge: 'heuristic' })
   const session = fakeSession({ events: [] })
-  await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+  const seeded = await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
     { text: '服务端口固定 8000，不要改。', type: 'constraint' },
     { agent: { session } },
   )
@@ -1500,13 +1518,21 @@ test('without a model a signature collision is recorded, not dropped in silence'
   })
   const ledger = await ledgerEntries(root)
   assert.equal(ledger.filter((entry) => entry.kind === 'pair-decision').length, 0, 'nobody was asked')
-  const collision = ledger.find((entry) => entry.kind === 'signature-collision')
-  assert.equal(collision?.reason, 'judge-unavailable')
-  assert.match(String(collision?.from), /8000/u)
-  assert.match(String(collision?.to), /9000/u)
+  const applied = ledger.find((entry) => entry.kind === 'pair-updated')
+  assert.equal(applied?.reason, 'judge-unavailable')
+  assert.equal(applied?.superseded, seeded.id, 'the record that lost is named')
+  assert.match(String(applied?.from), /8000/u)
+  assert.match(String(applied?.to), /9000/u)
 
   const search = toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search')
   assert.match((await search.execute({ query: '端口' }, { agent: { session } })).matches[0]?.text ?? '', /9000/u)
+
+  const document = JSON.parse(await readFile(join(root, 'memory.json'), 'utf8')) as {
+    records?: Array<Record<string, unknown>>
+  }
+  const old = (document.records ?? []).find((record) => String(record.id) === seeded.id)
+  assert.match(String(old?.text), /8000/u, 'the replaced text is a record, not just a ledger line')
+  assert.equal(old?.status, 'superseded')
 })
 
 // A paraphrase the model calls an update has a *different* signature, so there the old

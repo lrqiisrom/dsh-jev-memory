@@ -90,7 +90,7 @@ import {
   selectMemories,
 } from './lib/recall.ts'
 import { isNoteworthyVeto, screenSentence, signatureOf } from './lib/signals.ts'
-import { archiveId, createMemoryStore, MEMORY_TYPES, type L0Entry, type MemoryRecord } from './lib/store.ts'
+import { archiveId, createMemoryStore, MEMORY_TYPES, recordIdOf, type L0Entry, type MemoryRecord } from './lib/store.ts'
 import { ECHO_DEFAULTS, findEcho, type EchoSettings } from './lib/echo.ts'
 import { estimateTokens, excerpt, hashText } from './lib/text.ts'
 import type { Candidate, ExtractOptions, TurnEvent } from './lib/extract.ts'
@@ -583,6 +583,10 @@ export interface MemoryWriteResult {
   id: string
   stored: boolean
   replaced: boolean
+  /** the type actually stored, which is `fact` when the caller's type was not recognized. */
+  type: string
+  /** the importance actually stored, defaulted rather than echoed back. */
+  importance: number
 }
 
 /** The `memory_forget` result. */
@@ -2037,7 +2041,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           ? modelCandidates.filter((candidate) => {
               const screen = screenSentence(`${candidate.text} ${candidate.quote}`)
               if (screen.keep || screen.reason !== 'secret') return true
-              void store.ledger({ kind: 'skip', reason: 'veto:secret', id: candidate.key, quote: excerpt(candidate.quote, 120) })
+              void store.ledger({ kind: 'skip', reason: 'veto:secret', id: recordIdOf(candidate.text), quote: excerpt(candidate.quote, 120) })
               return false
             })
           : extractCandidates(events, {
@@ -2079,7 +2083,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
             void store.ledger({
               kind: 'skip',
               reason: 'echoed-model',
-              id: candidate.key,
+              id: recordIdOf(candidate.text),
               role: hit.role,
               coverage: Number(hit.coverage.toFixed(2)),
               quote: excerpt(candidate.quote, 120),
@@ -2117,10 +2121,14 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
 
       const fresh: Candidate[] = []
       for (const candidate of decided) {
-        const exact = store.get(candidate.key)
+        // Looked up by the id the write itself will use, not by the candidate's identity. Those
+        // were two different functions — the candidate's key folded digits, the record's id was
+        // the folded text — so for a clipped candidate the exact-duplicate check searched for an
+        // id that could never exist.
+        const exact = store.get(recordIdOf(candidate.text))
         // Byte-identical to something stored: no judgement in it, no model call.
         if (exact && exact.text === candidate.text) {
-          void store.ledger({ kind: 'skip', reason: 'duplicate', id: candidate.key, quote: candidate.quote })
+          void store.ledger({ kind: 'skip', reason: 'duplicate', id: recordIdOf(candidate.text), quote: candidate.quote })
           continue
         }
         // The signature matched but the words differ (`<n>` folds 8000 and 9000 into
@@ -2150,7 +2158,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           //
           // A model that cannot answer changes nothing here: the person's latest words win,
           // and the collision is recorded rather than dropped in silence.
-          if (near.id === candidate.key) {
+          if (near.id === recordIdOf(candidate.text)) {
             // Same identity: the record is updated in place, whatever the model says about the
             // relationship. The ledger line that used to record "the model could not answer" is written
             // after the judgement comes back, where the answer actually is.
@@ -2165,12 +2173,21 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         if (candidate.kind === 'tool-failure') {
           const seen = store.observedCount(candidate.key)
           store.noteObserved(candidate.key)
-          void store.ledger({ kind: 'observed', id: candidate.key, tool: candidate.tool, quote: excerpt(candidate.quote, 120) })
+          void store.ledger({
+            kind: 'observed',
+            id: recordIdOf(candidate.text),
+            // The counter key, deliberately not the record id: "the same failure again" is about the
+            // shape of the failure, and two error messages differing only by a port number are the same
+            // failure. Folding is right here and wrong as an identity, which is the whole distinction.
+            signature: candidate.key,
+            tool: candidate.tool,
+            quote: excerpt(candidate.quote, 120),
+          })
           if (seen + 1 < config.repeatFailuresToWrite) {
             void store.ledger({
               kind: 'skip',
               reason: 'failure-not-repeated',
-              id: candidate.key,
+              id: recordIdOf(candidate.text),
               seen: seen + 1,
               quote: excerpt(candidate.quote, 120),
             })
@@ -2225,7 +2242,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           // model's answer was not decisive, so applying its lean first meant answering "keep the old one"
           // left neither memory — the old one already superseded and the new one dropped.
           const torn = relationActionsDisagree(judgement.relationshipProbabilities, config.conflictReviewMinScore)
-          if (judgement.relationship === 'same-update' && partner.id !== candidate.key && !torn) {
+          if (judgement.relationship === 'same-update' && partner.id !== recordIdOf(candidate.text) && !torn) {
             replacements.set(candidate.key, partner.id)
           }
           if (judgement.relationship === 'same-duplicate' && !torn) skippedPairs.add(candidate.key)
@@ -2235,7 +2252,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           if (typeof judgement.relationship === 'string') {
             void store.ledger({
               kind: 'pair-decision',
-              id: candidate.key,
+              id: recordIdOf(candidate.text),
               with: partner.id,
               decision: judgement.relationship,
               probabilities: judgement.relationshipProbabilities ?? null,
@@ -2244,12 +2261,28 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
               overlap: Number((findConflictPartner(candidate.text, [partner], 0)?.score ?? 0).toFixed(3)),
               quote: excerpt(candidate.quote, 120),
             })
-          } else if (partner.id === candidate.key) {
-            // Same identity, no usable answer: the person's latest words still win (the in-place update
-            // is already recorded), and the collision is written down rather than dropped in silence.
+          } else if (
+            partner.text !== candidate.text &&
+            signatureOf(partner.text) === signatureOf(candidate.text)
+          ) {
+            // The same sentence with a different literal — a number, a path, a quoted value.
+            //
+            // This used to happen by accident. The record id *was* `signatureOf(text)`, which folds
+            // `8000` and `9000` into `<n>`, so these two sentences were one record and writing the
+            // second simply overwrote the first. That was the right outcome for the wrong reason, and
+            // the reason was also destroying memories that differed in more than a literal.
+            //
+            // Ids are content hashes now, so the relationship is stated here instead: nobody answered
+            // (no model, or a model with no usable opinion), the fingerprint says these are the same
+            // rule, and the person's latest words win. The previous text stays readable on the
+            // superseded record — which is what the question promises when it says the old one is kept
+            // "供以后查证". Before this, that text survived only in the ledger.
+            replacements.set(candidate.key, partner.id)
             void store.ledger({
-              kind: 'signature-collision',
-              id: candidate.key,
+              kind: 'pair-updated',
+              id: recordIdOf(candidate.text),
+              superseded: partner.id,
+              inPlace: false,
               from: excerpt(partner.text, 160),
               to: excerpt(candidate.text, 160),
               reason: !config.pairDecision ? 'pair-decision-disabled' : 'judge-unavailable',
@@ -2273,14 +2306,14 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
             // superseded with nobody asked, because this branch set a replacement and the question was
             // then dropped for want of a nameable partner.
             const tornHere = relationActionsDisagree(verdict.probabilities, config.conflictReviewMinScore)
-            if (verdict.decision === 'same-update' && target.id !== candidate.key && !tornHere) {
+            if (verdict.decision === 'same-update' && target.id !== recordIdOf(candidate.text) && !tornHere) {
               replacements.set(candidate.key, target.id)
             }
             if (verdict.decision === 'same-duplicate' && !tornHere) skippedPairs.add(candidate.key)
             if (verdict.by === 'jev') {
               void store.ledger({
                 kind: 'pair-decision',
-                id: candidate.key,
+                id: recordIdOf(candidate.text),
                 with: target.id,
                 decision: verdict.decision ?? 'unknown',
                 probabilities: verdict.probabilities ?? null,
@@ -2305,7 +2338,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         if (!suspected) continue
         void store.ledger({
           kind: 'conflict-suspected',
-          id: candidate.key,
+          id: recordIdOf(candidate.text),
           with: suspected.existing.id,
           score: Number(suspected.score.toFixed(3)),
           shared: suspected.shared.slice(0, 8),
@@ -2335,7 +2368,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           void store.ledger({
             kind: 'skip',
             reason: 'pair-duplicate',
-            id: candidate.key,
+            id: recordIdOf(candidate.text),
             with: partners.get(candidate.key)?.id ?? null,
             quote: excerpt(candidate.quote, 120),
           })
@@ -2377,7 +2410,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           void store.ledger({
             kind: 'skip',
             reason: gate.reason,
-            id: candidate.key,
+            id: recordIdOf(candidate.text),
             by: judgement?.by ?? 'none',
             model,
             // The raw probability, so a later run can tell "nothing near the line" from "the threshold
@@ -2410,7 +2443,10 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
             ? { pair: findConflictPartner(candidate.text, [known], 0) ?? { incoming: candidate.text, existing: known, score: 0, shared: [] }, via: 'known' as const }
             : await pairConflict(candidate.text, store.all().filter((record) => record.status === 'active' && inScope(record, cwd)), cwd, signal)
           if (paired) {
-            pendingConflicts.push({ incomingId: candidate.key, pair: paired.pair, via: paired.via, by: judgement.by })
+            // The record this question is about, by the id it is stored under: the answer arrives in a
+            // later turn and is applied with `store.remove`/`supersede` on this exact id. Passing the
+            // candidate's identity here made "keep the old one" delete nothing.
+            pendingConflicts.push({ incomingId: recordIdOf(candidate.text), pair: paired.pair, via: paired.via, by: judgement.by })
           } else {
             // A raised conflict nobody can be asked about is still a fact worth
             // recording: without this line the memory silently disappears from
@@ -2418,7 +2454,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
             void store.ledger({
               kind: 'skip',
               reason: 'conflict-unpaired',
-              id: candidate.key,
+              id: recordIdOf(candidate.text),
               by: judgement.by,
               quote: excerpt(candidate.quote, 120),
             })
@@ -2431,7 +2467,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           // were reversals somebody would have wanted to arbitrate. Counting changes no behaviour.
           void store.ledger({
             kind: 'conflict-preempted',
-            id: candidate.key,
+            id: recordIdOf(candidate.text),
             with: replaced ?? updated ?? null,
             decision: pairVerdicts.get(candidate.key) ?? null,
             conflict: judgement?.conflict ?? null,
@@ -2449,7 +2485,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         // the hint here would write a record that is never injected.
         const writtenType = fromModel ? candidate.modelType! : (gated?.type ?? judgement.type)
         await store.put({
-          id: candidate.key,
+          id: recordIdOf(candidate.text),
           // The type and importance that the *gate used*, not the judge's own numbers.
           //
           // Under `writeGate: deterministic` the gate reads the local type and score while the
@@ -2475,7 +2511,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         })
         void store.ledger({
           kind: 'write',
-          id: candidate.key,
+          id: recordIdOf(candidate.text),
           // What was acted on, and separately what the model said — the ledger records both so the
           // two can be compared after the fact instead of being conflated in one field.
           type: writtenType,
@@ -2500,17 +2536,28 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           // In place: `store.put` already preserves createdAt, recalls and lastRecalledAt.
           void store.ledger({
             kind: 'pair-updated',
-            id: candidate.key,
+            id: recordIdOf(candidate.text),
             inPlace: true,
             from: excerpt(previousText, 160),
             to: excerpt(candidate.text, 160),
           })
         }
         if (replaced !== undefined) {
-          await store.supersede(replaced, candidate.key)
-          void store.ledger({ kind: 'pair-updated', id: candidate.key, superseded: replaced, inPlace: false })
+          // Read the replaced text before superseding it, so the ledger line says *which words* were
+          // replaced. Without this the line named an id and nothing else, and the only way to find out
+          // what had been superseded was to go looking for the record.
+          const replacedText = store.get(replaced)?.text ?? previousText
+          await store.supersede(replaced, recordIdOf(candidate.text))
+          void store.ledger({
+            kind: 'pair-updated',
+            id: recordIdOf(candidate.text),
+            superseded: replaced,
+            inPlace: false,
+            from: excerpt(replacedText, 160),
+            to: excerpt(candidate.text, 160),
+          })
         }
-        writtenIds.push(candidate.key)
+        writtenIds.push(recordIdOf(candidate.text))
         written += 1
       }
       return {
@@ -2702,12 +2749,22 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           id: { type: 'string' },
           stored: { type: 'boolean' },
           replaced: { type: 'boolean' },
+          type: { type: 'string' },
+          importance: { type: 'number' },
         },
-        required: ['id', 'stored', 'replaced'],
+        required: ['id', 'stored', 'replaced', 'type', 'importance'],
         additionalProperties: false,
       },
+      // No id on the card. It is a content hash, so it says nothing to a reader, and printing it
+      // showed the person a folded fingerprint of their own sentence (`0/38` came out as `<path>`).
+      // What a reader wants to know is what was stored and how it was classified.
       render: (_args: unknown, value: MemoryWriteResult) => [
-        { type: 'text', text: value?.stored ? `已写入长期记忆 (${value.id})${value.replaced ? '，覆盖了同内容的旧条目' : ''}` : '未写入' },
+        {
+          type: 'text',
+          text: value?.stored
+            ? `已写入长期记忆（${value.type}，重要性 ${value.importance.toFixed(2)}）${value.replaced ? '，覆盖了内容相同的那条' : ''}`
+            : '未写入',
+        },
       ],
     },
     timeoutMs: 5000,
@@ -2715,17 +2772,23 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     execute: async (args: WriteArgs, exec?: ToolExecContext): Promise<MemoryWriteResult> => {
       const { text, type, importance } = args ?? {}
       const normalized = String(text ?? '').trim()
-      if (!normalized) return { id: '', stored: false, replaced: false }
-      const id = signatureOf(normalized)
+      if (!normalized) return { id: '', stored: false, replaced: false, type: 'fact', importance: 0.8 }
+      const stored = normalized.slice(0, 400)
+      // The id comes from the text that is stored, clipped the same way. Deriving it from the full
+      // input instead would make the id fail to match the record's own text.
+      const id = recordIdOf(stored)
       const replaced = store.has(id)
       const now = Date.now()
       const cwd = cwdOf(exec)
+      const storedType = type && MEMORY_TYPES.includes(type) ? type : 'fact'
+      const storedImportance =
+        typeof importance === 'number' && Number.isFinite(importance) ? Math.min(1, Math.max(0, importance)) : 0.8
       await store.put({
         id,
-        type: type && MEMORY_TYPES.includes(type) ? type : 'fact',
-        text: normalized.slice(0, 400),
+        type: storedType,
+        text: stored,
         cwd,
-        importance: typeof importance === 'number' && Number.isFinite(importance) ? Math.min(1, Math.max(0, importance)) : 0.8,
+        importance: storedImportance,
         status: 'active',
         source: { sessionId: exec?.agent?.id ?? null, seq: null, quote: normalized.slice(0, 200), at: now },
         createdAt: now,
@@ -2734,9 +2797,9 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         lastRecalledAt: null,
         judge: { kind: 'explicit', confidence: null, conflict: 'unknown', mode: 'explicit' },
       })
-      void store.ledger({ kind: 'write', id, type, by: 'explicit', cwd, quote: excerpt(normalized, 160) })
+      void store.ledger({ kind: 'write', id, type: storedType, by: 'explicit', cwd, quote: excerpt(normalized, 160) })
       scheduleNormalize([id], undefined)
-      return { id, stored: true, replaced }
+      return { id, stored: true, replaced, type: storedType, importance: storedImportance }
     },
   })
 
