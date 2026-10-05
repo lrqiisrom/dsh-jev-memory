@@ -71,6 +71,17 @@ export interface Judgement {
    * set from the distribution.
    */
   conflictScore?: number | null
+  /** the relationship label distribution, which is what the unsure band reads. */
+  relationshipProbabilities?: Record<string, number> | null
+  /** the relationship between this candidate and the stored memory it resembles, if asked. */
+  relationship?: string | null
+  /**
+   * Which known memory this candidate is about, when there was no similar one to quote.
+   *
+   * `-1` means the model looked and named none; `null` means the question was not asked. The caller needs
+   * the difference: only the first is an answer it can act on.
+   */
+  relatedIndex?: number | null
   /** judge-reported confidence, when available. */
   confidence: number | null
   /** which implementation produced this row. */
@@ -91,6 +102,14 @@ export interface JudgeResult {
 /** Extra judge context: known memories for the conflict question, the workspace, and the turn's signal. */
 export interface JudgeContext {
   known?: string[]
+  /**
+   * Per candidate: the stored sentence it resembles, or null when none was found.
+   *
+   * With one, the relationship is asked in the same request (quoted against that sentence); without one,
+   * the model is asked which known memory the candidate is about instead. The deterministic similarity
+   * search that fills this is free, which is why it runs first.
+   */
+  partners?: Array<string | null>
   /** the workspace the candidates came from; forwarded as model framing. */
   project?: string | null
   /**
@@ -152,7 +171,14 @@ export interface Judge {
     incoming: string,
     existing: string,
     context?: JudgeContext,
-  ): Promise<{ decision: PairDecision | null; confidence: number | null; by: 'jev' | 'heuristic'; model: string | null }>
+  ): Promise<{
+    decision: PairDecision | null
+    confidence: number | null
+    /** the label distribution, when the model reported one; the unsure band reads it. */
+    probabilities: Record<string, number> | null
+    by: 'jev' | 'heuristic'
+    model: string | null
+  }>
 }
 
 /** The judgement fields the write gate reads. */
@@ -162,8 +188,10 @@ export interface GateInput {
   /** the judge's "worth remembering" probability, when it answered that question. */
   remember?: number | null
   conflict: string
-  /** the raw probability behind `conflict`, for the unsure band; `null` when the judge had none. */
+  /** the raw probability behind `conflict`; kept for the ledger, nothing decides on it. */
   conflictScore?: number | null
+  /** the relationship label distribution, which is what the unsure band reads. */
+  relationshipProbabilities?: Record<string, number> | null
 }
 
 /** The config fields the write gate reads. */
@@ -174,13 +202,13 @@ export interface GateConfig {
   minRemember: number
   reviewOnConflict: boolean
   /**
-   * Below the conflict threshold but at or above this, the answer is treated as "unsure" and the person
-   * is asked instead of the plugin guessing. `0` disables the band.
+   * How much probability each *action* side needs before the person is asked. `0` disables the band.
    *
-   * The band exists because the number behind the verdict is the useful part: 0.02 and 0.68 both read as
-   * `no`, and they call for opposite decisions. Measured on 16 real near-miss candidates, two landed in
-   * 0.3-0.7 while the anchors separated cleanly (a real reversal 0.97, an unrelated sentence 0.10), so
-   * the band is narrow enough to be worth someone's attention.
+   * The relationship answer comes back as a distribution over three labels, and those labels fall into
+   * two outcomes: "do not add a new memory" (`same-update` replaces the old one, `same-duplicate` drops
+   * the new one) and "keep both" (`different`). A model torn *within* one side is not worth interrupting
+   * anyone for — either way nothing is added. A model torn *between* the sides is exactly the case a
+   * person should settle, and that is what this threshold measures.
    */
   conflictReviewMinScore?: number
 }
@@ -254,6 +282,7 @@ export function createJudge({ config, jev, log = () => {} }: { config: JudgeConf
           candidates,
           types: config.types,
           known: context.known ?? [],
+          partners: context.partners ?? [],
           project: context.project ?? null,
           conversation: context.conversation ?? [],
           timeoutMs: config.judgeTimeoutMs,
@@ -281,6 +310,12 @@ export function createJudge({ config, jev, log = () => {} }: { config: JudgeConf
                 typeof row.conflictScore === 'number' && Number.isFinite(row.conflictScore)
                   ? clamp01(row.conflictScore)
                   : null,
+              // The relationship and its distribution travel to the caller, which is what decides
+              // whether to ask the person. Dropping them here is a silent failure: the record still says
+              // "conflict: yes" (a description derived from the relationship) and the band sees nothing.
+              relationship: row.relationship ?? null,
+              relationshipProbabilities: row.relationshipProbabilities ?? null,
+              relatedIndex: row.relatedIndex ?? null,
               confidence: Number.isFinite(row.confidence) ? clamp01(row.confidence) : null,
               by: 'jev',
               signals: candidate.signals,
@@ -337,8 +372,15 @@ export function createJudge({ config, jev, log = () => {} }: { config: JudgeConf
       incoming: string,
       existing: string,
       context: JudgeContext = {},
-    ): Promise<{ decision: PairDecision | null; confidence: number | null; by: 'jev' | 'heuristic'; model: string | null }> {
-      if (!(await jevReady())) return { decision: null, confidence: null, by: 'heuristic', model: null }
+    ): Promise<{
+      decision: PairDecision | null
+      confidence: number | null
+      /** the label distribution, when the model reported one; the unsure band reads it. */
+      probabilities: Record<string, number> | null
+      by: 'jev' | 'heuristic'
+      model: string | null
+    }> {
+      if (!(await jevReady())) return { decision: null, confidence: null, probabilities: null, by: 'heuristic', model: null }
       try {
         const result = await jev!.decidePair({
           incoming,
@@ -347,10 +389,10 @@ export function createJudge({ config, jev, log = () => {} }: { config: JudgeConf
           timeoutMs: config.judgeTimeoutMs,
           signal: context.signal,
         })
-        return { decision: result.decision, confidence: result.confidence, by: 'jev', model: result.model }
+        return { decision: result.decision, confidence: result.confidence, probabilities: result.probabilities ?? null, by: 'jev', model: result.model }
       } catch (error) {
         log('warn', 'pair decision failed; keeping the deterministic behaviour', { error: String(error) })
-        return { decision: null, confidence: null, by: 'heuristic', model: null }
+        return { decision: null, confidence: null, probabilities: null, by: 'heuristic', model: null }
       }
     },
   }
@@ -416,20 +458,29 @@ export function applyGate(judgement: GateInput | null | undefined, config: GateC
   // same-duplicate / different judgement, and the human is only the tie-breaker. So the question is asked
   // in one situation only — the judge was not confident either way (the band) — and the record is written
   // first, as `needs-review`, so an unanswered question leaves it stored and merely withheld from recall.
-  const band = config.conflictReviewMinScore ?? 0
-  if (
-    config.reviewOnConflict &&
-    band > 0 &&
-    // The upper edge is "the judge called it a conflict" itself, so it needs no second number: a
-    // confident conflict is Jev's to resolve and must not fall into the band. Without this clause the
-    // band swallows every conflict — which an existing test caught the moment the branch above went away.
-    judgement.conflict !== 'yes' &&
-    typeof judgement.conflictScore === 'number' &&
-    judgement.conflictScore >= band
-  ) {
+  if (config.reviewOnConflict && relationActionsDisagree(judgement.relationshipProbabilities, config.conflictReviewMinScore ?? 0)) {
     return { write: true, review: true, reason: 'conflict-uncertain' }
   }
   return { write: true, reason: 'ok' }
+}
+
+/**
+ * Whether a relationship answer is torn between the two *outcomes* rather than between synonyms.
+ *
+ * `same-update` and `same-duplicate` both mean "the new sentence adds nothing new" — one replaces the
+ * old memory, the other is dropped, and either way nothing is added. `different` means both stay. So a
+ * distribution split inside one side is not a decision anybody needs to make, and only a split across
+ * the sides is worth a person's attention.
+ *
+ * @param probabilities - the label distribution the model returned, or null.
+ * @param band - how much probability each side needs; `0` disables the check.
+ * @returns whether to ask.
+ */
+export function relationActionsDisagree(probabilities: Record<string, number> | null | undefined, band: number): boolean {
+  if (!probabilities || band <= 0) return false
+  const keepBoth = probabilities.different ?? 0
+  const addsNothing = (probabilities['same-update'] ?? 0) + (probabilities['same-duplicate'] ?? 0)
+  return keepBoth >= band && addsNothing >= band
 }
 
 /**
@@ -455,14 +506,7 @@ export function applyModelGate(judgement: GateInput | null | undefined, config: 
   // The band applies here too — it is a question about who should decide, and that does not change just
   // because the model wrote the memory's text. A confident conflict is left to the pair judgement, as
   // above.
-  const band = config.conflictReviewMinScore ?? 0
-  if (
-    config.reviewOnConflict &&
-    band > 0 &&
-    judgement?.conflict !== 'yes' &&
-    typeof judgement?.conflictScore === 'number' &&
-    judgement.conflictScore >= band
-  ) {
+  if (config.reviewOnConflict && relationActionsDisagree(judgement?.relationshipProbabilities, config.conflictReviewMinScore ?? 0)) {
     return { write: true, review: true, reason: 'conflict-uncertain' }
   }
   return { write: true, reason: 'model-write' }

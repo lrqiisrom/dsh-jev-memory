@@ -59,11 +59,11 @@ test('judge auto mode picks up a credential that appears after mount', async () 
     config: { judge: 'auto', types: ['constraint'] },
     jev: {
       isAvailable: async () => available, choosePartner: async () => ({ index: null, confidence: null, model: null }),
-    decidePair: async () => ({ decision: null, confidence: null, model: null }),
+    decidePair: async () => ({ decision: null, confidence: null, probabilities: null, model: null }),
       decide: async () => ({
         model: 'jev-1.13.0',
         rows: [
-          { key: 'k', type: 'constraint', importance: 0.9, remember: 0.9, conflict: 'no', conflictScore: 0.12, confidence: 0.9 },
+          { key: 'k', type: 'constraint', importance: 0.9, remember: 0.9, conflict: 'no', conflictScore: 0.12, relationship: null, relationshipProbabilities: null, relatedIndex: null, confidence: 0.9 },
         ],
       }),
     },
@@ -81,7 +81,7 @@ test('an unavailable credential service never breaks a judgement', async () => {
         throw new Error('no service')
       },
       choosePartner: async () => ({ index: null, confidence: null, model: null }),
-    decidePair: async () => ({ decision: null, confidence: null, model: null }),
+    decidePair: async () => ({ decision: null, confidence: null, probabilities: null, model: null }),
       decide: async () => {
         throw new Error('must not be called')
       },
@@ -131,10 +131,11 @@ test('the gate question asks about lifetime, not about grammar', () => {
   assert.equal(typeof asked === 'object' ? asked.question : asked, 'SENTINEL QUESTION')
 })
 
-test('the raw conflict probability is carried, not discarded', () => {
-  // The verdict alone cannot answer "is the threshold cutting real conflicts off". 0.02 and 0.68 both
-  // record as `no` and call for opposite decisions, so the number behind the verdict is kept — for the
-  // ledger only, exactly like `confidence`, and never read by a decision.
+test('the relationship and its distribution are carried, not collapsed to a verdict', () => {
+  // The relationship is asked in the same request as everything else, when a stored memory similar enough
+  // to quote was found. The distribution comes back with it and is what the unsure band reads: a model
+  // torn between "replace the old one" and "keep both" is the case a person should settle, and the top
+  // label alone cannot show that.
   const rows = parseDecisions(
     {
       model: 'jev-1.13.0',
@@ -142,31 +143,45 @@ test('the raw conflict probability is carried, not discarded', () => {
         'remember:0': { type: 'noul', noul: 0.8 },
         'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
         'importance:0': { type: 'score', score: 2 },
-        'conflict:0': { type: 'noul', noul: 0.68 },
+        'pair:0': {
+          type: 'choice',
+          choice: 'same-update',
+          probabilities: { 'same-update': 0.5, 'same-duplicate': 0.1, different: 0.4 },
+          confidence: 0.5,
+        },
         'remember:1': { type: 'noul', noul: 0.8 },
         'type:1': { type: 'choice', choice: 'constraint', confidence: 0.9 },
         'importance:1': { type: 'score', score: 2 },
-        'conflict:1': { type: 'noul', noul: 0.97 },
+        'pair:1': { type: 'choice', choice: 'different', probabilities: { different: 0.95 }, confidence: 0.9 },
+        // No similar memory to quote, so this one is asked what it is *about* instead.
+        'remember:2': { type: 'noul', noul: 0.8 },
+        'type:2': { type: 'choice', choice: 'constraint', confidence: 0.9 },
+        'importance:2': { type: 'score', score: 2 },
+        'related:2': { type: 'choice', choice: 'm1', confidence: 0.8 },
       },
     },
     [
-      { key: 'near', text: 'a', hintedType: null, signalScore: 0, signals: [] },
-      { key: 'real', text: 'b', hintedType: null, signalScore: 0, signals: [] },
+      { key: 'torn', text: 'a', hintedType: null, signalScore: 0, signals: [] },
+      { key: 'keeps', text: 'b', hintedType: null, signalScore: 0, signals: [] },
+      { key: 'related', text: 'c', hintedType: null, signalScore: 0, signals: [] },
     ],
     { conflictThreshold: 0.7, importanceLevels: 3 },
   )
-  assert.equal(rows[0]?.conflict, 'no', 'just below the line')
-  assert.equal(rows[0]?.conflictScore, 0.68, 'and how close it was is now recorded')
-  assert.equal(rows[1]?.conflict, 'yes')
-  assert.equal(rows[1]?.conflictScore, 0.97)
+  assert.equal(rows[0]?.relationship, 'same-update')
+  assert.deepEqual(rows[0]?.relationshipProbabilities, { 'same-update': 0.5, 'same-duplicate': 0.1, different: 0.4 })
+  assert.equal(rows[1]?.relationship, 'different')
+  assert.equal(rows[2]?.relationship, null, 'no similar memory, so no relationship was asked')
+  assert.equal(rows[2]?.relatedIndex, 1, 'and the memory it named is carried as an index')
+  // "Conflict" is now a description derived from the relationship — nothing decides on it.
+  assert.equal(rows[0]?.conflict, 'yes')
+  assert.equal(rows[1]?.conflict, 'unknown')
 
-  // A judge with no probability to report says null, not zero: a missing answer must not look like a
-  // confident "no conflict" once the threshold is set from the distribution.
   const fallback = createJudge({
     config: { judge: 'heuristic', types: ['constraint'] },
     jev: undefined,
   })
   return fallback.judge([{ key: 'k', text: '必须用 pnpm。', hintedType: 'constraint', signalScore: 0.7, signals: [] }]).then((result) => {
-    assert.equal(result.rows[0]?.conflictScore ?? null, null)
+    assert.equal(result.rows[0]?.relationshipProbabilities ?? null, null, 'no probability to report is null, not zero')
+    assert.equal(result.rows[0]?.relationship ?? null, null)
   })
 })

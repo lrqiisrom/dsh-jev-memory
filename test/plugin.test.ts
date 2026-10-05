@@ -419,7 +419,6 @@ test('the write gate is deterministic by default and the judge can be put back',
           'remember:0': { type: 'noul', noul: 0.05 },
           'type:0': { type: 'choice', choice: 'fact', confidence: 0.9 },
           'importance:0': { type: 'score', score: 0, legend: {}, confidence: 0.9 },
-          'conflict:0': { type: 'noul', noul: 0.05 },
         },
       }),
       { status: 200, headers: { 'content-type': 'application/json' } },
@@ -472,7 +471,7 @@ test('a memory the local rule accepted is stored with the type the gate used, so
           // signals did.
           'type:0': { type: 'choice', choice: 'pitfall', confidence: 0.9 },
           'importance:0': { type: 'score', score: 0, legend: {}, confidence: 0.9 },
-          'conflict:0': { type: 'noul', noul: 0.05 },
+          'related:0': { type: 'choice', choice: 'none', confidence: 0.9 },
         },
       }),
       { status: 200, headers: { 'content-type': 'application/json' } },
@@ -507,7 +506,7 @@ test('deterministic mode refuses a sentence the local signals cannot type', asyn
           'remember:0': { type: 'noul', noul: 0.99 },
           'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
           'importance:0': { type: 'score', score: 4, legend: {}, confidence: 0.9 },
-          'conflict:0': { type: 'noul', noul: 0.05 },
+          'related:0': { type: 'choice', choice: 'none', confidence: 0.9 },
         },
       }),
       { status: 200, headers: { 'content-type': 'application/json' } },
@@ -703,9 +702,15 @@ function jevConflictResponse(): Response {
         'remember:0': { type: 'noul', noul: 0.9 },
         'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
         'importance:0': { type: 'score', score: 3, legend: {}, confidence: 0.9 },
-        // Inside the unsure band. The person's decision: a *confident* conflict is Jev's to resolve
-        // through its pair judgement, so the band is the only thing that asks.
-        'conflict:0': { type: 'noul', noul: 0.55 },
+        // A relationship the model is torn about: "replace the old one" and "keep both" both hold real
+        // probability. That split between outcomes — not between synonyms — is the only thing that asks
+        // the person now.
+        'pair:0': {
+          type: 'choice',
+          choice: 'same-update',
+          probabilities: { 'same-update': 0.5, 'same-duplicate': 0.05, different: 0.45 },
+          confidence: 0.5,
+        },
       },
     }),
     { status: 200, headers: { 'content-type': 'application/json' } },
@@ -753,6 +758,7 @@ test('a suspected conflict is put to the human and the answer decides', async ()
       signal: undefined,
     })
 
+    console.log('DEBUG asked:', captured.asked.length)
     assert.equal(captured.asked.length, 1, 'the plugin must ask exactly once')
     const question = captured.asked[0].questions[0]
     assert.match(question.detail ?? '', /不要改动 data\/ 目录下的任何文件/)
@@ -1311,7 +1317,14 @@ test('forgetting a superseded memory really removes it', async () => {
   }
 })
 
-/** A Jev stub that answers the pair question with one fixed decision. */
+/**
+ * A Jev stub that answers the relationship with one fixed decision.
+ *
+ * The relationship now travels in the *same* request as everything else, keyed by the candidate
+ * (`pair:0`), because the deterministic search for a similar sentence runs first and that is what makes
+ * quoting it possible. The separate `pair` question survives only for the rare follow-up: nothing similar
+ * by wording, but the model named one of the known memories as the subject.
+ */
 function jevPairStub(decision: string): typeof fetch {
   return (async (_url: string, init?: { body?: unknown }) => {
     const body = JSON.parse(String(init?.body ?? '{}'))
@@ -1334,7 +1347,17 @@ function jevPairStub(decision: string): typeof fetch {
           'remember:0': { type: 'noul', noul: 0.9 },
           'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
           'importance:0': { type: 'score', score: 3, legend: {}, confidence: 0.9 },
-          'conflict:0': { type: 'noul', noul: 0.05 },
+          // The candidate resembles a stored memory, so the relationship is asked in this same request,
+          // with the distribution that decides whether the person is asked too.
+          'pair:0': {
+            type: 'choice',
+            choice: decision,
+            probabilities: {
+              'same-update': decision === 'same-update' ? 0.9 : 0.05,
+              different: decision === 'different' ? 0.9 : 0.05,
+            },
+            confidence: 0.9,
+          },
         },
       }),
       { status: 200, headers: { 'content-type': 'application/json' } },
@@ -2168,10 +2191,14 @@ test('a conflict the pair question resolved is counted, not asked, and not lost'
           'remember:0': { type: 'noul', noul: 0.9 },
           'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
           'importance:0': { type: 'score', score: 2 },
-          // ≥0.7 → the judge says a conflict exists → `gate.review` is true.
-          'conflict:0': { type: 'noul', noul: 0.95 },
-          // …and the pair question then resolves it as the same rule, newer wording.
-          pair: { type: 'choice', choice: 'same-update', confidence: 0.9 },
+          // A confident relationship: the same rule, newer wording → the old memory is replaced. Counted
+          // by the pre-emption line because the person chose to leave this to the model.
+          'pair:0': {
+            type: 'choice',
+            choice: 'same-update',
+            probabilities: { 'same-update': 0.95, different: 0.05 },
+            confidence: 0.95,
+          },
         },
       }),
       { status: 200, headers: { 'content-type': 'application/json' } },
@@ -2235,8 +2262,13 @@ test('an unsure conflict probability asks the person, and the record waits in ne
           'remember:0': { type: 'noul', noul: 0.9 },
           'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
           'importance:0': { type: 'score', score: 3, legend: {}, confidence: 0.9 },
-          // Not `yes` (>= 0.7), but inside the band [0.3, 0.7): the model is unsure.
-          'conflict:0': { type: 'noul', noul: 0.5 },
+          // Torn between the two outcomes: replacement and keep-both both hold real probability.
+          'pair:0': {
+            type: 'choice',
+            choice: 'same-update',
+            probabilities: { 'same-update': 0.5, 'same-duplicate': 0.1, different: 0.4 },
+            confidence: 0.5,
+          },
         },
       }),
       { status: 200, headers: { 'content-type': 'application/json' } },

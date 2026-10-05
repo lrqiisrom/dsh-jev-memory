@@ -53,7 +53,15 @@ import {
   type ConflictScorer,
 } from './lib/conflict.ts'
 import { EXTRACT_DEFAULTS, archiveMessages, extractCandidates } from './lib/extract.ts'
-import { applyGate, applyModelGate, createJudge, heuristicRow, JUDGE_MODES, type Judgement } from './lib/judge.ts'
+import {
+  applyGate,
+  applyModelGate,
+  createJudge,
+  heuristicRow,
+  JUDGE_MODES,
+  relationActionsDisagree,
+  type Judgement,
+} from './lib/judge.ts'
 import {
   EMBEDDING_DEFAULTS,
   cosineSimilarity,
@@ -659,7 +667,7 @@ export const name = 'jev-memory'
  * runtime (importing JSON would break the zero-dependency mount), so the two
  * are a convention rather than a derivation. Bump both together.
  */
-export const version = '0.31.0'
+export const version = '0.32.0'
 
 /** Hard dependencies: without them there is nothing to register or inject into. */
 export const inject = ['tools', 'systemPrompt']
@@ -2096,6 +2104,8 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
        * the question.
        */
       const pairVerdicts = new Map<string, string | null>()
+      /** candidate key → the stored memory it resembles, for the relationship question. */
+      const partners = new Map<string, MemoryRecord>()
 
       const fresh: Candidate[] = []
       for (const candidate of decided) {
@@ -2111,35 +2121,12 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         // three relationships it is. Without the model, behaviour is what it was: a
         // signature match is still treated as a duplicate.
         const near = exact ?? findConflictPartner(candidate.text, activePartners, NEAR_DUPLICATE_MIN)?.existing
-        let decision: string | null = null
-        let asked = false
+        // Collection only: the partner is found here because this half is deterministic and free, and
+        // the relationship is asked in the *same* request as everything else about the candidate. Asking
+        // it as a second round trip, beside a separate conflict question, was the redundancy the person
+        // pointed at.
+        if (near) partners.set(candidate.key, near)
         pairVerdicts.set(candidate.key, null)
-        if (near && config.pairDecision) {
-          const verdict = await judge.decidePair(candidate.text, near.text, { project: cwd, signal })
-          decision = verdict.decision
-          pairVerdicts.set(candidate.key, decision)
-          // `pair-decision` means "the model was asked". The offline judge answers nothing
-          // by construction, and recording a question nobody was asked would make the
-          // ledger unreadable: the collision line below already tells that story.
-          asked = verdict.by === 'jev'
-          if (asked) {
-            void store.ledger({
-              kind: 'pair-decision',
-              id: candidate.key,
-              with: near.id,
-              decision: verdict.decision ?? 'unknown',
-              by: verdict.by,
-              model: verdict.model,
-              confidence: verdict.confidence,
-              overlap: Number((findConflictPartner(candidate.text, [near], 0)?.score ?? 0).toFixed(3)),
-              quote: excerpt(candidate.quote, 120),
-            })
-          }
-        }
-        if (decision === 'same-duplicate') {
-          void store.ledger({ kind: 'skip', reason: 'pair-duplicate', id: candidate.key, with: near?.id ?? null, quote: excerpt(candidate.quote, 120) })
-          continue
-        }
         if (near) {
           // Two shapes, and which one this is decided by the identity, not by the model.
           //
@@ -2153,19 +2140,10 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           // A model that cannot answer changes nothing here: the person's latest words win,
           // and the collision is recorded rather than dropped in silence.
           if (near.id === candidate.key) {
+            // Same identity: the record is updated in place, whatever the model says about the
+            // relationship. The ledger line that used to record "the model could not answer" is written
+            // after the judgement comes back, where the answer actually is.
             updates.set(candidate.key, near.id)
-            if (decision === null) {
-              void store.ledger({
-                kind: 'signature-collision',
-                id: candidate.key,
-                from: excerpt(near.text, 160),
-                to: excerpt(candidate.text, 160),
-                reason: !config.pairDecision ? 'pair-decision-disabled' : 'judge-unavailable',
-              })
-            }
-          } else if (decision === 'same-update') {
-            // Different identity, same rule: the old record is superseded and linked.
-            replacements.set(candidate.key, near.id)
           }
         }
         // A tool failure is only a *pitfall* once it repeats. One sandbox denial is
@@ -2207,17 +2185,103 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       )
       const known = shown.map((record) => `[${record.type}] ${record.text}`)
 
-      const { rows, model, degraded } = await judge.judge(fresh, { known, signal, project: cwd })
+      const { rows, model, degraded } = await judge.judge(fresh, {
+        known,
+        // The partner each candidate resembles, if any: the relationship is asked about it in the same
+        // request. `null` for a candidate with no similar memory, which is when the model is asked what
+        // it *is* about instead.
+        partners: fresh.map((candidate) => partners.get(candidate.key)?.text ?? null),
+        signal,
+        project: cwd,
+      })
 
-      // The judge is asked "does this contradict anything you know" about a window of
-      // memories. When it answers no, check the same question deterministically and
-      // record what it finds — but do not interrupt the person for it: the point is to
-      // learn how often the window and the model miss a contradiction, and only then
-      // decide whether it deserves a question. Two sources of miss are covered, the
-      // window (a partner outside the twenty) and the model (a pair it did not see).
+      // Apply what came back with the request, and follow up only where there was nothing to quote.
+      const skippedPairs = new Set<string>()
       for (const candidate of fresh) {
         const judgement = rows.find((row) => row.key === candidate.key)
-        if (judgement?.conflict === 'yes') continue
+        if (!judgement) continue
+        const partner = partners.get(candidate.key)
+        pairVerdicts.set(candidate.key, judgement.relationship ?? null)
+        if (partner) {
+          // The relationship was asked in the same request, quoted against this sentence.
+          //
+          // `same-update` means the old record is superseded — but only when it is a *different* record.
+          // When the identity is the same, the in-place update is already recorded above and superseding
+          // it would mean the record superseding itself: exactly the bug the in-place path was built to
+          // avoid (a record that overwrote itself was unreachable).
+          //
+          // And nothing is replaced while a question is pending: the band fired precisely because the
+          // model's answer was not decisive, so applying its lean first meant answering "keep the old one"
+          // left neither memory — the old one already superseded and the new one dropped.
+          const torn = relationActionsDisagree(judgement.relationshipProbabilities, config.conflictReviewMinScore)
+          if (judgement.relationship === 'same-update' && partner.id !== candidate.key && !torn) {
+            replacements.set(candidate.key, partner.id)
+          }
+          if (judgement.relationship === 'same-duplicate' && !torn) skippedPairs.add(candidate.key)
+          // `typeof` rather than `!== null`: the offline judge's rows simply lack the field, and an
+          // `undefined` that reads as "the model answered" writes a decision line for a question nobody
+          // was asked.
+          if (typeof judgement.relationship === 'string') {
+            void store.ledger({
+              kind: 'pair-decision',
+              id: candidate.key,
+              with: partner.id,
+              decision: judgement.relationship,
+              probabilities: judgement.relationshipProbabilities ?? null,
+              by: judgement.by,
+              model,
+              overlap: Number((findConflictPartner(candidate.text, [partner], 0)?.score ?? 0).toFixed(3)),
+              quote: excerpt(candidate.quote, 120),
+            })
+          } else if (partner.id === candidate.key) {
+            // Same identity, no usable answer: the person's latest words still win (the in-place update
+            // is already recorded), and the collision is written down rather than dropped in silence.
+            void store.ledger({
+              kind: 'signature-collision',
+              id: candidate.key,
+              from: excerpt(partner.text, 160),
+              to: excerpt(candidate.text, 160),
+              reason: !config.pairDecision ? 'pair-decision-disabled' : 'judge-unavailable',
+            })
+          }
+        } else if (typeof judgement.relatedIndex === 'number' && judgement.relatedIndex >= 0) {
+          // Nothing similar by wording, but the model says this is about one of the known memories. The
+          // relationship depends on *which* one, so it is a second request — the rare path, and the only
+          // one left that costs a round trip.
+          const target = shown[judgement.relatedIndex]
+          if (target) {
+            const verdict = await judge.decidePair(candidate.text, target.text, { project: cwd, signal })
+            // Carried onto the row so the gate's band reads the same distribution whether the
+            // relationship was answered in the first request or this follow-up.
+            judgement.relationship = verdict.decision
+            judgement.relationshipProbabilities = verdict.probabilities
+            pairVerdicts.set(candidate.key, verdict.decision)
+            if (verdict.decision === 'same-update') replacements.set(candidate.key, target.id)
+            if (verdict.decision === 'same-duplicate') skippedPairs.add(candidate.key)
+            if (verdict.by === 'jev') {
+              void store.ledger({
+                kind: 'pair-decision',
+                id: candidate.key,
+                with: target.id,
+                decision: verdict.decision ?? 'unknown',
+                probabilities: verdict.probabilities ?? null,
+                by: verdict.by,
+                model: verdict.model,
+                via: 'related-follow-up',
+                quote: excerpt(candidate.quote, 120),
+              })
+            }
+          }
+        }
+      }
+
+      // The model named nothing related; when the deterministic check disagrees, record it without
+      // interrupting anyone. Kept as a diagnostic for the one thing the merged question can no longer
+      // see: a memory the model overlooked entirely.
+      for (const candidate of fresh) {
+        const judgement = rows.find((row) => row.key === candidate.key)
+        if (partners.has(candidate.key)) continue
+        if (typeof judgement?.relatedIndex === 'number' && judgement.relatedIndex >= 0) continue
         const suspected = findConflictPartner(candidate.text, activePartners)
         if (!suspected) continue
         void store.ledger({
@@ -2247,6 +2311,17 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const pendingConflicts: ConflictAsk[] = []
       for (const candidate of fresh) {
         const judgement = rows.find((row) => row.key === candidate.key)
+        if (skippedPairs.has(candidate.key)) {
+          // The relationship said this sentence adds nothing the stored one does not already say.
+          void store.ledger({
+            kind: 'skip',
+            reason: 'pair-duplicate',
+            id: candidate.key,
+            with: partners.get(candidate.key)?.id ?? null,
+            quote: excerpt(candidate.quote, 120),
+          })
+          continue
+        }
         // `deterministic` means the *local* type and score decide, not the model's.
         //
         // The first implementation only stripped `remember`, and `applyGate` then fell through to
@@ -2303,7 +2378,11 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         // A candidate the pair question already resolved as an update is not a
         // contradiction: asking the person to arbitrate it would be asking them to
         // re-decide what the model just decided, with less context.
-        if (gate.review && config.askOnConflict && replaced === undefined && updated === undefined && pendingConflicts.length === 0) {
+        // The band's whole purpose is to ask precisely when the model's own answer was not decisive, so
+        // a relationship that *leaned* one way must not suppress the question — that was the old rule,
+        // and it made every torn answer silent. `pendingConflicts.length === 0` still limits a turn to one
+        // question.
+        if (gate.review && config.askOnConflict && pendingConflicts.length === 0) {
           const partners = store.all().filter((record) => record.status === 'active' && inScope(record, cwd))
           const paired = await pairConflict(candidate.text, partners, cwd, signal)
           if (paired) {
@@ -2359,7 +2438,9 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           text: candidate.text,
           cwd,
           importance: gated?.importance ?? judgement.importance,
-          status: gate.review && replaced === undefined && updated === undefined ? 'needs-review' : 'active',
+          // A pending question means the record is withheld from recall until it is answered, whether or
+          // not a replacement was proposed: an unreviewed guess must not enter the prompt.
+          status: gate.review ? 'needs-review' : 'active',
           supersedes: replaced ?? null,
           source: { sessionId: header?.id ?? agent?.id ?? null, seq: candidate.seq, quote: candidate.quote, at: now },
           createdAt: now,
@@ -2382,7 +2463,9 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
           by: judgement.by,
           model,
           conflict: judgement.conflict,
-          status: gate.review && replaced === undefined && updated === undefined ? 'needs-review' : 'active',
+          // A pending question means the record is withheld from recall until it is answered, whether or
+          // not a replacement was proposed: an unreviewed guess must not enter the prompt.
+          status: gate.review ? 'needs-review' : 'active',
           supersedes: replaced ?? null,
           cwd,
           source: { sessionId: header?.id ?? null, seq: candidate.seq, quote: excerpt(candidate.quote, 160) },

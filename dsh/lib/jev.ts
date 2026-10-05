@@ -149,8 +149,10 @@ export interface JevDecideRequest {
   candidates: JevCandidate[]
   /** enabled types (the Choice labels). */
   types: string[]
-  /** known memory texts, for the conflict question. */
+  /** known memory texts, for the "which one is this about" question. */
   known?: string[]
+  /** per candidate: the stored sentence it resembles, or null; decides which question is asked. */
+  partners?: Array<string | null>
   /** the workspace the memories belong to; passed to the model as framing. */
   project?: string | null
   /** messages around the candidates, oldest first; omitted from the request when empty. */
@@ -168,6 +170,25 @@ export interface JevRow {
   importance: number | null
   /** Noul answer to "is this worth remembering at all"; the write gate reads this. */
   remember: number | null
+  /**
+   * The relationship between this candidate and the one stored memory it resembles, when there was one.
+   *
+   * Asked in the *same* request as everything else, quoting both sentences. The separate conflict
+   * question ("does this contradict anything I know") used to run beside it, which was a redundant
+   * judgement: its own wording already said "or has been superseded — the same thing said differently",
+   * and in production it answered `no` thirteen times while the relationship question did the work.
+   */
+  relationship: PairDecision | null
+  /**
+   * The full distribution behind `relationship`. This is what the human-in-the-loop band reads: a
+   * relationship the model is torn about is the one worth someone's attention.
+   */
+  relationshipProbabilities: Record<string, number> | null
+  /**
+   * Which known memory the candidate is about, when there was no lexically similar one to quote.
+   * `-1` means the model named none, `null` means the question was not asked.
+   */
+  relatedIndex: number | null
   conflict: string
   /**
    * The raw Noul probability behind `conflict`, kept rather than discarded.
@@ -228,6 +249,8 @@ export interface JevPairResult {
   /** null when the answer was missing or unusable — never guessed. */
   decision: PairDecision | null
   confidence: number | null
+  /** the full label distribution, when the model reported one; the unsure band reads this. */
+  probabilities: Record<string, number> | null
   model: string | null
 }
 
@@ -412,6 +435,7 @@ export function createJevClient({
         candidates,
         types: request.types?.length ? request.types : ['constraint', 'pitfall', 'decision'],
         known: (request.known ?? []).slice(0, settings.maxKnown),
+        partners: request.partners ?? [],
         importanceLevels: settings.importanceLevels,
         rememberQuestion: settings.rememberQuestion,
         project: request.project ?? null,
@@ -499,8 +523,17 @@ export function createJevClient({
       const decision: PairDecision | null =
         label === 'same-update' || label === 'same-duplicate' || label === 'different' ? label : null
       const confidence = typeof answer?.confidence === 'number' ? clamp01(answer.confidence) : null
+      const raw = answer?.probabilities == null ? undefined : asRecord(answer.probabilities)
+      const probabilities =
+        raw == null
+          ? null
+          : Object.fromEntries(
+              Object.entries(raw)
+                .filter(([, value]) => typeof value === 'number')
+                .map(([key, value]) => [key, clamp01(value as number)]),
+            )
       const model = typeof json?.model === 'string' ? json.model : null
-      return { decision, confidence, model }
+      return { decision, confidence, probabilities, model }
     },
 
     /**
@@ -585,6 +618,7 @@ export function buildRequestBody({
   candidates,
   types,
   known,
+  partners = [],
   importanceLevels,
   rememberQuestion,
   project,
@@ -597,6 +631,8 @@ export function buildRequestBody({
   types: string[]
   /** known memory texts. */
   known: string[]
+  /** per candidate: the stored sentence it resembles, or null when none was found. */
+  partners?: Array<string | null>
   /** ordered score legend. */
   importanceLevels: string[]
   /** the gate question, verbatim. */
@@ -618,6 +654,10 @@ export function buildRequestBody({
 }): JevRequestBody {
   const questions: Record<string, JevQuestion> = {}
   const choiceCriteria: Record<string, string> = {}
+  // The stored sentence each candidate resembles, if the deterministic similarity search found one.
+  // `null` means there is nothing to compare against by wording, and only then is the "which known
+  // memory is this about" question worth asking — the cheap, deterministic half runs first.
+  const partnersByIndex = partners
   for (const type of types) choiceCriteria[type] = TYPE_CRITERIA[type] ?? type
   choiceCriteria['none-of-the-above'] = '以上都不合适，或这条信息本身不值得记住'
 
@@ -652,14 +692,44 @@ export function buildRequestBody({
       },
       criteria: importanceLevels,
     }
-    questions[conflictId(index)] = {
-      type: 'noul',
-      instructions: {
-        context: MEMORY_CONTEXT,
-        candidate: candidate.text,
-        question: '上一条 `candidate` 是否与 `known_memories` 中的某一条冲突，或已被它取代（同一件事给出不同说法）？没有相关条目时回答 false。',
-      },
-      criteria: { true: '冲突或被取代', false: '不冲突' },
+    const partner = partnersByIndex[index] ?? null
+    if (partner !== null) {
+      // One question, and it answers what to *do* rather than only whether something is wrong: replace
+      // the old memory, drop the new one, or keep both. `probabilities` comes back with it and drives the
+      // band, so "the model is torn" is visible rather than hidden behind the top label.
+      questions[pairId(index)] = {
+        type: 'choice',
+        instructions: {
+          incoming: candidate.text,
+          stored: partner,
+          question:
+            '`incoming` 是刚说的一句话，`stored` 是已经记下来的一条。它们措辞很像，但**措辞像不等于同一件事**。判断当前内容的关系：' +
+            '若 `incoming` 是同一条规矩更准或更新的说法（改了数字、改了限制、把话说清楚了），选 same-update；' +
+            '若只是同一句话换个说法、没有任何新信息，选 same-duplicate；' +
+            '若讲的是不同的规矩或不同的方面、两条都该留着，选 different。' +
+            '只看内容，不要因为用词相近就选 same-*。',
+        },
+        criteria: {
+          'same-update': '同一条规矩的新说法，应该用它替换旧的',
+          'same-duplicate': '完全同义，没有任何新信息',
+          different: '不同的规矩或不同的方面，两条都保留',
+        },
+      }
+    } else if (known.length > 0) {
+      const related: Record<string, string> = {}
+      known.forEach((_text, at) => {
+        related[`m${at}`] = `就是这一条：${known[at]}`
+      })
+      related.none = '和上面任何一条都不是同一件事'
+      questions[relatedId(index)] = {
+        type: 'choice',
+        instructions: {
+          context: MEMORY_CONTEXT,
+          candidate: candidate.text,
+          question: '`candidate` 和下面哪一条讲的是**同一件事**（同一件规矩、同一个决定、同一个问题）？都不相关就选 none。',
+        },
+        criteria: related,
+      }
     }
   })
 
@@ -703,13 +773,15 @@ export function parseDecisions(
     const rememberAnswer = answers[rememberId(index)]
     const choiceAnswer = answers[typeId(index)]
     const scoreAnswer = answers[importanceId(index)]
-    const conflictAnswer = answers[conflictId(index)]
+    const pairAnswer = answers[pairId(index)]
+    const relatedAnswer = answers[relatedId(index)]
     if (!rememberAnswer && !choiceAnswer && !scoreAnswer) continue
 
     const remember = asRecord(rememberAnswer)
     const choice = asRecord(choiceAnswer)
     const score = asRecord(scoreAnswer)
-    const conflict = asRecord(conflictAnswer)
+    const pair = asRecord(pairAnswer)
+    const related = asRecord(relatedAnswer)
 
     const choiceValue = choice?.choice
     const label = typeof choiceValue === 'string' ? choiceValue : null
@@ -717,7 +789,24 @@ export function parseDecisions(
     const rememberNoul = remember?.noul
     const importance =
       scoreValue === null ? (typeof rememberNoul === 'number' ? clamp01(rememberNoul) : null) : scoreToUnit(scoreValue, options.importanceLevels)
-    const conflictNoul = conflict?.noul
+    const pairLabel = typeof pair?.choice === 'string' ? pair.choice : null
+    const relationship: PairDecision | null =
+      pairLabel === 'same-update' || pairLabel === 'same-duplicate' || pairLabel === 'different' ? pairLabel : null
+    const distribution = pair?.probabilities == null ? undefined : asRecord(pair.probabilities)
+    const relationshipProbabilities =
+      distribution == null
+        ? null
+        : Object.fromEntries(
+            Object.entries(distribution)
+              .filter(([, value]) => typeof value === 'number')
+              .map(([key, value]) => [key, clamp01(value as number)]),
+          )
+    // `m3` names the fourth known memory; `none` names none of them. A malformed or absent answer stays
+    // `null` ("not asked") rather than becoming `-1` ("asked, none"), because the two mean different
+    // things to the caller deciding whether to follow up.
+    const relatedLabel = typeof related?.choice === 'string' ? related.choice : null
+    const relatedIndex =
+      relatedLabel === null ? null : relatedLabel === 'none' ? -1 : /^m\d+$/u.test(relatedLabel) ? Number(relatedLabel.slice(1)) : null
     const choiceConfidence = choice?.confidence
     const scoreConfidence = score?.confidence
 
@@ -731,8 +820,14 @@ export function parseDecisions(
       // the boolean judgement, and a genuinely good constraint ("必须用 pnpm") scored
       // 0.28 on the generic importance rubric while a task instruction scored 0.73.
       remember: typeof rememberNoul === 'number' ? clamp01(rememberNoul) : null,
-      conflict: (typeof conflictNoul === 'number' ? conflictNoul : 0) >= options.conflictThreshold ? 'yes' : 'no',
-      conflictScore: typeof conflictNoul === 'number' ? clamp01(conflictNoul) : null,
+      relationship,
+      relationshipProbabilities,
+      relatedIndex,
+      // Kept as the ledger's own word for "this supersedes an earlier statement", derived from the
+      // relationship rather than asked separately. The rest of the system reads it only to *describe*
+      // what happened; nothing decides on it.
+      conflict: relationship === 'same-update' ? 'yes' : 'unknown',
+      conflictScore: relationshipProbabilities?.[relationship ?? ''] ?? null,
       confidence:
         typeof choiceConfidence === 'number' ? clamp01(choiceConfidence) : typeof scoreConfidence === 'number' ? clamp01(scoreConfidence) : null,
       note: null,
@@ -861,4 +956,5 @@ export const typeId = (index: number): string => `type:${index}`
 /** @param index - candidate index. @returns question key. */
 export const importanceId = (index: number): string => `importance:${index}`
 /** @param index - candidate index. @returns question key. */
-export const conflictId = (index: number): string => `conflict:${index}`
+export const pairId = (index: number): string => `pair:${index}`
+export const relatedId = (index: number): string => `related:${index}`

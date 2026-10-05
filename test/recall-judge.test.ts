@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { applyGate, applyModelGate, createJudge, heuristicRow } from '../dsh/lib/judge.ts'
+import { applyGate, applyModelGate, createJudge, heuristicRow, relationActionsDisagree } from '../dsh/lib/judge.ts'
 import { fixedCost, inScope, NAME_LIKE, renderLine, renderRecall, searchMemories, selectMemories } from '../dsh/lib/recall.ts'
 import { signatureOf } from '../dsh/lib/signals.ts'
 import { estimateTokens } from '../dsh/lib/text.ts'
@@ -211,7 +211,7 @@ test('judge with mode off writes nothing and never calls the model', async () =>
   const judge = createJudge({
     config: { judge: 'off', types: ['constraint'] },
     jev: { isAvailable: async () => true, choosePartner: async () => ({ index: null, confidence: null, model: null }),
-    decidePair: async () => ({ decision: null, confidence: null, model: null }), decide: async () => { called += 1; return { rows: [], model: null } } },
+    decidePair: async () => ({ decision: null, confidence: null, probabilities: null, model: null }), decide: async () => { called += 1; return { rows: [], model: null } } },
   })
   assert.equal(judge.kind, 'off')
   const result = await judge.judge([{ key: 'k', hintedType: 'constraint', signalScore: 1, signals: [] }])
@@ -229,7 +229,7 @@ test('an explicit heuristic mode never consults the model, even with a key avail
     config: { judge: 'heuristic', types: ['constraint'] },
     jev: {
       isAvailable: async () => true, choosePartner: async () => ({ index: null, confidence: null, model: null }),
-    decidePair: async () => ({ decision: null, confidence: null, model: null }),
+    decidePair: async () => ({ decision: null, confidence: null, probabilities: null, model: null }),
       decide: async () => {
         called += 1
         return { rows: [], model: null }
@@ -247,7 +247,7 @@ test('judge falls back to the heuristic when the model fails', async () => {
   const judge = createJudge({
     config: { judge: 'jev', types: ['constraint'], judgeTimeoutMs: 10 },
     jev: { isAvailable: async () => true, choosePartner: async () => ({ index: null, confidence: null, model: null }),
-    decidePair: async () => ({ decision: null, confidence: null, model: null }), decide: async () => { throw new Error('timeout') } },
+    decidePair: async () => ({ decision: null, confidence: null, probabilities: null, model: null }), decide: async () => { throw new Error('timeout') } },
     log: (level, message) => warnings.push(`${level}:${message}`),
   })
   const { rows, degraded } = await judge.judge([{ key: 'k', hintedType: 'constraint', signalScore: 0.7, signals: [] }])
@@ -262,10 +262,10 @@ test('judge maps model rows onto candidates and rejects types outside the config
     config: { judge: 'jev', types: ['constraint', 'pitfall'] },
     jev: {
       isAvailable: async () => true, choosePartner: async () => ({ index: null, confidence: null, model: null }),
-    decidePair: async () => ({ decision: null, confidence: null, model: null }),
+    decidePair: async () => ({ decision: null, confidence: null, probabilities: null, model: null }),
       decide: async () => ({
         model: 'jev-1.13.0',
-        rows: [{ key: 'k', type: 'fact', importance: 0.95, remember: 0.9, conflict: 'yes', conflictScore: null, confidence: 0.8 }],
+        rows: [{ key: 'k', type: 'fact', importance: 0.95, remember: 0.9, conflict: 'yes', conflictScore: null, relationship: null, relationshipProbabilities: null, relatedIndex: null, confidence: 0.8 }],
       }),
     },
   })
@@ -424,34 +424,42 @@ test('an id that is only the sentence again is not printed, and one that informs
   )
 })
 
-test('an unsure conflict probability asks the person instead of being decided locally', () => {
-  // The verdict alone cannot tell "nothing is near the line" from "the threshold is cutting real
-  // conflicts off": 0.02 and 0.68 both read as `no`. The band is [0.3, 0.7) — measured on 16 real
-  // near-miss candidates, two landed in it, while a real reversal scored 0.97 and an unrelated sentence
-  // 0.10. Inside it the record is written as `needs-review` (stored, withheld from recall) and the
-  // person is asked: that is what having a person available is for.
-  const config = { types: ['constraint'], minImportance: 0.6, minRemember: 0.12, reviewOnConflict: true, conflictReviewMinScore: 0.3 }
-  const row = (conflict: string, conflictScore: number | null): Parameters<typeof applyGate>[0] => ({
+test('the person is asked when the model is torn between outcomes, not between synonyms', () => {
+  // The relationship comes back as a distribution over three labels, and those labels fall into two
+  // outcomes: "do not add anything" (`same-update` replaces the old memory, `same-duplicate` drops the
+  // new one) and "keep both" (`different`). A model torn *within* one side is not worth interrupting
+  // anyone for; torn *across* the sides is exactly what a person should settle.
+  const config = {
+    types: ['constraint'],
+    minImportance: 0.6,
+    minRemember: 0.12,
+    reviewOnConflict: true,
+    conflictReviewMinScore: 0.3,
+  }
+  const row = (relationshipProbabilities: Record<string, number> | null): Parameters<typeof applyGate>[0] => ({
     type: 'constraint',
     importance: 0.8,
     remember: null,
-    conflict,
-    conflictScore,
+    conflict: 'unknown',
+    relationshipProbabilities,
   })
 
-  const unsure = applyGate(row('no', 0.5), config)
-  assert.deepEqual(unsure, { write: true, review: true, reason: 'conflict-uncertain' })
-  assert.equal(applyGate(row('no', 0.68), config).review, true, 'the top of the band still asks')
-  assert.equal(applyGate(row('no', 0.2), config).review, undefined, 'clearly unrelated writes without asking')
-  assert.equal(applyGate(row('yes', 0.95), config).review, undefined, 'a confident conflict is Jev\'s to resolve, not the person\'s')
-  // A judge that reported no probability cannot land in the band: `null` is not `0`, and treating a
-  // missing number as "unsure" would ask about everything the heuristic path ever wrote.
-  assert.equal(applyGate(row('unknown', null), config).review, undefined)
-  // `0` disables it, which is the escape hatch for a deployment that must not ask.
-  assert.equal(applyGate(row('no', 0.5), { ...config, conflictReviewMinScore: 0 }).review, undefined)
+  const tornAcross = { 'same-update': 0.5, 'same-duplicate': 0.1, different: 0.4 }
+  assert.deepEqual(applyGate(row(tornAcross), config), { write: true, review: true, reason: 'conflict-uncertain' })
 
-  // And the same band applies when the model wrote the memory's text: the question is about who should
-  // decide, not about who typed the sentence.
-  assert.deepEqual(applyModelGate(row('no', 0.5), config), { write: true, review: true, reason: 'conflict-uncertain' })
-  assert.deepEqual(applyModelGate(row('no', 0.1), config), { write: true, reason: 'model-write' })
+  // Torn between two ways of *not* adding a memory: whichever wins, nothing new is stored, so there is
+  // nothing for the person to decide.
+  const tornWithin = { 'same-update': 0.5, 'same-duplicate': 0.45, different: 0.05 }
+  assert.equal(applyGate(row(tornWithin), config).review, undefined)
+  assert.equal(relationActionsDisagree(tornWithin, 0.3), false, 'the refinement is the point of the band')
+
+  assert.equal(applyGate(row({ different: 0.95 }), config).review, undefined, 'a confident answer is not a question')
+  // The offline judge has no distribution at all, and `null` is not "unsure": treating it as such would
+  // ask about everything the heuristic path ever wrote.
+  assert.equal(applyGate(row(null), config).review, undefined)
+  assert.equal(applyGate(row(tornAcross), { ...config, conflictReviewMinScore: 0 }).review, undefined, '0 turns it off')
+
+  // The band applies when the model wrote the memory's text too — it is a question about who decides.
+  assert.deepEqual(applyModelGate(row(tornAcross), config), { write: true, review: true, reason: 'conflict-uncertain' })
+  assert.deepEqual(applyModelGate(row({ different: 0.95 }), config), { write: true, reason: 'model-write' })
 })
