@@ -788,7 +788,10 @@ test('a suspected conflict is put to the human and the answer decides', async ()
     const ledger = await readFile(join(root, 'ledger.jsonl'), 'utf8')
     assert.match(ledger, /"kind":"conflict-ask"/)
     assert.match(ledger, /"kind":"conflict-resolved".*"choice":"replace"/)
-    assert.match(ledger, /"kind":"conflict-ask".*"via":"jev"/)
+    // `known` rather than `jev`: the relationship question already quoted the memory it was about, so the
+    // partner comes from there. Naming it again was a second call that could fail — and when it failed, a
+    // question the band itself had asked for went unasked.
+    assert.match(ledger, /"kind":"conflict-ask".*"via":"known"/)
   } finally {
     globalThis.fetch = realFetch
   }
@@ -918,12 +921,21 @@ test('an unanswered conflict is re-asked at the start of the next turn', async (
   }
 })
 
-test('a conflict nobody can be paired with is recorded instead of vanishing', async () => {
+test('the question names the memory the relationship was about, without asking again', async () => {
+  // This test used to be "a conflict nobody can be paired with is recorded instead of vanishing": the
+  // band fired, a *second* question ("which of these is it about") answered "none of them", and the
+  // question the band had asked for was dropped. Live traffic showed what that costs — a record parked
+  // for review, the old memory already superseded, and nobody ever asked.
+  //
+  // The relationship question already quoted the memory it was about, so that memory *is* the partner.
+  // Nothing needs naming a second time, and a naming question that fails can no longer swallow a
+  // question the model itself asked for.
   const realFetch = globalThis.fetch
-  // The judge raises a conflict, then explicitly names no partner.
+  let namedAgain = false
   globalThis.fetch = (async (_url: string, init?: { body?: unknown }) => {
     const body = JSON.parse(String(init?.body ?? '{}'))
     if (body?.questions?.partner) {
+      namedAgain = true
       return new Response(
         JSON.stringify({ model: 'jev-1.13.0', answers: { partner: { type: 'choice', choice: 'none-of-the-above', confidence: 0.9 } } }),
         { status: 200, headers: { 'content-type': 'application/json' } },
@@ -945,15 +957,20 @@ test('a conflict nobody can be paired with is recorded instead of vanishing', as
       turn: 1,
       signal: undefined,
     })
-    assert.equal(captured.asked.length, 0, 'naming no partner must not produce a question')
+    assert.equal(captured.asked.length, 1, 'the band asked for a question, and the question is put')
+    assert.match(String(captured.asked[0]?.questions[0]?.detail ?? ''), /可以随便改 data\/ 目录下的文件/)
+    assert.equal(namedAgain, false, 'and the model is not asked to name what we already know')
     await settle()
-    assert.match(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /"reason":"conflict-unpaired"/)
+    assert.doesNotMatch(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /"reason":"conflict-unpaired"/)
   } finally {
     globalThis.fetch = realFetch
   }
 })
 
-test('pairing falls back to lexical overlap when the model cannot answer', async () => {
+test('a partner-naming failure cannot swallow the question the band asked for', async () => {
+  // The naming fallback (`choosePartner` → lexical overlap) now lives on the *retry* path, which re-derives
+  // the partner in a later turn when the in-memory one is gone. Here the same turn already knows it, so a
+  // failing naming call is simply never made.
   const realFetch = globalThis.fetch
   let partnerCalls = 0
   globalThis.fetch = (async (_url: string, init?: { body?: unknown }) => {
@@ -978,8 +995,8 @@ test('pairing falls back to lexical overlap when the model cannot answer', async
       turn: 1,
       signal: undefined,
     })
-    assert.equal(partnerCalls >= 1, true, 'the model is asked first')
-    assert.equal(captured.asked.length, 1, 'a failed pairing still lets the human decide')
+    assert.equal(partnerCalls, 0, 'the partner was already known, so nothing was asked a second time')
+    assert.equal(captured.asked.length, 1, 'and the human still decides')
     await settle()
     // Both survive, and the ledger says the pairing came from overlap, not the model.
     const found = await toolFor<SearchArgs, MemorySearchResult>(captured, 'memory_search').execute(
@@ -987,7 +1004,7 @@ test('pairing falls back to lexical overlap when the model cannot answer', async
       { agent: { session } },
     )
     assert.equal(promoted(found).length, 2)
-    assert.match(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /"via":"overlap"/)
+    assert.match(await readFile(join(root, 'ledger.jsonl'), 'utf8'), /"via":"known"/)
   } finally {
     globalThis.fetch = realFetch
   }

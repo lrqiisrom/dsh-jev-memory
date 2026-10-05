@@ -635,7 +635,7 @@ interface ConflictAsk {
   incomingId: string
   pair: ConflictPair
   /** how the partner was chosen: `jev` (the model picked) or `overlap` (lexical). */
-  via: 'jev' | 'overlap'
+  via: 'jev' | 'overlap' | 'known' | 'known'
   /** which judge raised the conflict, for the ledger. */
   by: string
 }
@@ -1805,7 +1805,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     partners: readonly MemoryRecord[],
     cwd: string | null,
     signal: AbortSignal | undefined,
-  ): Promise<{ pair: ConflictPair; via: 'jev' | 'overlap' } | null> {
+  ): Promise<{ pair: ConflictPair; via: 'jev' | 'overlap' | 'known' } | null> {
     if (partners.length === 0) return null
 
     const ranked = await rankPartners(incoming, partners, config.knownForConflict)
@@ -2106,6 +2106,14 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       const pairVerdicts = new Map<string, string | null>()
       /** candidate key → the stored memory it resembles, for the relationship question. */
       const partners = new Map<string, MemoryRecord>()
+      /**
+       * The stored memory we already know this candidate is about, from either path.
+       *
+       * Used to ask the person directly. The question needs to name the other side, and re-deriving it
+       * with `choosePartner` failed on live traffic — the band fired, the pairing could not be named
+       * again, and a question that should have been asked was dropped as `conflict-unpaired`.
+       */
+      const knownPartnerOf = new Map<string, MemoryRecord>()
 
       const fresh: Candidate[] = []
       for (const candidate of decided) {
@@ -2125,7 +2133,10 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         // the relationship is asked in the *same* request as everything else about the candidate. Asking
         // it as a second round trip, beside a separate conflict question, was the redundancy the person
         // pointed at.
-        if (near) partners.set(candidate.key, near)
+        if (near) {
+          partners.set(candidate.key, near)
+          knownPartnerOf.set(candidate.key, near)
+        }
         pairVerdicts.set(candidate.key, null)
         if (near) {
           // Two shapes, and which one this is decided by the identity, not by the model.
@@ -2256,8 +2267,16 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
             judgement.relationship = verdict.decision
             judgement.relationshipProbabilities = verdict.probabilities
             pairVerdicts.set(candidate.key, verdict.decision)
-            if (verdict.decision === 'same-update') replacements.set(candidate.key, target.id)
-            if (verdict.decision === 'same-duplicate') skippedPairs.add(candidate.key)
+            knownPartnerOf.set(candidate.key, target)
+            // The same rule as the first path, and it was missing here: while a question is pending the
+            // model's lean must not be applied. Live traffic showed what that costs — the old memory was
+            // superseded with nobody asked, because this branch set a replacement and the question was
+            // then dropped for want of a nameable partner.
+            const tornHere = relationActionsDisagree(verdict.probabilities, config.conflictReviewMinScore)
+            if (verdict.decision === 'same-update' && target.id !== candidate.key && !tornHere) {
+              replacements.set(candidate.key, target.id)
+            }
+            if (verdict.decision === 'same-duplicate' && !tornHere) skippedPairs.add(candidate.key)
             if (verdict.by === 'jev') {
               void store.ledger({
                 kind: 'pair-decision',
@@ -2383,8 +2402,13 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         // and it made every torn answer silent. `pendingConflicts.length === 0` still limits a turn to one
         // question.
         if (gate.review && config.askOnConflict && pendingConflicts.length === 0) {
-          const partners = store.all().filter((record) => record.status === 'active' && inScope(record, cwd))
-          const paired = await pairConflict(candidate.text, partners, cwd, signal)
+          // The partner is usually already known — either the similar memory the relationship was quoted
+          // against, or the one the model named. Re-deriving it costs a model call and can fail, which is
+          // how a question the band asked for went unasked.
+          const known = knownPartnerOf.get(candidate.key)
+          const paired = known
+            ? { pair: findConflictPartner(candidate.text, [known], 0) ?? { incoming: candidate.text, existing: known, score: 0, shared: [] }, via: 'known' as const }
+            : await pairConflict(candidate.text, store.all().filter((record) => record.status === 'active' && inScope(record, cwd)), cwd, signal)
           if (paired) {
             pendingConflicts.push({ incomingId: candidate.key, pair: paired.pair, via: paired.via, by: judgement.by })
           } else {
