@@ -68,7 +68,22 @@ if (process.env.DSH_LIVE_ROUTE !== 'yes') {
   process.exit(0)
 }
 
-const limit = Number(process.env.WRITE_ARM_LIMIT ?? '6') || 6
+const limit = Number(process.env.WRITE_ARM_LIMIT ?? '20') || 20
+/**
+ * Which population to draw windows from.
+ *
+ * `traffic` (the default) is every window the plugin would actually have built: each user turn in each
+ * session, made into the same 5-round window the hook makes. `labelled` keeps the original rule — only
+ * windows that contain a labelled row — and it is kept because it is what the earlier runs used.
+ *
+ * The distinction is not cosmetic. `labelled` samples the *labelled corpus*, which was harvested with
+ * stratified quotas and is 13% positive and mostly study Q&A; the plugin's real traffic is mostly
+ * coding. The first runs reported "5 of 6 windows produced nothing", which was a property of the sample
+ * rather than of the path, and the claim had to be withdrawn.
+ */
+const sampling = process.env.WRITE_ARM_SAMPLE?.trim() === 'labelled' ? 'labelled' : 'traffic'
+/** Fixed, so the same population gives the same sample and a larger limit extends it rather than replacing it. */
+const seed = Number(process.env.WRITE_ARM_SEED ?? '20261006') || 20261006
 const endpoint = process.env.LIVE_ENDPOINT?.trim() || 'https://api.deepseek.com/chat/completions'
 /** The route the plugin is handed on this machine, per the ledger's `write-path` lines. */
 const model = process.env.LIVE_MODEL?.trim() || 'deepseek-flash'
@@ -158,44 +173,70 @@ function overlapLength(left: string, right: string): number {
   return best
 }
 
-/** One entry per distinct window, so the same request is never paid for twice. */
-const windowIdOf = (entry: { session: Session; seq: number }): string =>
-  `${entry.session.id}:${shippedWindow(entry.session, entry.seq, ROUNDS, ANSWER_CHARS)[0]?.seq ?? entry.seq}`
-
-const allWindows: typeof located = []
-const seenWindows = new Set<string>()
-for (const entry of located) {
-  const windowId = windowIdOf(entry)
-  if (seenWindows.has(windowId)) continue
-  seenWindows.add(windowId)
-  allWindows.push(entry)
-}
-
-// Round-robin across sessions rather than taking the first N in reading order. The first version did
-// the latter and the whole sample came out of one session's last fifty messages: a "first look" that
-// only ever looks at one conversation is a first look at one conversation.
-const bySession = new Map<string, typeof located>()
-for (const entry of allWindows) {
-  const bucket = bySession.get(entry.session.id) ?? []
-  bucket.push(entry)
-  bySession.set(entry.session.id, bucket)
-}
-const sample: typeof located = []
-for (let round = 0; sample.length < limit; round += 1) {
-  let added = false
-  for (const bucket of bySession.values()) {
-    const entry = bucket[round]
-    if (!entry) continue
-    sample.push(entry)
-    added = true
-    if (sample.length >= limit) break
+/** A stable 32-bit rank for a string (FNV-1a), so a window's fate depends only on itself. */
+function hashRank(value: string): number {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
   }
-  if (!added) break
+  return hash >>> 0
 }
+
+/**
+ * The unit is one **turn**: a window ending at a message the person wrote, which is what the write hook
+ * reacts to. The two modes differ only in which turns they draw from.
+ */
+interface Turn {
+  session: Session
+  seq: number
+}
+
+/** Every turn that would have produced a call: a user message with a non-empty window behind it. */
+const allTurns: Turn[] = []
+for (const session of sessions) {
+  for (const message of session.messages) {
+    if (message.role !== 'user') continue
+    if (shippedWindow(session, message.seq, ROUNDS, ANSWER_CHARS).length === 0) continue
+    allTurns.push({ session, seq: message.seq })
+  }
+}
+
+/** How many labelled rows sit inside a window, which is what `labelled` mode selects on. */
+const rowsIn = (turn: Turn): Array<{ text: string; label: string }> =>
+  shippedWindow(turn.session, turn.seq, ROUNDS, ANSWER_CHARS).flatMap(
+    (message) => rowsAt.get(`${turn.session.id}:${message.seq}`) ?? [],
+  )
+
+const population = sampling === 'labelled' ? allTurns.filter((turn) => rowsIn(turn).length > 0) : allTurns
+const sample = [...population]
+  .map((turn) => ({ turn, rank: hashRank(`${seed}:${turn.session.id}:${turn.seq}`) }))
+  .sort((left, right) =>
+    left.rank === right.rank
+      ? `${left.turn.session.id}:${left.turn.seq}` < `${right.turn.session.id}:${right.turn.seq}`
+        ? -1
+        : 1
+      : left.rank - right.rank,
+  )
+  .slice(0, limit)
+  .map((entry) => entry.turn)
+
+const sizes = population.map((turn) =>
+  shippedWindow(turn.session, turn.seq, ROUNDS, ANSWER_CHARS).reduce((sum, message) => sum + message.text.length, 0),
+)
+const sortedSizes = [...sizes].sort((left, right) => left - right)
+const median = sortedSizes[Math.floor(sortedSizes.length / 2)] ?? 0
+const sampleLabels = sample.flatMap(rowsIn)
+const samplePositives = sampleLabels.filter((row) => row.label === '1').length
 
 console.log(
-  `标注行 ${byKey.size} 条，定位到 ${located.length} 条，去重成 ${allWindows.length} 个窗口（分布在 ${bySession.size} 个会话），` +
-    `跨会话轮流取 ${sample.length} 个（含该记行 ${sample.filter((entry) => entry.label === '1').length} 条）`,
+  `口径 ${sampling}｜标注行 ${byKey.size} 条定位到 ${located.length} 条｜` +
+    `窗口总体 ${population.length} 个（${new Set(population.map((turn) => turn.session.id)).size} 个会话，` +
+    `共 ${allTurns.length} 个用户回合）｜字数 最少 ${sortedSizes[0] ?? 0}／中位 ${median}／最多 ${sortedSizes[sortedSizes.length - 1] ?? 0}`,
+)
+console.log(
+  `按固定种子 ${seed} 取 ${sample.length} 个窗口（跨 ${new Set(sample.map((turn) => turn.session.id)).size} 个会话）；` +
+    `其中带标注的 ${sample.filter((turn) => rowsIn(turn).length > 0).length} 个，标注行 ${sampleLabels.length} 条（该记 ${samplePositives} 条）`,
 )
 
 // Everything above this line is free and offline, so it can be checked before paying for calls. The
@@ -207,8 +248,22 @@ if (process.env.WRITE_ARM_DRY === 'yes') {
     const chars = window.reduce((sum, message) => sum + message.text.length, 0)
     const rows = window.flatMap((message) => rowsAt.get(`${entry.session.id}:${message.seq}`) ?? [])
     console.log(
-      `  窗口 会话 ${entry.session.id.slice(-12)}… 结束于 seq ${entry.seq}｜${window.length} 条消息 ${chars} 字｜` +
+      `  窗口 会话 ${entry.session.id.slice(-12)}… 结束于 seq ${entry.seq}｜${window.length} 条：` +
+        `${window.map((message) => (message.role === 'user' ? 'U' : 'A')).join('')}｜${chars} 字｜` +
         `该记行 ${rows.filter((row) => row.label === '1').length}、不该记行 ${rows.filter((row) => row.label === '0').length}`,
+    )
+  }
+  // The prompt head, because the order of the messages is directly visible here and nowhere else:
+  // the window builder walks backwards and reverses at the end, and whether that reversal keeps each
+  // question in front of its own answer is not something to reason about when it can be printed.
+  if (process.env.WRITE_ARM_SHOW_PROMPT === 'yes' && sample[0]) {
+    const window = shippedWindow(sample[0].session, sample[0].seq, ROUNDS, ANSWER_CHARS)
+    console.log('\n--- 第一个窗口的实际 prompt（前 22 行）---')
+    console.log(
+      buildModelWritePrompt(window.map((message) => ({ seq: message.seq, role: message.role, text: message.text })))
+        .split('\n')
+        .slice(0, 22)
+        .join('\n'),
     )
   }
   console.log('\n试跑结束（WRITE_ARM_DRY=yes，没有调用模型）。')
