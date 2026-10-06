@@ -15,10 +15,13 @@ import {
   buildModelWritePrompt,
   createModelWriter,
   explainModelWrite,
+  readCompleteObjects,
+  summaryDrifted,
   MODEL_WRITE_SYSTEM,
   WRITE_TYPES,
   type WriteMessage,
 } from '../dsh/lib/modelwrite.ts'
+import { NAME_LIKE } from '../dsh/lib/recall.ts'
 
 const WINDOW: WriteMessage[] = [
   { seq: 3, role: 'user', text: '必须把端口固定成 8000。另外这个配置流程应该再简化一下。' },
@@ -261,4 +264,129 @@ test('a retry is skipped when the first attempt failed on the clock, not on the 
   })
   assert.deepEqual(await writer.decide(WINDOW), { items: [], model: 'test-model' })
   assert.equal(fast, 2, 'an unparsable answer one second in is still worth a second try')
+})
+
+test('an answer cut off mid-array keeps the items that were complete', () => {
+  // The live failure this exists for: a 15,233-character window, a 3,462-character answer, `finish:
+  // length`, the array never closed, and the whole window wrote nothing — the call paid for and
+  // discarded. One missing bracket must not cost every item in front of it.
+  // Both sources have to be verbatim in the window, or the item is refused for the right reason and
+  // the test would be measuring the verbatim check instead of the salvage.
+  const first = '必须把端口固定成 8000。'
+  const second = '另外这个配置流程应该再简化一下。'
+  const window = [...WINDOW]
+  const cut =
+    `[{"message": 0, "source": "${first}", "summary": "用户要求把端口固定成 8000。", "who": "user", "worth": true, "type": "constraint"},` +
+    ` {"message": 0, "source": "${second}", "summary": "用户要求把配置流程再简化一下。", "who": "user", "worth": true, "type": "constraint"},` +
+    ` {"message": 0, "source": "第三`
+  const decided = explainModelWrite(cut, window)
+  assert.equal(decided.reason, 'truncated', 'the reason says the answer stopped early')
+  assert.equal(decided.items?.length, 2, 'and the two complete items are kept')
+  assert.deepEqual(
+    decided.items?.map((item) => item.summary),
+    ['用户要求把端口固定成 8000。', '用户要求把配置流程再简化一下。'],
+  )
+})
+
+test('salvage still refuses everything the normal path refuses', () => {
+  // Salvaging is not a looser rule. The item below quotes a line that is not in the message, which is
+  // the failure the verbatim check exists for, so it must be dropped even though it parses.
+  const cut =
+    `[{"message": 0, "source": "这句话原文里没有", "summary": "用户说了什么。", "who": "user", "worth": true, "type": "constraint"},` +
+    ` {"message": 0, "source": "另外这个配置流程应该再简化一下。", "summary": "用户要求把配置流程再简化一下。", "who": "user", "worth": true, "type": "constraint"}`
+  const decided = explainModelWrite(cut, WINDOW)
+  assert.equal(decided.reason, 'truncated')
+  assert.equal(decided.items?.length, 1, 'only the item whose source is in the message survives')
+  assert.match(decided.items![0]!.summary, /简化/u)
+
+  // And a cut-off answer whose complete items are all refused stays a refusal, not a partial write.
+  // The drift used here names a *long Latin identifier*, because that is what the check can see — see
+  // the gap pinned in the test below.
+  const allBad = `[{"message": 0, "source": "必须把端口固定成 8000。", "summary": "用户要求改用 startPortServer。", "who": "user", "worth": true, "type": "constraint"}`
+  assert.match(String(explainModelWrite(allBad, WINDOW).reason), /^drifted:/u)
+  assert.equal(explainModelWrite(allBad, WINDOW).items, null)
+})
+
+test('braces, brackets and escapes inside a string do not fool the scanner', () => {
+  // A summary quoting code is ordinary on this path, so a scanner that counted braces inside strings
+  // would cut objects in half and keep the wrong half.
+  const messy = 'if (x) { return [1] }  // 说 "好" 的时候'
+  const window = [{ seq: 1, role: 'user', text: `看这段：${messy}` }]
+  const answer =
+    `[{"message": 0, "source": ${JSON.stringify(`看这段：${messy}`)}, "summary": "用户贴了一段代码。", "who": "user", "worth": true, "type": "constraint"},` +
+    ` {"message": 0, "source": "截断`
+  const decided = explainModelWrite(answer, window)
+  assert.equal(decided.reason, 'truncated')
+  assert.equal(decided.items?.length, 1, 'the object with braces and brackets inside its strings survived')
+  assert.equal(decided.items![0]!.end - decided.items![0]!.start, `看这段：${messy}`.length)
+})
+
+test('a salvaged answer is used, and is not retried', async () => {
+  // Two things at once, both about cost. The items must reach the caller, and there must be no second
+  // attempt: the first attempt already produced usable memories, so retrying would pay twice for the
+  // same window — and on a slow call the retry is exactly what the budget cannot afford.
+  let calls = 0
+  const writer = createModelWriter({
+    llm: {
+      stream: () => {
+        calls += 1
+        return (async function* () {
+          yield {
+            type: 'text-delta',
+            text: `[{"message": 0, "source": "必须把端口固定成 8000。", "summary": "用户要求把端口固定成 8000。", "who": "user", "worth": true, "type": "constraint"}, {"message": 0, "source": "还有`,
+          }
+          yield { type: 'finish', reason: 'length' }
+        })()
+      },
+    } as never,
+    settings: { enabled: true, window: 5, timeoutMs: 1_000, retry: 1 },
+    resolveRoute: async () => ({ provider: 'p', model: 'test-model' }),
+  })
+  const written = await writer.decide(WINDOW)
+  assert.equal(written?.items.length, 1, 'the complete item is returned')
+  assert.equal(calls, 1, 'and the answer is not asked for twice')
+  // The ledger has to be able to say this happened. `ok` here would hide a truncation behind a
+  // successful write, which is how it went unnoticed in the first place.
+  assert.equal(writer.lastReason(), 'truncated')
+})
+
+test('an answer with no array at all is still refused, not salvaged', () => {
+  assert.equal(explainModelWrite('这些都不值得记。', WINDOW).reason, 'unparsable')
+  assert.deepEqual(readCompleteObjects('没有任何数组'), { values: null, closed: false })
+  assert.deepEqual(readCompleteObjects('[]'), { values: [], closed: true })
+})
+
+test('the drift check sees long Latin names and nothing else — a gap, not a design', () => {
+  // `summaryDrifted` matches `\b[A-Za-z][A-Za-z0-9_.-]{4,}\b`: five characters or more, starting with a
+  // Latin letter. Measured against the eight cases below, that catches the two Latin identifiers and
+  // misses everything else — including the two examples the prompt itself gives.
+  //
+  // Pinned as a test rather than left in a comment because the source comment claims more than the
+  // pattern delivers ("a different filename, command, number or symbol is a different claim"), and a
+  // claim nobody checks is how a check quietly stops working.
+  const caught = (summary: string, source: string): boolean => summaryDrifted(summary, source) !== null
+
+  assert.equal(caught('用户决定把接口命名成 fetchData。', '把接口命名成 loadData。'), true, 'a long Latin identifier')
+  assert.equal(caught('用户要求提交到 /data/reports-2 目录。', '提交到 /data/reports 目录。'), true, 'a path segment')
+
+  // The gaps. Each is a changed fact, not a wording choice, and each is accepted as written today.
+  assert.equal(caught('用户要求把端口固定成 9000。', '必须把端口固定成 8000。'), false, 'a changed port number')
+  assert.equal(caught('用户要求超时设成 30 秒。', '超时设成 10 秒。'), false, 'a changed timeout')
+  assert.equal(
+    caught('用户要求设置 timeoutMs=9000。', '设置 timeoutMs=3000。'),
+    false,
+    'the identifier is copied, its value is not: the token passes and the number is never looked at',
+  )
+  assert.equal(
+    caught('用户要求用 yarn 管理依赖。', '必须用 pnpm 管理依赖。'),
+    false,
+    'four characters: the single most load-bearing token in a "必须用 pnpm" memory escapes the pattern',
+  )
+  assert.equal(caught('这个方案提到了集成的问题。', '这个方案提到了继承的问题。'), false, 'Chinese is never matched')
+
+  // Chinese is the bulk of the corpus, so the check as it stands covers a small share of the writes.
+  // Whether to widen it is a separate decision — widening to digits refuses summaries that render
+  // "两个" as "2", and every refusal here costs a memory.
+  assert.equal(NAME_LIKE.test('pnpm'), false)
+  assert.equal(NAME_LIKE.test('timeoutMs'), true)
 })

@@ -149,12 +149,30 @@ export interface WriteExplanation {
 export function explainModelWrite(raw: string, messages: readonly WriteMessage[]): WriteExplanation {
   const start = raw.indexOf('[')
   const end = raw.lastIndexOf(']')
-  if (start < 0 || end <= start) return { items: null, reason: 'unparsable' }
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw.slice(start, end + 1))
-  } catch {
-    return { items: null, reason: 'unparsable' }
+  let parsed: unknown = null
+  if (start >= 0 && end > start) {
+    try {
+      parsed = JSON.parse(raw.slice(start, end + 1))
+    } catch {
+      parsed = null
+    }
+  }
+  // Salvage, and only here. The path above is untouched, so an answer that parses behaves exactly as
+  // it did; this runs only when the whole array could not be read, which in practice means the answer
+  // was cut off at the token ceiling. Measured on the live route: a 15,233-character window produced a
+  // 3,462-character answer with `finish: length`, the array never closed, and **the whole window wrote
+  // nothing** — the worst shape of failure, because the call was paid for.
+  //
+  // Salvaging adds no new acceptance rule. Every item still has to name a message that exists, quote
+  // its source verbatim, carry a non-empty summary, and introduce no identifier the source lacks. What
+  // changes is only that a complete item in front of an incomplete one is no longer thrown away with
+  // it.
+  let salvaged = false
+  if (parsed === null) {
+    const read = readCompleteObjects(raw)
+    if (read.values === null || read.values.length === 0) return { items: null, reason: 'unparsable' }
+    parsed = read.values
+    salvaged = true
   }
   if (!Array.isArray(parsed)) return { items: null, reason: 'unparsable' }
   if (parsed.length === 0) return { items: [], reason: 'empty' }
@@ -224,7 +242,71 @@ export function explainModelWrite(raw: string, messages: readonly WriteMessage[]
   // A refused identifier is worth its own word: it is the only failure on this path that looks like a
   // successful write from the outside, so the ledger has to be able to say it happened.
   if (items.length === 0 && refused > 0) return { items: null, reason: lastDrift === null ? 'all-refused' : `drifted:${lastDrift}` }
-  return { items, reason: items.length === 0 ? 'empty' : 'ok' }
+  if (items.length === 0) return { items, reason: 'empty' }
+  // A salvaged answer is a partial one, and the ledger has to be able to say so. Reporting `ok` here
+  // would turn a loud failure into a quiet one: the operator would see written memories and no sign
+  // that the answer stopped early, so the truncation would never be fixed.
+  return { items, reason: salvaged ? 'truncated' : 'ok' }
+}
+
+/**
+ * Pull the complete top-level objects out of an answer whose array never closed.
+ *
+ * A plain `JSON.parse` needs the whole array, so one missing bracket at the end costs every item in
+ * front of it. This walks the text instead, tracking string state and brace depth, and hands back each
+ * object that is complete on its own. It stops at the first object that does not parse — that is where
+ * the answer was cut — and reports whether the array's closing bracket was ever seen.
+ *
+ * Braces and brackets inside strings are honoured, because a summary quoting code is ordinary here and
+ * a scanner that counted them would cut objects in half.
+ *
+ * @param raw - the model's answer, complete or not.
+ * @returns the objects it could read, and whether the array ended properly. `null` when there is no
+ *   array at all.
+ */
+export function readCompleteObjects(raw: string): { values: unknown[] | null; closed: boolean } {
+  const start = raw.indexOf('[')
+  if (start < 0) return { values: null, closed: false }
+  const values: unknown[] = []
+  let depth = 0
+  let objectStart = -1
+  let inString = false
+  let escaped = false
+  for (let at = start + 1; at < raw.length; at += 1) {
+    const character = raw[at]!
+    if (inString) {
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === '"') inString = false
+      continue
+    }
+    if (character === '"') {
+      inString = true
+      continue
+    }
+    if (character === '{') {
+      if (depth === 0) objectStart = at
+      depth += 1
+      continue
+    }
+    if (character === '}') {
+      if (depth === 1 && objectStart >= 0) {
+        try {
+          values.push(JSON.parse(raw.slice(objectStart, at + 1)))
+        } catch {
+          // A half-written object: everything after it is unusable too, so stop rather than skip.
+          return { values, closed: false }
+        }
+        objectStart = -1
+        depth = 0
+        continue
+      }
+      if (depth > 0) depth -= 1
+      continue
+    }
+    if (character === ']' && depth === 0) return { values, closed: true }
+  }
+  return { values, closed: false }
 }
 
 /**

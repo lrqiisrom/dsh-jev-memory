@@ -53,7 +53,13 @@ import { readFile, readdir, writeFile, mkdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-import { MODEL_WRITE_SYSTEM, WRITE_TYPES, buildModelWritePrompt, explainModelWrite } from '../dsh/lib/modelwrite.ts'
+import {
+  MODEL_WRITE_SYSTEM,
+  WRITE_TYPES,
+  buildModelWritePrompt,
+  explainModelWrite,
+  readCompleteObjects,
+} from '../dsh/lib/modelwrite.ts'
 import { parseCsvRecords } from './lib/csv.ts'
 import { readSessions, type Session } from './lib/sessions.ts'
 
@@ -260,16 +266,12 @@ for (const entry of sample) {
   const finish = String(payload.choices?.[0]?.finish_reason ?? 'unknown')
   if (finish !== 'stop') cutOff.push(`seq ${entry.seq}｜finish=${finish}｜窗口 ${window.reduce((sum, message) => sum + message.text.length, 0)} 字｜回答 ${raw.length} 字`)
 
-  // Two counts, so every item is attributable: what the model returned, what survived the parser, and
-  // what survived the filters the plugin applies afterwards. The gap between them is the refusal rate.
-  let rawCount = 0
-  try {
-    const bracket = raw.slice(raw.indexOf('['), raw.lastIndexOf(']') + 1)
-    const parsed: unknown = JSON.parse(bracket)
-    if (Array.isArray(parsed)) rawCount = parsed.length
-  } catch {
-    rawCount = 0
-  }
+  // Three counts, so every item is attributable: what the answer contained as complete objects, what
+  // survived the parser's checks, and what survived the filters the plugin applies afterwards. The
+  // first count uses the same scanner the plugin uses to salvage a cut-off answer, because counting with
+  // `JSON.parse` reports 0 for exactly the answers that need counting most — which is how a truncated
+  // window came to be displayed as "brought back 0, kept 14".
+  const rawCount = readCompleteObjects(raw).values?.length ?? 0
   const decided = explainModelWrite(raw, messages)
   const accepted = decided.items ?? []
   if (decided.items === null) {
@@ -306,7 +308,7 @@ for (const entry of sample) {
   kept += writeable.length
 
   rowLines.push(
-    `\n## 窗口 ${entry.session.id.slice(-12)}… 结束于 seq ${entry.seq}｜${ms}ms｜带回 ${rawCount} 条 → 解析留 ${accepted.length} → 该写 ${writeable.length}` +
+    `\n## 窗口 ${entry.session.id.slice(-12)}… 结束于 seq ${entry.seq}｜${ms}ms｜finish=${finish}｜完整项 ${rawCount} → 解析留 ${accepted.length} → 该写 ${writeable.length}` +
       (decided.items === null ? `（整份被拒：${decided.reason}）` : ''),
   )
 
