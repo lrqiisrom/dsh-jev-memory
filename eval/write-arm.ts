@@ -617,7 +617,14 @@ if (process.env.WRITE_ARM_REVIEW === 'yes') {
   // Written where the other measuring batches live, and for the same reason they are gitignored: every
   // row is real session text. `label` is the column to fill — 1 该留, 0 不该留, ? 拿不准.
   const header = ['row', 'window', 'arm', 'why', 'who', 'worth', 'type', 'text', 'source', 'label', 'note']
-  const body = reviewRows.map((row, index) =>
+  // The rows the plugin would keep come first. Labelling is the scarce resource, and the headline
+  // metric's denominator is exactly those rows — so if the sheet only gets half read, the half that
+  // matters is the half that was read. Order is the only thing this changes; nothing is re-run, because
+  // the answer for every window is already in the checkpoint.
+  const ordered = [...reviewRows].sort((left, right) =>
+    left.arm === right.arm ? 0 : left.arm === 'written' ? -1 : 1,
+  )
+  const body = ordered.map((row, index) =>
     [
       String(index + 1),
       row.window,
@@ -636,9 +643,9 @@ if (process.env.WRITE_ARM_REVIEW === 'yes') {
   )
   const reviewFile = join(labelDir, `review-${runLabel}.csv`)
   await writeFile(reviewFile, `${header.join(',')}\n${body.join('\n')}\n`)
-  const written = reviewRows.filter((row) => row.arm === 'written').length
+  const written = ordered.filter((row) => row.arm === 'written').length
   console.log(`\n复核表已写出 ${reviewFile}（本次运行标记 ${runLabel}）`)
-  console.log(`  ${reviewRows.length} 行：插件要留的 ${written} 条、插件丢掉的 ${reviewRows.length - written} 条`)
+  console.log(`  ${ordered.length} 行：**前 ${written} 行是插件要留的**（先判这些），后面 ${ordered.length - written} 行是它丢掉的`)
   console.log('  只填 label 列：1 该留、0 不该留、? 拿不准；note 列可写理由。')
   console.log('  注意：这张表只能查出"模型提到过但判错了的"，它没法发现模型压根没提到的记忆。')
 }

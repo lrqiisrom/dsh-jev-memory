@@ -58,9 +58,15 @@ const records = parseCsv(await readFile(path, 'utf8'))
 const header = records[0] ?? []
 const at = (name: string): number => header.indexOf(name)
 if (at('text') < 0 || at('window') < 0) throw new Error(`${file} 里找不到 text / window 列`)
-const valueAt = at('jev_noul')
+// `let`, and assigned after the column is appended. The first version kept the `-1` from "the column is
+// not there yet" and wrote every answer to `cells[-1]` — an array property that is not an element. The
+// file therefore received nothing while the tool's own tally, read from that same property, happily
+// reported 305 filled. A tool that reports success while writing nothing is worse than one that fails,
+// so the write is now read back and checked.
+let valueAt = at('jev_noul')
 if (valueAt < 0) {
   header.push('jev_noul')
+  valueAt = header.length - 1
   for (const cells of records.slice(1)) while (cells.length < header.length) cells.push('')
 }
 
@@ -139,4 +145,13 @@ const share = (threshold: number): string => {
   return `${kept}/${values.length}`
 }
 console.log(`\nJev 判"值得"的比例，按不同门槛：0.12 → ${share(0.12)}｜0.3 → ${share(0.3)}｜0.5 → ${share(0.5)}`)
-console.log('复核表当前插件留下的比例，可以对照着看 arm 列。')
+// Read the file back. The tally above comes from memory, and memory is exactly what was wrong the first
+// time: it agreed with itself and disagreed with the file.
+const written = parseCsv(await readFile(path, 'utf8'))
+const persisted = written.slice(1).filter((cells) => (cells[valueAt] ?? '').trim() !== '').length
+if (persisted !== values.length) {
+  console.log(`\n⚠️ 写回后回读只看到 ${persisted} 个值，内存里是 ${values.length} 个 —— 这次结果不可信，请勿据此判断。`)
+  process.exitCode = 1
+} else {
+  console.log(`复核表当前插件留下的比例，可以对照着看 arm 列。（已回读校验：${persisted} 个值都在文件里）`)
+}
