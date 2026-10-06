@@ -150,11 +150,22 @@ export function explainModelWrite(raw: string, messages: readonly WriteMessage[]
   const start = raw.indexOf('[')
   const end = raw.lastIndexOf(']')
   let parsed: unknown = null
+  let repaired = false
   if (start >= 0 && end > start) {
+    const slice = raw.slice(start, end + 1)
     try {
-      parsed = JSON.parse(raw.slice(start, end + 1))
+      parsed = JSON.parse(slice)
     } catch {
-      parsed = null
+      // Second attempt, still on the whole array: a quote inside a string value that the model did not
+      // escape. Measured on real traffic — one window in twenty answered
+      // `"summary": "…统一回答"JDK 各版本区别及如何选择"这个问题。"` with `finish: stop`, the array
+      // looked complete, and every memory in it was lost to one missing backslash.
+      try {
+        parsed = JSON.parse(repairStrayQuotes(slice))
+        repaired = true
+      } catch {
+        parsed = null
+      }
     }
   }
   // Salvage, and only here. The path above is untouched, so an answer that parses behaves exactly as
@@ -168,11 +179,14 @@ export function explainModelWrite(raw: string, messages: readonly WriteMessage[]
   // changes is only that a complete item in front of an incomplete one is no longer thrown away with
   // it.
   let salvaged = false
+  let truncated = false
   if (parsed === null) {
     const read = readCompleteObjects(raw)
     if (read.values === null || read.values.length === 0) return { items: null, reason: 'unparsable' }
     parsed = read.values
     salvaged = true
+    repaired = repaired || read.repaired
+    truncated = !read.closed
   }
   if (!Array.isArray(parsed)) return { items: null, reason: 'unparsable' }
   if (parsed.length === 0) return { items: [], reason: 'empty' }
@@ -243,10 +257,68 @@ export function explainModelWrite(raw: string, messages: readonly WriteMessage[]
   // successful write from the outside, so the ledger has to be able to say it happened.
   if (items.length === 0 && refused > 0) return { items: null, reason: lastDrift === null ? 'all-refused' : `drifted:${lastDrift}` }
   if (items.length === 0) return { items, reason: 'empty' }
-  // A salvaged answer is a partial one, and the ledger has to be able to say so. Reporting `ok` here
-  // would turn a loud failure into a quiet one: the operator would see written memories and no sign
-  // that the answer stopped early, so the truncation would never be fixed.
-  return { items, reason: salvaged ? 'truncated' : 'ok' }
+  // One word for an answer that arrived imperfectly, because the ledger has one field for it.
+  //
+  // `truncated` wins over `repaired` when both happened: a missing tail is the fact an operator acts
+  // on, and the salvaged `items` count already says how much of it survived. Reporting `ok` for either
+  // would turn a loud failure into a quiet one — the operator would see written memories and no sign
+  // that the answer was cut off or that text had to be altered to read it.
+  if (truncated) return { items, reason: 'truncated' }
+  if (repaired) return { items, reason: 'repaired' }
+  return { items, reason: 'ok' }
+}
+
+/**
+ * Escape the quotes a model left unescaped inside a string value.
+ *
+ * Deliberately narrow, and only ever applied to text that failed to parse: a quote is treated as the
+ * end of a string only when the next non-whitespace character is structural (`,` `:` `}` `]`), and as
+ * content — and so escaped — when it is bookended by content on both sides. That is the shape of the
+ * measured failure, where a summary quoted a phrase: `"…统一回答"JDK…"这个问题。"`.
+ *
+ * It cannot make a valid document invalid, which is what lets it run as a second attempt over a whole
+ * array: on text that parses, every quote it sees is already in a legal position.
+ *
+ * @param text - JSON that failed to parse.
+ * @returns the same text with stray inner quotes escaped.
+ */
+export function repairStrayQuotes(text: string): string {
+  let out = ''
+  let inString = false
+  let escaped = false
+  for (let at = 0; at < text.length; at += 1) {
+    const character = text[at]!
+    if (escaped) {
+      out += character
+      escaped = false
+      continue
+    }
+    if (character === '\\') {
+      out += character
+      escaped = true
+      continue
+    }
+    if (character !== '"') {
+      out += character
+      continue
+    }
+    if (!inString) {
+      inString = true
+      out += character
+      continue
+    }
+    // Inside a string: legal only if what follows is structural, or if the string simply ends here.
+    let next = at + 1
+    while (next < text.length && /\s/u.test(text[next]!)) next += 1
+    const after = next < text.length ? text[next]! : ''
+    if (after === '' || after === ',' || after === ':' || after === '}' || after === ']') {
+      inString = false
+      out += character
+      continue
+    }
+    out += '\\"'
+  }
+  return out
 }
 
 /**
@@ -264,14 +336,16 @@ export function explainModelWrite(raw: string, messages: readonly WriteMessage[]
  * @returns the objects it could read, and whether the array ended properly. `null` when there is no
  *   array at all.
  */
-export function readCompleteObjects(raw: string): { values: unknown[] | null; closed: boolean } {
+export function readCompleteObjects(raw: string): { values: unknown[] | null; closed: boolean; repaired: boolean } {
   const start = raw.indexOf('[')
-  if (start < 0) return { values: null, closed: false }
+  if (start < 0) return { values: null, closed: false, repaired: false }
   const values: unknown[] = []
   let depth = 0
   let objectStart = -1
   let inString = false
   let escaped = false
+  /** Whether any object needed its unescaped quotes repaired before it would parse. */
+  let repaired = false
   for (let at = start + 1; at < raw.length; at += 1) {
     const character = raw[at]!
     if (inString) {
@@ -291,11 +365,17 @@ export function readCompleteObjects(raw: string): { values: unknown[] | null; cl
     }
     if (character === '}') {
       if (depth === 1 && objectStart >= 0) {
+        const slice = raw.slice(objectStart, at + 1)
         try {
-          values.push(JSON.parse(raw.slice(objectStart, at + 1)))
+          values.push(JSON.parse(slice))
         } catch {
-          // A half-written object: everything after it is unusable too, so stop rather than skip.
-          return { values, closed: false }
+          try {
+            values.push(JSON.parse(repairStrayQuotes(slice)))
+            repaired = true
+          } catch {
+            // A half-written object: everything after it is unusable too, so stop rather than skip.
+            return { values, closed: false, repaired }
+          }
         }
         objectStart = -1
         depth = 0
@@ -304,9 +384,9 @@ export function readCompleteObjects(raw: string): { values: unknown[] | null; cl
       if (depth > 0) depth -= 1
       continue
     }
-    if (character === ']' && depth === 0) return { values, closed: true }
+    if (character === ']' && depth === 0) return { values, closed: true, repaired }
   }
-  return { values, closed: false }
+  return { values, closed: false, repaired }
 }
 
 /**

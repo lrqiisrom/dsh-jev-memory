@@ -16,6 +16,7 @@ import {
   createModelWriter,
   explainModelWrite,
   readCompleteObjects,
+  repairStrayQuotes,
   summaryDrifted,
   MODEL_WRITE_SYSTEM,
   WRITE_TYPES,
@@ -352,8 +353,8 @@ test('a salvaged answer is used, and is not retried', async () => {
 
 test('an answer with no array at all is still refused, not salvaged', () => {
   assert.equal(explainModelWrite('这些都不值得记。', WINDOW).reason, 'unparsable')
-  assert.deepEqual(readCompleteObjects('没有任何数组'), { values: null, closed: false })
-  assert.deepEqual(readCompleteObjects('[]'), { values: [], closed: true })
+  assert.deepEqual(readCompleteObjects('没有任何数组'), { values: null, closed: false, repaired: false })
+  assert.deepEqual(readCompleteObjects('[]'), { values: [], closed: true, repaired: false })
 })
 
 test('the drift check sees long Latin names and nothing else — a gap, not a design', () => {
@@ -389,4 +390,63 @@ test('the drift check sees long Latin names and nothing else — a gap, not a de
   // "两个" as "2", and every refusal here costs a memory.
   assert.equal(NAME_LIKE.test('pnpm'), false)
   assert.equal(NAME_LIKE.test('timeoutMs'), true)
+})
+
+test('a quote the model left unescaped does not cost the whole answer', () => {
+  // The shape of a real failure: `finish: stop`, the array complete, and every memory in it lost
+  // because the model quoted a phrase inside `summary` without escaping it. One missing backslash cost
+  // the window — including an item it had typed `worth: true, type: decision`.
+  //
+  // The text here is synthesised rather than copied from the session that produced it. The measuring
+  // batches live outside the repository for the same reason.
+  const span = '这个字段的说明应该写成「关键路径」，因为中文手册里都是这么叫的'
+  const window = [{ seq: 1, role: 'user', text: span }]
+  const raw =
+    '[ { "message": 0, "source": "' +
+    span +
+    '", "who": "user", "worth": true, "type": "decision", ' +
+    '"summary": "用户要求把这个字段的说明统一写成"关键路径"，理由是中文手册里都这么叫。" } ]'
+  assert.throws(() => JSON.parse(raw), 'the raw answer really is invalid JSON')
+
+  const decided = explainModelWrite(raw, window)
+  assert.equal(decided.reason, 'repaired', 'the ledger says the text had to be altered to read it')
+  assert.equal(decided.items?.length, 1, 'and the memory survives')
+  assert.equal(decided.items![0]!.type, 'decision')
+  assert.match(decided.items![0]!.summary, /关键路径/u)
+  assert.equal(
+    decided.items![0]!.end - decided.items![0]!.start,
+    span.length,
+    'and the source span it points at is measured in the message, not in the repaired text',
+  )
+})
+
+test('the repair does not touch text that already parses', () => {
+  // It runs as a second attempt over a whole array, so it has to be a no-op on anything legal —
+  // otherwise the safety of the fallback would depend on the answer being broken in one particular way.
+  const legal = [
+    '{"a": "plain"}',
+    '{"a": "with \\"escaped\\" quotes"}',
+    '{"a": "ends with a colon:"}',
+    '{"a": "", "b": "x", "c": {"d": [1, 2]}}',
+    '{"a": "他说的\\"是\\"这个"}',
+  ]
+  for (const text of legal) {
+    assert.equal(repairStrayQuotes(text), text, text)
+    assert.doesNotThrow(() => JSON.parse(repairStrayQuotes(text)), text)
+  }
+})
+
+test('an odd number of stray quotes is repaired too, not just an even one', () => {
+  // The scanner walks brace depth and string state, so an odd number of unescaped quotes leaves it
+  // believing a string never ended: it then walks past the object's closing brace and finds nothing.
+  // That is why the repair exists on both paths — the whole-array retry and the per-object one.
+  const window = [{ seq: 1, role: 'user', text: '把日志级别改成 "debug"。' }]
+  const raw =
+    '[{"message": 0, "source": "把日志级别改成 \\"debug\\"。", "who": "user", "worth": true, "type": "constraint", ' +
+    '"summary": "用户要求把日志级别改成 "debug"。"}]'
+  assert.throws(() => JSON.parse(raw))
+  const decided = explainModelWrite(raw, window)
+  assert.equal(decided.reason, 'repaired')
+  assert.equal(decided.items?.length, 1)
+  assert.match(decided.items![0]!.summary, /debug/u)
 })
