@@ -15,6 +15,7 @@ import {
   buildModelWritePrompt,
   createModelWriter,
   explainModelWrite,
+  extractionSourceOf,
   readCompleteObjects,
   repairStrayQuotes,
   summaryDrifted,
@@ -449,4 +450,54 @@ test('an odd number of stray quotes is repaired too, not just an even one', () =
   assert.equal(decided.reason, 'repaired')
   assert.equal(decided.items?.length, 1)
   assert.match(decided.items![0]!.summary, /debug/u)
+})
+
+test('only the newest thing the person wrote may be extracted from', () => {
+  // The window holds five rounds and only the last is new. Reading all five as sources re-proposed the
+  // same sentences every turn — 6 of 76 source spans appeared in two different windows on real traffic —
+  // and left the deduplication to a paraphrase judgement that costs a model call and misses whenever the
+  // wording of the summary changes. The earlier rounds still travel, because they are what tells the
+  // model whether the newest message is quoting something.
+  const window: WriteMessage[] = [
+    { seq: 1, role: 'user', text: '必须用 pnpm 管理依赖。' },
+    { seq: 2, role: 'assistant', text: '好的，我记住了。' },
+    { seq: 3, role: 'user', text: '现在把构建脚本改一下。' },
+    { seq: 4, role: 'assistant', text: '改成什么？' },
+    { seq: 5, role: 'user', text: '算了，先别动。' },
+  ]
+  assert.equal(extractionSourceOf(window), 4, 'the newest user message, not the oldest')
+  assert.equal(extractionSourceOf([{ seq: 1, role: 'assistant', text: '只有助手说话' }]), -1)
+
+  const answer = JSON.stringify([
+    // The already-read round: refused, however good the sentence is.
+    { message: 0, source: '必须用 pnpm 管理依赖。', summary: '用户要求用 pnpm 管理依赖。', who: 'user', worth: true, type: 'constraint' },
+    // The newest round: kept.
+    { message: 4, source: '算了，先别动。', summary: '用户决定先不动构建脚本。', who: 'user', worth: true, type: 'decision' },
+  ])
+  const decided = explainModelWrite(answer, window)
+  assert.equal(decided.items?.length, 1, 'the item from the older round is refused')
+  assert.equal(decided.items![0]!.messageIndex, 4)
+  assert.match(decided.items![0]!.summary, /先不动/u)
+
+  // And when the model strays entirely, the answer is a refusal rather than a silent write.
+  const strayOnly = JSON.stringify([
+    { message: 0, source: '必须用 pnpm 管理依赖。', summary: '用户要求用 pnpm 管理依赖。', who: 'user', worth: true, type: 'constraint' },
+  ])
+  assert.equal(explainModelWrite(strayOnly, window).items, null)
+  assert.equal(explainModelWrite(strayOnly, window).reason, 'all-refused')
+})
+
+test('the window marks which message is the source and which is only context', () => {
+  const window: WriteMessage[] = [
+    { seq: 1, role: 'user', text: '必须用 pnpm 管理依赖。' },
+    { seq: 2, role: 'assistant', text: '好的。' },
+    { seq: 3, role: 'user', text: '现在把构建脚本改一下。' },
+  ]
+  const prompt = buildModelWritePrompt(window)
+  assert.match(prompt, /\[0\] 角色=user｜仅背景/u)
+  assert.match(prompt, /\[1\] 角色=assistant｜仅背景/u)
+  assert.match(prompt, /\[2\] 角色=user｜\*\*提取源\*\*/u)
+  // The rule is stated in the system prompt too, and names the same words the window uses.
+  assert.match(MODEL_WRITE_SYSTEM, /只有标注为「提取源」的那条消息是提取对象/u)
+  assert.match(MODEL_WRITE_SYSTEM, /不要从「仅背景」的消息里提取/u)
 })

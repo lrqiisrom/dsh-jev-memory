@@ -95,17 +95,19 @@ export const MODEL_WRITE_DEFAULTS: ModelWriteSettings = {
 
 /** The instruction. The person's own standard, stated, plus the two exclusions that matter most. */
 export const MODEL_WRITE_SYSTEM =
-  '你在为一个人维护跨会话的长期记忆。下面是一段真实对话，每条消息前面有编号和角色。\n' +
-  '请找出其中**值得长期记住**的内容。判断标准：换个会话、换一天，这段内容还有用吗？\n' +
+  '你在为一个人维护跨会话的长期记忆。下面是一段真实对话，每条消息前面有编号、角色和「提取源 / 仅背景」的标注。\n' +
+  '**只有标注为「提取源」的那条消息是提取对象**；标注为「仅背景」的只用来判断语境——' +
+  '比如提取源里那段话是不是在粘贴/引用前面的内容、有没有指代前面说过的事。**不要从「仅背景」的消息里提取任何东西，也不要为它们返回 JSON 项。**\n' +
+  '在提取源里找出**值得长期记住**的内容。判断标准：换个会话、换一天，这段内容还有用吗？\n' +
   '值得记的是**这个人自己**表达的、以后仍然适用的内容：约定、禁忌、取舍及原因、踩过的坑、项目事实。\n' +
   '不值得记的：一次性任务指令、提问、寒暄、状态汇报、临时状态、与项目无关的闲聊、没有项目特异性的通用常识。\n' +
-  '注意：用户消息里可能混着**他粘贴或引用的别人的内容、模型自己的回答**——那些不算他说的。\n' +
+  '注意：提取源里可能混着**他粘贴或引用的别人的内容、模型自己的回答**——那些不算他说的。\n' +
   '每条记忆要输出**两样东西**：`source` 是你在原文里找到的那段（一字不差，只作出处）；' +
   '`summary` 是**你写的一句话总结**，它会成为长期记忆库里唯一的正文，以后靠它被召回。\n' +
   '输出一个 JSON 数组，每项形如：\n' +
   '{"message": 0, "source": "就用刚才那个项目。", "who": "user", "worth": true, "type": "decision", "summary": "用户决定这个项目沿用此前讨论的那个。"}\n' +
   '字段含义：\n' +
-  '- `message`：消息编号\n' +
+  '- `message`：消息编号，**只能是标注为「提取源」的那条**\n' +
   '- `source`：**必须是那条消息里一字不差的原文片段**（直接复制，不要改写、不要补标点、不要翻译）。' +
   '**不要输出字符下标**。\n' +
   '- `summary`：**用第三人称写的一句总结**，是你对这段内容的理解。要求：\n' +
@@ -119,13 +121,44 @@ export const MODEL_WRITE_SYSTEM =
   '只输出 JSON 数组，不要任何解释。没有值得记的就输出 []。'
 
 /**
- * Render the conversation the model reads.
+ * The message the model is allowed to extract from: the newest one the person wrote.
+ *
+ * A window holds five rounds, and only the last of them is new. Reading all five as extraction sources
+ * re-proposed the same sentences on every turn — measured on twenty windows, 6 of 76 source spans
+ * appeared in two different windows — and it left the duplicate detection to a paraphrase judgement,
+ * which costs a model call and misses whenever the summarised wording changes (5 of those 76 were
+ * summarised differently the second time). The earlier rounds are still sent, because they are what
+ * tells the model whether the newest message is quoting something.
+ *
+ * @param messages - the window, oldest first.
+ * @returns the index of the extraction source, or -1 when the window holds nothing the person wrote.
+ */
+export function extractionSourceOf(messages: readonly WriteMessage[]): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]!.role === 'user') return index
+  }
+  return -1
+}
+
+/**
+ * Render the conversation the model reads, marking the one message it may extract from.
+ *
+ * The labelling follows the segmentation prompt, which already distinguishes what may be used from
+ * what is only there for context — and which reached the same conclusion for the same reason: a
+ * judgement made without knowing what came before is missing the one thing a person has when they
+ * read it.
  *
  * @param messages - the window, oldest first.
  * @returns the user message for the model.
  */
 export function buildModelWritePrompt(messages: readonly WriteMessage[]): string {
-  const body = messages.map((message, index) => `[${index}] 角色=${message.role}\n${message.text}`).join('\n\n')
+  const source = extractionSourceOf(messages)
+  const body = messages
+    .map(
+      (message, index) =>
+        `[${index}] 角色=${message.role}｜${index === source ? '**提取源**' : '仅背景，不要提取'}\n${message.text}`,
+    )
+    .join('\n\n')
   return `以下是一段对话：\n\n${body}`
 }
 
@@ -194,6 +227,10 @@ export function explainModelWrite(raw: string, messages: readonly WriteMessage[]
   const items: WriteItem[] = []
   let refused = 0
   let lastDrift: string | null = null
+  // The scope, enforced rather than requested. A prompt that asks for one source and code that accepts
+  // any of them is a scope that depends on the model's compliance, and then the ledger cannot say
+  // whether the five-round window is costing anything: the answer would differ run to run.
+  const sourceIndex = extractionSourceOf(messages)
   for (const entry of parsed) {
     if (entry === null || typeof entry !== 'object') {
       refused += 1
@@ -209,6 +246,12 @@ export function explainModelWrite(raw: string, messages: readonly WriteMessage[]
     const type = String(item.type ?? '')
     const message = messages[messageIndex]
     if (!message || !(WRITE_WHO as readonly string[]).includes(who)) {
+      refused += 1
+      continue
+    }
+    // An item quoted from a round that has already been read. It was allowed until the window was
+    // scoped, which is how the same sentence came back on every turn for four turns.
+    if (messageIndex !== sourceIndex) {
       refused += 1
       continue
     }
