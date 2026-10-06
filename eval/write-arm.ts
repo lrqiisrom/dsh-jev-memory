@@ -81,6 +81,18 @@ const limit = Number(process.env.WRITE_ARM_LIMIT ?? '20') || 20
  * rather than evidence.
  */
 const runLabel = (process.env.WRITE_ARM_LABEL?.trim() || new Date().toISOString().slice(0, 16).replace(/[:.]/gu, '-')) as string
+
+/**
+ * Where each window's raw answer is kept, the moment it arrives.
+ *
+ * The first version of this harness kept everything in memory and wrote the sheet at the end. A single
+ * `ECONNRESET` on the 400-window run therefore killed the process and **discarded every call it had
+ * already paid for** — the run left no sheet and no partial result, and there was nothing to resume
+ * from. Two fixes came out of that: each call is retried and then tolerated on its own, and the answer
+ * is appended here before anything is parsed. Analysis reads this file, so re-analysing after a
+ * classification change is free, and a re-run skips the windows already answered.
+ */
+const checkpoint = new URL(`../.scratch/write-arm-answers.${runLabel}.jsonl`, import.meta.url).pathname
 /**
  * Which population to draw windows from.
  *
@@ -308,33 +320,79 @@ const unmatched: Array<{ summary: string; source: string; why: string }> = []
 const missed: Array<{ text: string; session: string; seq: number }> = []
 const rowLines: string[] = []
 
+interface Answer {
+  raw: string
+  finish: string
+  ms: number
+}
+
+const answered = new Map<string, Answer>()
+for (const line of (await readFile(checkpoint, 'utf8').catch(() => '')).split('\n')) {
+  if (line.trim() === '') continue
+  try {
+    const record = JSON.parse(line) as { window?: string } & Partial<Answer>
+    if (typeof record.window === 'string' && typeof record.raw === 'string') {
+      answered.set(record.window, { raw: record.raw, finish: String(record.finish ?? 'unknown'), ms: Number(record.ms ?? 0) })
+    }
+  } catch {
+    /* a half-written last line from an interrupted run is dropped, and that window is asked again */
+  }
+}
+if (answered.size > 0) console.log(`续跑：checkpoint 里已有 ${answered.size} 个窗口的答案，不再重复调用`)
+
+/** One call, retried once, tolerated if it still fails. A reset must cost one window, not the run. */
+async function askOnce(messages: Array<{ seq: number; role: string; text: string }>): Promise<Answer | null> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const started = Date.now()
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: MODEL_WRITE_SYSTEM },
+            { role: 'user', content: buildModelWritePrompt(messages) },
+          ],
+          temperature: 0,
+          max_tokens: 1500,
+          thinking: { type: 'disabled' },
+        }),
+      })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const payload = (await response.json()) as Record<string, any>
+      return {
+        raw: String(payload.choices?.[0]?.message?.content ?? ''),
+        finish: String(payload.choices?.[0]?.finish_reason ?? 'unknown'),
+        ms: Date.now() - started,
+      }
+    } catch (error) {
+      if (attempt === 1) {
+        console.log(`  窗口调用失败（已重试一次），跳过：${String(error).slice(0, 90)}`)
+        return null
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+  }
+  return null
+}
+
 for (const entry of sample) {
   const window = shippedWindow(entry.session, entry.seq, ROUNDS, ANSWER_CHARS)
   if (window.length === 0) continue
   const messages = window.map((message) => ({ seq: message.seq, role: message.role, text: message.text }))
-  const started = Date.now()
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: MODEL_WRITE_SYSTEM },
-        { role: 'user', content: buildModelWritePrompt(messages) },
-      ],
-      temperature: 0,
-      max_tokens: 1500,
-      thinking: { type: 'disabled' },
-    }),
-  })
-  if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`)
-  const payload = (await response.json()) as Record<string, any>
-  const raw = String(payload.choices?.[0]?.message?.content ?? '')
-  const ms = Date.now() - started
+  const windowId = `${entry.session.id.slice(-8)}:${entry.seq}`
+  let answer = answered.get(windowId) ?? null
+  if (answer === null) {
+    answer = await askOnce(messages)
+    if (answer === null) continue
+    answered.set(windowId, answer)
+    await appendFile(checkpoint, `${JSON.stringify({ window: windowId, ...answer })}\n`)
+  }
+  const { raw, finish, ms } = answer
   // `unparsable` and `truncated` are different faults with different fixes — one is the prompt, the
   // other is the budget — and they were conflated on the segmentation path once already. The provider
-  // says which one this is; not asking it means guessing.
-  const finish = String(payload.choices?.[0]?.finish_reason ?? 'unknown')
+  // says which one this is (it is in the checkpoint), and not asking it means guessing.
   if (finish !== 'stop') cutOff.push(`seq ${entry.seq}｜finish=${finish}｜窗口 ${window.reduce((sum, message) => sum + message.text.length, 0)} 字｜回答 ${raw.length} 字`)
 
   // Three counts, so every item is attributable: what the answer contained as complete objects, what
