@@ -91,6 +91,7 @@ import {
 } from './lib/recall.ts'
 import { isNoteworthyVeto, screenSentence, signatureOf } from './lib/signals.ts'
 import { archiveId, createMemoryStore, MEMORY_TYPES, recordIdOf, type L0Entry, type MemoryRecord } from './lib/store.ts'
+import { conversationWindowOf } from './lib/window.ts'
 import { ECHO_DEFAULTS, findEcho, type EchoSettings } from './lib/echo.ts'
 import { estimateTokens, excerpt, hashText } from './lib/text.ts'
 import type { Candidate, ExtractOptions, TurnEvent } from './lib/extract.ts'
@@ -1517,54 +1518,6 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
     }
   }
 
-  /**
-   * The conversation a model reads on the write path: the last few **rounds**, oldest first.
-   *
-   * One round is a message the person wrote plus the final answer that followed it. The intermediate
-   * assistant lines and tool traffic of a long turn are deliberately left out: they are what the turn
-   * *did*, not what was said to the person, and including them is what made the old window (the last
-   * five messages) capable of containing nothing the person wrote.
-   *
-   * Walked backwards from the end of the session log so a long session costs five rounds, not its
-   * whole history. Returns null when the session cannot be walked — the caller then keeps the old
-   * message-count window, which is also what its own tests exercise.
-   *
-   * @param session - the session being written from.
-   * @param rounds - how many rounds to include.
-   * @param answerChars - cap on each round's answer; the person's own words are never truncated.
-   * @returns the window in reading order, or null.
-   */
-  function conversationWindowOf(
-    session: SessionLike | null | undefined,
-    rounds: number,
-    answerChars: number,
-  ): Array<{ seq: number; role: string; text: string }> | null {
-    if (!session?.eventAt || rounds <= 0) return null
-    const limit = typeof session.seq === 'number' ? session.seq : 0
-    const collected: Array<{ seq: number; role: string; text: string }> = []
-    // Assistant lines of the round being walked, newest first. The first one collected is that round's
-    // final answer, which is the only one the next round's reader needs.
-    let answers: Array<{ seq: number; text: string }> = []
-    let found = 0
-    for (let seq = limit - 1; seq >= 0 && found < rounds; seq -= 1) {
-      const event = session.eventAt(seq)
-      if (!event) continue
-      const message = archiveMessages([{ ...event, seq } as TurnEvent])[0]
-      if (!message) continue
-      if (message.role === 'assistant') {
-        answers.push({ seq, text: message.text })
-        continue
-      }
-      if (message.role !== 'user') continue
-      collected.push({ seq, role: 'user', text: message.text })
-      const answer = answers[0]
-      if (answer && answerChars > 0) collected.push({ seq: answer.seq, role: 'assistant', text: answer.text.slice(0, answerChars) })
-      answers = []
-      found += 1
-    }
-    return collected.reverse()
-  }
-
   const recallText = (assembleCtx: AssembleContext): string => renderRecallFor(assembleCtx?.agent, 'context').text
 
   ctx.inject(['systemPrompt'], (scope) => {
@@ -1920,7 +1873,18 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
       // The model reads rounds; the fallback is the old message-count window for a session that cannot
       // be walked (and for the tests that drive the hook with a hand-built event list).
       const conversation = conversationWindowOf(
-        agent?.session,
+        typeof agent?.session?.seq === 'number' ? agent.session.seq : null,
+        (seq) => {
+          // The window itself — what a round is, why the walk goes backwards, why the intermediate
+          // assistant lines and tool traffic are dropped — lives in `lib/window.ts`.
+          //
+          // Normalized lazily, newest first: the walk stops after `rounds` rounds, so a session with a
+          // long history costs the rounds it reads rather than the events it holds.
+          const event = agent?.session?.eventAt?.(seq)
+          if (!event) return null
+          const message = archiveMessages([{ ...event, seq } as TurnEvent])[0]
+          return message ? { seq, role: message.role, text: message.text } : null
+        },
         config.conversationWindow.rounds,
         config.conversationWindow.answerChars,
       )

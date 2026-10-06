@@ -60,6 +60,8 @@ import {
   explainModelWrite,
   readCompleteObjects,
 } from '../dsh/lib/modelwrite.ts'
+import { answerFailure } from '../dsh/lib/normalize.ts'
+import { conversationWindowOf } from '../dsh/lib/window.ts'
 import { parseCsvRecords } from './lib/csv.ts'
 import { readSessions, type Session } from './lib/sessions.ts'
 
@@ -131,30 +133,16 @@ for (const session of sessions) {
 /**
  * The window the plugin would have handed the model, ending at `endSeq`.
  *
- * A faithful copy of `conversationWindowOf` in `dsh/index.ts`, which is a closure and cannot be
- * imported. Walking backwards: an assistant message is a candidate answer, and the first user message
- * ends a round, taking the *newest* answer collected so far as that round's reply. Copied rather than
- * approximated because the window shape was measured, and a different shape measures a different thing.
+ * Calls the shipped walk directly. It used to be a hand copy, which is how the harness and the plugin
+ * could disagree about the window without anything noticing — and the copy is what reproduced the
+ * ordering bug faithfully enough to make it look like the plugin's own behaviour rather than a
+ * transcription of it.
  */
 function shippedWindow(session: Session, endSeq: number, rounds: number, answerChars: number): Array<{ seq: number; role: string; text: string }> {
-  const upto = session.messages.filter((message) => message.seq <= endSeq)
-  const collected: Array<{ seq: number; role: string; text: string }> = []
-  let answers: Array<{ seq: number; text: string }> = []
-  let found = 0
-  for (let index = upto.length - 1; index >= 0 && found < rounds; index -= 1) {
-    const message = upto[index]!
-    if (message.role === 'assistant') {
-      answers.push({ seq: message.seq, text: message.text })
-      continue
-    }
-    if (message.role !== 'user') continue
-    collected.push({ seq: message.seq, role: 'user', text: message.text })
-    const answer = answers[0]
-    if (answer && answerChars > 0) collected.push({ seq: answer.seq, role: 'assistant', text: answer.text.slice(0, answerChars) })
-    answers = []
-    found += 1
-  }
-  return collected.reverse()
+  const at = new Map(session.messages.map((message) => [message.seq, message]))
+  const last = session.messages.filter((message) => message.seq <= endSeq).map((message) => message.seq)
+  const current = last.length > 0 ? Math.max(...last) + 1 : null
+  return conversationWindowOf(current, (seq) => at.get(seq) ?? null, rounds, answerChars) ?? []
 }
 
 /** Character overlap between two strings, by the longest common run — enough here, and symmetric. */
@@ -329,11 +317,16 @@ for (const entry of sample) {
   const rawCount = readCompleteObjects(raw).values?.length ?? 0
   const decided = explainModelWrite(raw, messages)
   const accepted = decided.items ?? []
+  // The reason the *ledger* would carry, not the parser's own word. The caller maps a parse failure onto
+  // what actually happened — `finish: length` is a budget fault and `unparsable` is a prompt fault — and
+  // a harness that skips that mapping reports a different reason for the same event, which is how a
+  // truncation stops being countable.
+  const reason = decided.reason === 'unparsable' ? (answerFailure({ finish, text: raw, reasoningChars: 0 }) ?? decided.reason) : decided.reason
   if (decided.items === null) {
     refusals += 1
     // What a whole-answer refusal actually looked like, because `unparsable` covers "no JSON at all"
     // and "JSON that one escaping slip broke" and they need different fixes.
-    wholeRefusals.push(`seq ${entry.seq}｜${decided.reason}｜${raw.slice(0, 220).replace(/\s+/gu, ' ')}`)
+    wholeRefusals.push(`seq ${entry.seq}｜${reason}｜${raw.slice(0, 220).replace(/\s+/gu, ' ')}`)
   }
   const writeable: typeof accepted = []
   for (const item of accepted) {
@@ -364,7 +357,7 @@ for (const entry of sample) {
 
   rowLines.push(
     `\n## 窗口 ${entry.session.id.slice(-12)}… 结束于 seq ${entry.seq}｜${ms}ms｜finish=${finish}｜完整项 ${rawCount} → 解析留 ${accepted.length} → 该写 ${writeable.length}` +
-      (decided.items === null ? `（整份被拒：${decided.reason}）` : ''),
+      (decided.items === null ? `（整份被拒：${reason}）` : ''),
   )
 
   const touched = new Set<string>()
