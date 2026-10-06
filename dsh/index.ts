@@ -2329,11 +2329,16 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         const judgement = rows.find((row) => row.key === candidate.key)
         if (skippedPairs.has(candidate.key)) {
           // The relationship said this sentence adds nothing the stored one does not already say.
+          //
+          // The partner is read from *either* source. It was read from the deterministic one alone, so
+          // when the model named the partner on the follow-up (`related-follow-up`) this line recorded
+          // `with: null` — while the pair decision written the same second knew the id. A skip line that
+          // cannot say what it collided with is not auditable, which is the only reason it exists.
           void store.ledger({
             kind: 'skip',
             reason: 'pair-duplicate',
             id: recordIdOf(candidate.text),
-            with: partners.get(candidate.key)?.id ?? null,
+            with: (partners.get(candidate.key) ?? knownPartnerOf.get(candidate.key))?.id ?? null,
             quote: excerpt(candidate.quote, 120),
           })
           continue

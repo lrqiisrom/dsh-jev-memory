@@ -2340,3 +2340,82 @@ test('an unsure conflict probability asks the person, and the record waits in ne
     globalThis.fetch = realFetch
   }
 })
+
+test('a duplicate found through the follow-up names the memory it duplicates', async () => {
+  // The `related` follow-up is the branch where the model names a partner the deterministic search
+  // could not find by wording. It had no test at all, which is how its ledger line came to record
+  // `with: null` — the pair decision written in the same second knew the id, and the skip line that
+  // exists to be audited did not. Both places now read the partner from either source.
+  const realFetch = globalThis.fetch
+  let sawRelated = false
+  let followUpPairs = 0
+  const shapes: string[] = []
+  globalThis.fetch = (async (_url: string, init?: { body?: unknown }) => {
+    const body = JSON.parse(String(init?.body ?? '{}')) as { questions?: Record<string, unknown> }
+    const questions = body.questions ?? {}
+    shapes.push(Object.keys(questions).join('|'))
+    // A real response carries every answer for the candidates in that request. An earlier version of
+    // this stub returned only the `related` answer, which made the parser skip the candidate entirely —
+    // one answer present is not the same as an answer to one question.
+    const base = {
+      'remember:0': { type: 'noul', noul: 0.95 },
+      'type:0': { type: 'choice', choice: 'constraint', confidence: 0.9 },
+      'importance:0': { type: 'score', score: 4, legend: {}, confidence: 0.9 },
+    }
+    const json = (answers: Record<string, unknown>): Response =>
+      new Response(JSON.stringify({ model: 'jev-1.13.0', answers }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    if (questions['related:0']) {
+      sawRelated = true
+      // No `pair` question in this request: the deterministic search found nothing by wording, so the
+      // model is asked which stored memory this is about. Answering `m0` is what triggers the follow-up.
+      assert.equal(questions['pair:0'], undefined, 'the first request found no partner by wording')
+      return json({ ...base, 'related:0': { type: 'choice', choice: 'm0', confidence: 0.9 } })
+    }
+    // The follow-up is a request of its own, and it names its question differently from the
+    // relationship that travels inside the first request: `pair` here, `pair:0` there. A stub that
+    // knows only one of the two answers the other with the base questions, which looks like the model
+    // declining to answer and leaves the candidate written rather than dropped.
+    if (questions.pair) {
+      followUpPairs += 1
+      return json({
+        pair: {
+          type: 'choice',
+          choice: 'same-duplicate',
+          probabilities: { 'same-duplicate': 0.9, different: 0.05, 'same-update': 0.05 },
+          confidence: 0.9,
+        },
+      })
+    }
+    return json(base)
+  }) as unknown as typeof fetch
+  try {
+    const { root, captured } = await mount({ judge: 'auto', jev: { apiKey: 'test-key' } })
+    const session = fakeSession({ events: [] })
+    const seeded = await toolFor<WriteArgs, MemoryWriteResult>(captured, 'memory_write').execute(
+      { text: 'README 里的截图要注明来源。', type: 'constraint' },
+      { agent: { session } },
+    )
+    await listenerFor(captured, 'agent/turn-stopping')({
+      agent: { id: 's1', session: fakeSession({ events: turnWith('配图必须写清楚出处。') }) },
+      turn: 1,
+      signal: undefined,
+    })
+    await settle()
+
+    assert.equal(sawRelated, true, 'the follow-up path was the one that ran')
+    const all = await ledgerEntries(root)
+    assert.equal(
+      followUpPairs,
+      1,
+      `and the relationship was asked there, once（请求形状：${shapes.join(' / ')}）\n台账：${JSON.stringify(all, null, 1)}`,
+    )
+    const skips = (await ledgerEntries(root)).filter((entry) => entry.reason === 'pair-duplicate')
+    assert.equal(skips.length, 1, 'the duplicate was dropped rather than stored')
+    assert.equal(skips[0]?.with, seeded.id, 'and the line names the memory it duplicates')
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
