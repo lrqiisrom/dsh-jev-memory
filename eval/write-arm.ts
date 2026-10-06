@@ -49,7 +49,7 @@
  * @module eval/write-arm
  */
 
-import { readFile, readdir, writeFile, mkdir } from 'node:fs/promises'
+import { appendFile, readFile, readdir, writeFile, mkdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -71,6 +71,16 @@ if (process.env.DSH_LIVE_ROUTE !== 'yes') {
 }
 
 const limit = Number(process.env.WRITE_ARM_LIMIT ?? '20') || 20
+/**
+ * Names this run's outputs, so a run never overwrites the evidence for an earlier one.
+ *
+ * The first version wrote `review1.csv` every time, which meant the comparison between two scopes
+ * destroyed the artifact it was comparing against: the 82-row sheet was gone the moment the 17-row one
+ * was written, and the only record of the larger number was a commit message. Reproduction needs the
+ * earlier run to still exist — and once a sheet has labels in it, overwriting it would destroy work
+ * rather than evidence.
+ */
+const runLabel = (process.env.WRITE_ARM_LABEL?.trim() || new Date().toISOString().slice(0, 16).replace(/[:.]/gu, '-')) as string
 /**
  * Which population to draw windows from.
  *
@@ -519,6 +529,29 @@ lines.push(`- 请求与发货路径同形：同一 system、同 ${ROUNDS} 轮窗
 lines.push('- 窗口按"结束于某条标注行所在的位置"取，所以样本必然含标注；随机窗口的映射率不适用这个口径。')
 lines.push(`- 对上与否用"最长公共片段 ÷ 较短一方 ≥ ${MATCH_FLOOR}"判定，纯机械、可复现；换阈值会改变映射率，所以阈值写在报告里。`)
 lines.push('- 只跑一发，样本小，**这些数不能当结论**；它要回答的是"映射率能不能支撑后面的评测"。')
+// Append-only, so the numbers of every run survive even when the sheets are deleted. It carries
+// session ids, which is why it lives in the gitignored scratch directory rather than in the repo.
+const runLog = new URL('../.scratch/write-arm-runs.jsonl', import.meta.url).pathname
+await appendFile(
+  runLog,
+  `${JSON.stringify({
+    at: new Date().toISOString(),
+    label: runLabel,
+    sampling,
+    seed,
+    limit,
+    population: population.length,
+    sample: sample.map((turn) => `${turn.session.id.slice(-8)}:${turn.seq}`),
+    parsed: produced + Object.values(whyNotWritten).reduce((sum, value) => sum + value, 0),
+    written: produced,
+    whichNotWritten: whyNotWritten,
+    refusals,
+    cutOff: cutOff.length,
+    unmatched: unmatched.length,
+    windowOrder: 'user-then-answer',
+  })}\n`,
+)
+
 await mkdir(new URL('../.scratch/', import.meta.url).pathname, { recursive: true })
 await writeFile(outFile, lines.join('\n'))
 
@@ -543,10 +576,10 @@ if (process.env.WRITE_ARM_REVIEW === 'yes') {
       .map((value) => csvField(value))
       .join(','),
   )
-  const reviewFile = join(labelDir, 'review1.csv')
+  const reviewFile = join(labelDir, `review-${runLabel}.csv`)
   await writeFile(reviewFile, `${header.join(',')}\n${body.join('\n')}\n`)
   const written = reviewRows.filter((row) => row.arm === 'written').length
-  console.log(`\n复核表已写出 ${reviewFile}`)
+  console.log(`\n复核表已写出 ${reviewFile}（本次运行标记 ${runLabel}）`)
   console.log(`  ${reviewRows.length} 行：插件要留的 ${written} 条、插件丢掉的 ${reviewRows.length - written} 条`)
   console.log('  只填 label 列：1 该留、0 不该留、? 拿不准；note 列可写理由。')
   console.log('  注意：这张表只能查出"模型提到过但判错了的"，它没法发现模型压根没提到的记忆。')

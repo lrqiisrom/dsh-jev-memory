@@ -45,8 +45,17 @@ interface Row {
   label: string
 }
 
+// One sheet at a time, and it says which. Summing `review*.csv` would add up two runs over the same
+// windows and count them twice, and after a scope change the two runs are not even the same question.
+const requested = process.env.REVIEW_FILE?.trim() ?? ''
+const available = (await readdir(labelDir)).filter((name) => /^review.*\.csv$/u.test(name)).sort()
+const files = requested === '' ? available.slice(-1) : available.filter((name) => name === requested)
+if (files.length === 0) {
+  console.log(requested === '' ? '没有找到复核表。' : `没有找到 ${requested}。现有：${available.join('、') || '（无）'}`)
+  process.exit(0)
+}
+
 const rows: Row[] = []
-const files = (await readdir(labelDir)).filter((name) => /^review\d+\.csv$/u.test(name)).sort()
 for (const name of files) {
   for (const record of parseCsvRecords(await readFile(join(labelDir, name), 'utf8'))) {
     rows.push({
@@ -64,7 +73,7 @@ const decided = rows.filter((row) => row.label === '1' || row.label === '0')
 const unsure = rows.filter((row) => row.label === '?')
 const blank = rows.filter((row) => row.label !== '1' && row.label !== '0' && row.label !== '?')
 
-console.log(`复核表 ${files.length} 份｜共 ${rows.length} 行`)
+console.log(`复核表 ${files.join('、')}｜共 ${rows.length} 行`)
 console.log(`已判 ${decided.length}（该留 ${decided.filter((row) => row.label === '1').length}、不该留 ${decided.filter((row) => row.label === '0').length}）｜拿不准 ${unsure.length}｜还没填 ${blank.length}`)
 
 if (decided.length === 0) {
@@ -96,7 +105,7 @@ const keptTotal = keptRight + keptWrong
 const pct = (part: number, whole: number): string => (whole === 0 ? '—' : `${((part / whole) * 100).toFixed(0)}%`)
 
 const lines: string[] = ['# 复核表计分：模型提出的那些条目，判得对不对', '']
-lines.push(`复核表 ${files.length} 份｜已判 ${decided.length} 行（该留 ${shouldKeep}、不该留 ${decided.length - shouldKeep}）`)
+lines.push(`复核表 ${files.join('、')}｜已判 ${decided.length} 行（该留 ${shouldKeep}、不该留 ${decided.length - shouldKeep}）`)
 lines.push('')
 lines.push('| | 人判该留 | 人判不该留 |')
 lines.push('|---|---|---|')
