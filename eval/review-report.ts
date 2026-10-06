@@ -43,6 +43,8 @@ interface Row {
   why: string
   text: string
   label: string
+  /** Jev's answer to the shipped question, when `eval/jev-column.ts` has asked it. */
+  jev: number | null
 }
 
 // One sheet at a time, and it says which. Summing `review*.csv` would add up two runs over the same
@@ -58,6 +60,7 @@ if (files.length === 0) {
 const rows: Row[] = []
 for (const name of files) {
   for (const record of parseCsvRecords(await readFile(join(labelDir, name), 'utf8'))) {
+    const jev = Number((record.jev_noul ?? '').trim())
     rows.push({
       file: name,
       row: record.row ?? '',
@@ -65,6 +68,7 @@ for (const name of files) {
       why: (record.why ?? '').trim(),
       text: record.text ?? '',
       label: (record.label ?? '').trim(),
+      jev: (record.jev_noul ?? '').trim() !== '' && Number.isFinite(jev) ? jev : null,
     })
   }
 }
@@ -115,6 +119,32 @@ lines.push('')
 lines.push(`- **写对率** = 记对 / 插件留的 = ${keptRight} / ${keptTotal} = **${pct(keptRight, keptTotal)}**（沉淀下来的里面有多少是对的）`)
 lines.push(`- **该留覆盖率** = 记对 / 人判该留的 = ${keptRight} / ${shouldKeep} = **${pct(keptRight, shouldKeep)}**`)
 lines.push('')
+// The second arm, when the sheet carries one. Same rows, same labels, a different decision rule — so
+// the two are compared on identical material and no new labelling is needed. The threshold is swept
+// rather than fixed because Jev's score distribution depends on what it is shown, and this column
+// shows it something the shipped threshold was not tuned on.
+const withJev = decided.filter((row) => row.jev !== null)
+if (withJev.length > 0) {
+  lines.push('## 换成 Jev 判：同一条目、同一批标注')
+  lines.push('')
+  lines.push('问句用的是线上那条（`REMEMBER_QUESTION`），输入是**总结 + 它引的原话**。只换了判的人。')
+  lines.push('')
+  lines.push('| Jev 门槛 | 它留下几条 | 记对 | 误记 | 漏记 | 写对率 | 该留覆盖率 |')
+  lines.push('|---|---|---|---|---|---|---|')
+  for (const threshold of [0.12, 0.2, 0.3, 0.5]) {
+    const kept = withJev.filter((row) => row.jev! >= threshold)
+    const tp = kept.filter((row) => row.label === '1').length
+    const fp = kept.filter((row) => row.label === '0').length
+    const fn = withJev.filter((row) => row.label === '1' && row.jev! < threshold).length
+    lines.push(
+      `| ${threshold} | ${kept.length} / ${withJev.length} | ${tp} | ${fp} | ${fn} | **${pct(tp, tp + fp)}** | ${pct(tp, tp + fn)} |`,
+    )
+  }
+  lines.push('')
+  lines.push(`对照：现在的规则在同一批 ${decided.length} 行上留下 ${keptTotal} 条、记对 ${keptRight}、误记 ${keptWrong}、漏记 ${droppedWrong}。`)
+  lines.push('')
+}
+
 lines.push('## 判错的那些')
 lines.push('')
 for (const item of wrong) lines.push(`- ${item}`)

@@ -1,0 +1,142 @@
+/**
+ * Ask Jev, row by row, whether the memory a row describes is worth keeping.
+ *
+ * The proposal this exists to test: the write path's model writes the summary, and Jev — a service
+ * built for exactly this kind of verdict — decides whether to keep it. What it would replace is the
+ * current rule, which is a **conjunction** (the model said it was worth it *and* the type is in a
+ * whitelist). The last attempt to compose a conjunction like that is on record: two independent
+ * thresholds had to line up, and when the judge was given more context its scores shifted down until
+ * none of the eighteen positives cleared the second one and the gate wrote nothing at all.
+ *
+ * Three deliberate choices, each with a reason that is not "it was easy":
+ *
+ *  - **The question is the shipped one, verbatim.** `REMEMBER_QUESTION` is what the frozen
+ *    sentence-level baseline was measured against, so this column is comparable with it. What changes
+ *    is the input, not the standard — a new question would move the score distribution and make every
+ *    threshold on the old table meaningless.
+ *  - **The input is the summary *plus the verbatim span it quotes*.** Judging the summary alone asks
+ *    whether it reads like a fact; the standard is whether *this person* asserted it, and only the
+ *    source can show that. The source travels in `recent_conversation`, which is the field for "what
+ *    was being discussed", so the question's subject stays the summary exactly as the shipped question
+ *    expects it. Measured context for that choice: feeding the judge a *cleaned* sentence instead of
+ *    the raw one did not help it (AUC 0.62 → 0.61, positives clearing the threshold 15/18 → 12/18), so
+ *    whatever this column earns has to come from the summary being a better unit to judge, not from it
+ *    being tidier prose.
+ *  - **The answer is stored as the probability, not a verdict.** The shipped threshold (0.12) was
+ *    tuned on a different input; baking it in here would hide the one thing worth looking at. The
+ *    scorer sweeps it.
+ *
+ * Resumable: rows that already carry a value are skipped, so an interrupted run does not pay twice.
+ *
+ * Run:
+ *   TYPESAFE_API_KEY=... node eval/jev-column.ts
+ *   REVIEW_FILE=review-xxx.csv JEV_LIMIT=20 node eval/jev-column.ts
+ *
+ * @module eval/jev-column
+ */
+
+import { readFile, readdir, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+import { createJevClient, JEV_DEFAULTS, REMEMBER_QUESTION } from '../dsh/lib/jev.ts'
+import { csvField, parseCsv } from './lib/csv.ts'
+import { readSessions } from './lib/sessions.ts'
+
+const labelDir = new URL('./labels/', import.meta.url).pathname
+const requested = process.env.REVIEW_FILE?.trim() ?? ''
+const available = (await readdir(labelDir)).filter((name) => /^review.*\.csv$/u.test(name)).sort()
+const file = requested === '' ? available[available.length - 1] : requested
+if (file === undefined || !available.includes(file)) {
+  console.log(`没有找到复核表。现有：${available.join('、') || '（无）'}`)
+  process.exit(0)
+}
+const limit = Number(process.env.JEV_LIMIT ?? '0') || 0
+
+const path = join(labelDir, file)
+const records = parseCsv(await readFile(path, 'utf8'))
+const header = records[0] ?? []
+const at = (name: string): number => header.indexOf(name)
+if (at('text') < 0 || at('window') < 0) throw new Error(`${file} 里找不到 text / window 列`)
+const valueAt = at('jev_noul')
+if (valueAt < 0) {
+  header.push('jev_noul')
+  for (const cells of records.slice(1)) while (cells.length < header.length) cells.push('')
+}
+
+/** The workspace, so the judge applies the standard it applies live: *this project's* conventions. */
+const sessions = await readSessions()
+const cwdBySuffix = new Map<string, string | null>()
+for (const session of sessions) cwdBySuffix.set(session.id.slice(-8), session.cwd)
+
+// The credential document, which is how the plugin itself resolves this key when the environment does
+// not carry it. Without this the tool only works if the caller exports the variable — and a harness
+// that needs a variable the plugin does not need is a harness that silently reports "not configured".
+const home = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')
+const credentials = await readFile(join(home, '.credentials.yaml'), 'utf8').catch(() => '')
+const documentKey = /TYPESAFE_API_KEY:\s*(\S+)/u.exec(credentials)?.[1] ?? ''
+
+const jev = createJevClient({
+  config: { model: JEV_DEFAULTS.model, rememberQuestion: REMEMBER_QUESTION },
+  env: process.env,
+  resolveApiKey: async () => {
+    const fromEnv = process.env.TYPESAFE_API_KEY?.trim()
+    if (fromEnv) return fromEnv
+    return documentKey === '' ? undefined : { key: documentKey, source: 'credential-document' }
+  },
+})
+
+let filled = 0
+let skipped = 0
+let failed = 0
+for (const cells of records.slice(1)) {
+  const index = records.indexOf(cells)
+  const already = (cells[valueAt] ?? '').trim()
+  if (already !== '') {
+    skipped += 1
+    continue
+  }
+  if (limit > 0 && filled >= limit) break
+  const summary = cells[at('text')] ?? ''
+  const source = cells[at('source')] ?? ''
+  const suffix = (cells[at('window')] ?? '').split(':')[0] ?? ''
+  const project = cwdBySuffix.get(suffix) ?? null
+  try {
+    const result = await jev.decide({
+      candidates: [{ key: `r${index}`, text: summary, hintedType: cells[at('type')] || null, signalScore: 1, signals: [] }],
+      types: ['constraint', 'pitfall', 'decision'],
+      known: [],
+      partners: [],
+      project,
+      // The person's own words, for the reason in the header: the question is whether they asserted it.
+      conversation: source === '' ? [] : [source],
+    })
+    const probability = result.rows[0]?.remember
+    if (typeof probability !== 'number' || !Number.isFinite(probability)) {
+      failed += 1
+      continue
+    }
+    while (cells.length < header.length) cells.push('')
+    cells[valueAt] = probability.toFixed(3)
+    filled += 1
+    process.stdout.write(`\r已问 ${filled} 条（跳过 ${skipped}、失败 ${failed}）`)
+  } catch (error) {
+    failed += 1
+    console.log(`\n第 ${index} 行失败：${String(error).slice(0, 120)}`)
+  }
+}
+
+console.log('')
+await writeFile(path, `${records.map((cells) => cells.map((value) => csvField(value ?? '')).join(',')).join('\n')}\n`)
+console.log(`已写回 ${path}（新填 ${filled}、跳过 ${skipped}、失败 ${failed}）`)
+
+const values = records
+  .slice(1)
+  .map((cells) => Number((cells[valueAt] ?? '').trim()))
+  .filter((value) => Number.isFinite(value))
+const share = (threshold: number): string => {
+  const kept = values.filter((value) => value >= threshold).length
+  return `${kept}/${values.length}`
+}
+console.log(`\nJev 判"值得"的比例，按不同门槛：0.12 → ${share(0.12)}｜0.3 → ${share(0.3)}｜0.5 → ${share(0.5)}`)
+console.log('复核表当前插件留下的比例，可以对照着看 arm 列。')

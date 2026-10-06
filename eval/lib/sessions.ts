@@ -14,6 +14,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -37,6 +38,21 @@ export interface Session {
   messages: SessionMessage[]
   /** extractor id → the message it came from, so a labelled row can be located. */
   keyToSeq: Map<string, number>
+  /**
+   * The workspace the session ran in, or null when it cannot be established.
+   *
+   * Carried because the write path hands it to the judge (`project` in the request), and the standard
+   * being applied is "this project's conventions, lessons and trade-offs" — a judgement made without
+   * it is answering a slightly different question.
+   *
+   * The sessions directory names the workspace in an encoded form (`--Users-rom-Documents-projectSDK--`,
+   * with non-ASCII as `~hex~`), and decoding is ambiguous: a directory whose own name contains a dash
+   * is indistinguishable from a path separator, so `blarify-main` decodes to `blarify/main`. It is
+   * decoded anyway and then **checked against the filesystem** — a path that exists is right, and a
+   * path that does not is dropped rather than passed on. A judge told the name of a project that does
+   * not exist is worse off than a judge told nothing.
+   */
+  cwd: string | null
 }
 
 /** Read one multi-frame zstd log through the CLI the harvester already depends on. */
@@ -64,9 +80,10 @@ function textOf(content: unknown): string {
  * @param id - the session id, for the returned record.
  * @returns the session.
  */
-export function parseSession(raw: string, id: string): Session {
+export function parseSession(raw: string, id: string, workspace: string | null = null): Session {
   const messages: SessionMessage[] = []
   const keyToSeq = new Map<string, number>()
+  let cwd: string | null = null
   let turn: Array<{ seq: number; type: string; data: unknown }> = []
   // **Session-global**, not per-turn. Resetting it at every `turn/start` looked harmless and was
   // not: `seq` is used to find a message again (`messages.findIndex(m => m.seq === seq)`), and a
@@ -116,13 +133,30 @@ export function parseSession(raw: string, id: string): Session {
     seq += 1
   }
   flush()
-  return { id, messages, keyToSeq }
+  return { id, messages, keyToSeq, cwd: workspace }
+}
+
+/**
+ * Turn a sessions-directory name into the workspace path, but only when the filesystem agrees.
+ *
+ * @param name - the directory name, such as `--Users-rom-Documents-projectSDK--`.
+ * @returns the path when it exists, otherwise null.
+ */
+export function decodeWorkspace(name: string): string | null {
+  const body = name.replace(/^--/u, '').replace(/--$/u, '')
+  const unescaped = body.replace(/~([0-9A-Fa-f]{4,6})~/gu, (_match, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+  const path = `/${unescaped.replace(/-/gu, '/')}`
+  try {
+    return existsSync(path) ? path : null
+  } catch {
+    return null
+  }
 }
 
 /** Every session log under the harness home, newest generation per session, child sessions skipped. */
 export async function readSessions(options: { max?: number; includeChildren?: boolean } = {}): Promise<Session[]> {
   const root = join(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh'), 'sessions')
-  const files: Array<{ file: string; id: string }> = []
+  const files: Array<{ file: string; id: string; workspace: string }> = []
   for (const workspace of await readdir(root)) {
     let ids: string[] = []
     try {
@@ -140,7 +174,7 @@ export async function readSessions(options: { max?: number; includeChildren?: bo
       }
       const logs = entries.filter((name) => name.startsWith('session') && name.endsWith('.jsonl.zstd')).sort()
       const best = logs[logs.length - 1]
-      if (best) files.push({ file: join(dir, best), id })
+      if (best) files.push({ file: join(dir, best), id, workspace })
     }
   }
   const out: Session[] = []
@@ -159,7 +193,7 @@ export async function readSessions(options: { max?: number; includeChildren?: bo
     } catch {
       /* a log without a readable header is treated as a normal session */
     }
-    out.push(parseSession(raw, file.id))
+    out.push(parseSession(raw, file.id, decodeWorkspace(file.workspace)))
   }
   return out
 }
