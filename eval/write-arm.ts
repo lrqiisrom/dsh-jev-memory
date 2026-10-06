@@ -62,7 +62,7 @@ import {
 } from '../dsh/lib/modelwrite.ts'
 import { answerFailure } from '../dsh/lib/normalize.ts'
 import { conversationWindowOf } from '../dsh/lib/window.ts'
-import { parseCsvRecords } from './lib/csv.ts'
+import { csvField, parseCsvRecords } from './lib/csv.ts'
 import { readSessions, type Session } from './lib/sessions.ts'
 
 if (process.env.DSH_LIVE_ROUTE !== 'yes') {
@@ -271,6 +271,24 @@ let kept = 0
 /** Why an item the parser accepted is still not written. Three very different stories, kept apart. */
 const whyNotWritten = { who: 0, worth: 0, type: 0 }
 const rejectedExamples: string[] = []
+/**
+ * Every item the model proposed, with the plugin's verdict on it, for a person to judge.
+ *
+ * The model has already done the extraction, so the question put to the person is one yes/no per row
+ * rather than a re-reading of the corpus: of the things it wanted to keep and the things it threw
+ * away, which were right? That is the only way to reach the miss rate — nothing else can tell whether
+ * a `worth=false` refusal cost a memory.
+ */
+const reviewRows: Array<{
+  arm: 'written' | 'refused'
+  why: string
+  who: string
+  worth: boolean
+  type: string
+  text: string
+  source: string
+  window: string
+}> = []
 /** Answers that hit the token ceiling instead of finishing: a budget fault, not a prompt fault. */
 const cutOff: string[] = []
 const wholeRefusals: string[] = []
@@ -334,21 +352,38 @@ for (const entry of sample) {
     // the model attributed the line to itself or to a paste, `worth` says the model judged it not
     // worth keeping, and `type` says the type whitelist refused a line the model *did* call worth
     // keeping. Reporting one combined number hides which of the three is doing the damage.
+    const itemSource = messages[item.messageIndex]?.text.slice(item.start, item.end) ?? ''
+    const row = (arm: 'written' | 'refused', why: string): void => {
+      reviewRows.push({
+        arm,
+        why,
+        who: item.who,
+        worth: item.worth,
+        type: item.type,
+        text: item.summary,
+        source: itemSource,
+        window: `${entry.session.id.slice(-8)}:${entry.seq}`,
+      })
+    }
     if (item.who !== 'user') {
       whyNotWritten.who += 1
       if (rejectedExamples.length < 8) rejectedExamples.push(`who=${item.who}｜${item.summary.slice(0, 60)}`)
+      row('refused', `who=${item.who}`)
       continue
     }
     if (!item.worth) {
       whyNotWritten.worth += 1
       if (rejectedExamples.length < 8) rejectedExamples.push(`worth=false｜${item.summary.slice(0, 60)}`)
+      row('refused', 'worth=false')
       continue
     }
     if (!(WRITE_TYPES as readonly string[]).includes(item.type)) {
       whyNotWritten.type += 1
       if (rejectedExamples.length < 8) rejectedExamples.push(`type=${item.type}｜${item.summary.slice(0, 60)}`)
+      row('refused', `type=${item.type}`)
       continue
     }
+    row('written', '')
     writeable.push(item)
   }
   produced += writeable.length
@@ -486,4 +521,34 @@ lines.push(`- 对上与否用"最长公共片段 ÷ 较短一方 ≥ ${MATCH_FLO
 lines.push('- 只跑一发，样本小，**这些数不能当结论**；它要回答的是"映射率能不能支撑后面的评测"。')
 await mkdir(new URL('../.scratch/', import.meta.url).pathname, { recursive: true })
 await writeFile(outFile, lines.join('\n'))
+
+if (process.env.WRITE_ARM_REVIEW === 'yes') {
+  // Written where the other measuring batches live, and for the same reason they are gitignored: every
+  // row is real session text. `label` is the column to fill — 1 该留, 0 不该留, ? 拿不准.
+  const header = ['row', 'window', 'arm', 'why', 'who', 'worth', 'type', 'text', 'source', 'label', 'note']
+  const body = reviewRows.map((row, index) =>
+    [
+      String(index + 1),
+      row.window,
+      row.arm,
+      row.why,
+      row.who,
+      String(row.worth),
+      row.type,
+      row.text,
+      row.source,
+      '',
+      '',
+    ]
+      .map((value) => csvField(value))
+      .join(','),
+  )
+  const reviewFile = join(labelDir, 'review1.csv')
+  await writeFile(reviewFile, `${header.join(',')}\n${body.join('\n')}\n`)
+  const written = reviewRows.filter((row) => row.arm === 'written').length
+  console.log(`\n复核表已写出 ${reviewFile}`)
+  console.log(`  ${reviewRows.length} 行：插件要留的 ${written} 条、插件丢掉的 ${reviewRows.length - written} 条`)
+  console.log('  只填 label 列：1 该留、0 不该留、? 拿不准；note 列可写理由。')
+  console.log('  注意：这张表只能查出"模型提到过但判错了的"，它没法发现模型压根没提到的记忆。')
+}
 console.log(`\n详细写在 ${outFile}`)
