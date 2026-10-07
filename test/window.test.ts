@@ -60,6 +60,52 @@ test('an answer is capped and the question never is', () => {
   assert.deepEqual(conversationWindowOf(source.current, source.at, 1, 0)?.[1], undefined)
 })
 
+test('a wider cap for the newest rounds is off unless it is asked for', () => {
+  // The shipped window is one flat cap. The wider cap exists for the provenance experiment — a person
+  // quoting the answer they just read leaves the extraction model unable to mark it as a quotation when
+  // the sentence is not in the window (14 of 15 verbatim echoes sat past the 200th character of the
+  // answer they came from). Passing no `recentAnswers` must leave the shipped shape untouched.
+  const source = reader(ROUNDS)
+  assert.deepEqual(
+    conversationWindowOf(source.current, source.at, 5, 4)?.map((message) => message.text),
+    conversationWindowOf(source.current, source.at, 5, 4, { rounds: 0, chars: Infinity })?.map((message) => message.text),
+    'omitting it is the same as applying it to no round at all',
+  )
+})
+
+test('the wider cap reaches exactly the newest N rounds', () => {
+  const source = reader(ROUNDS)
+  const widened = conversationWindowOf(source.current, source.at, 5, 4, { rounds: 1, chars: Infinity })
+  assert.deepEqual(
+    widened?.map((message) => message.text),
+    ['第一个问题', '第一个回', '第二个问题', '第二个回', '第三个问题', '第三个回答'],
+    'only the answer to the newest question is whole; the older ones stay at the flat cap',
+  )
+  const two = conversationWindowOf(source.current, source.at, 5, 4, { rounds: 2, chars: Infinity })
+  assert.deepEqual(
+    two?.map((message) => message.text),
+    ['第一个问题', '第一个回', '第二个问题', '第二个回答', '第三个问题', '第三个回答'],
+  )
+})
+
+test('the wider cap counts answers, not rounds', () => {
+  // The newest round in a real window is the turn being answered, and it has no answer yet — the hook
+  // runs at the end of the turn. Counting rounds spent the whole widening on that empty round, so an
+  // arm built with `rounds: 1` came out byte-identical to the shipped window while looking like a
+  // successful experiment. This fixture is that shape: 刚问的 has nothing after it.
+  const open: WindowMessage[] = [
+    { seq: 0, role: 'user', text: '旧问题' },
+    { seq: 1, role: 'assistant', text: '旧回答'.repeat(200) },
+    { seq: 2, role: 'user', text: '刚问的' },
+  ]
+  const source = reader(open)
+  assert.deepEqual(
+    conversationWindowOf(source.current, source.at, 5, 4, { rounds: 1, chars: Infinity })?.map((m) => m.text),
+    ['旧问题', '旧回答'.repeat(200), '刚问的'],
+    'the widening reaches the answer that exists, not the empty newest round',
+  )
+})
+
 test('the last assistant line of a round is the one kept', () => {
   // A turn can produce several assistant messages. The first one collected walking backwards is the
   // final answer, and it is the only one the next round's reader needs; the earlier ones are what the

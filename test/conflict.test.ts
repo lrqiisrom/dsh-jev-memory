@@ -88,10 +88,28 @@ test('the card never shows the record id, and never says "矛盾"', () => {
   assert.doesNotMatch(question.header, /矛盾/)
   assert.doesNotMatch(question.question, /矛盾/)
 
-  // Both sides on their own line, separated widely enough to see the boundary at a glance.
-  assert.match(question.detail, /\n\n/)
-  // And the new memory is held back from recall until this is answered, so say so.
-  assert.match(question.detail, /还没生效/)
+  // One list item per side, each labelled in bold. Label and text used to share a line, which left
+  // two 100-character sentences separated only by a blank line — readable as one wall of text, and
+  // the boundary between the two memories is the whole point of the card.
+  assert.match(question.detail, /^- \*\*新的\*\*：/m, 'the new memory is its own labelled list item')
+  assert.match(question.detail, /^- \*\*旧的\*\*（\d{4}-\d{2}-\d{2} 记的）：/m, 'so is the older one, dated')
+  // And the new memory is held back from recall until this is answered, so say so — as a paragraph
+  // after the list, not as a third item.
+  assert.match(question.detail, /\n\n这条新的还没生效/)
+})
+
+test('a memory containing a newline stays one list item', () => {
+  // The card is markdown and each side is a list item. A raw newline would split the item: the blank
+  // line ends the list and the following line leaves it, so the older memory would render outside the
+  // card's structure — and a wrapped memory would read as two separate items.
+  const pair = findConflictPartner(
+    '不要改动 data/ 目录下的任何文件',
+    [memory('candidate', '可以随便改 data/ 目录下的文件\n\n包括删掉')],
+  )
+  assert.ok(pair)
+  const question = buildConflictQuestion(pair, 'incoming-id')
+  assert.equal((question.detail.match(/^- /gm) ?? []).length, 2, 'exactly two list items, whatever the memories contain')
+  assert.match(question.detail, /可以随便改 data\/ 目录下的文件 包括删掉/, 'the newline collapses to a space rather than splitting the item')
 })
 
 test('choiceFromAnswer maps labels back and refuses to guess', () => {

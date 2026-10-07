@@ -317,6 +317,21 @@ export function findConflictPartner(incoming: string, records: readonly MemoryRe
  * @param incomingId - the incoming record's id, used as the question id.
  * @returns the question item for the harness's ask service.
  */
+/**
+ * Collapse a memory onto one line for the card.
+ *
+ * The card is markdown, and each side is one list item. A newline inside the quoted memory would
+ * split that item: a blank line ends the list and the line after it leaves the list entirely, so the
+ * second memory would render outside the card's structure. Collapsing also stops a memory that
+ * happens to wrap from being mistaken for two items.
+ *
+ * @param text - the memory text, verbatim.
+ * @returns the same text with every run of whitespace reduced to a single space.
+ */
+function oneLine(text: string): string {
+  return text.replace(/\s+/gu, ' ').trim()
+}
+
 export function buildConflictQuestion(pair: ConflictPair, incomingId: string): {
   id: string
   header: string
@@ -329,13 +344,18 @@ export function buildConflictQuestion(pair: ConflictPair, incomingId: string): {
     id: `conflict:${incomingId}`,
     header: '长期记忆：两条像是同一件事',
     question: '这条新记住的，和库里已有的一条可能在讲同一件事。我分不清它是那条的更新说法，还是另一条规矩，所以问你一句。',
-    // Blank lines between the parts: two 60-90 character sentences separated by a single
-    // newline read as one wall of text, and the boundary between them is the whole point.
+    // The harness renders this through its markdown component, so the two sides get a list item
+    // each rather than two paragraphs. Label and text used to share a line, and two 100-character
+    // sentences whose only separator is a blank line read as one wall of text — the boundary is the
+    // whole point of the card. A bullet plus the hanging indent marks it, and the bold label makes
+    // 新的/旧的 scannable. Indenting with spaces instead would not work: four leading spaces become
+    // a code block and one to three are dropped.
     detail: [
-      `新的：${pair.incoming}`,
-      `旧的（${date} 记的）：${pair.existing.text}`,
+      `- **新的**：${oneLine(pair.incoming)}`,
+      `- **旧的**（${date} 记的）：${oneLine(pair.existing.text)}`,
+      '',
       '这条新的还没生效——你定了它才生效。',
-    ].join('\n\n'),
+    ].join('\n'),
     options: [
       { label: CONFLICT_CHOICES.replace, description: '旧的那条不再使用（保留记录，供以后查证）' },
       { label: CONFLICT_CHOICES['keep-old'], description: '丢掉这条新记的' },

@@ -21,10 +21,31 @@
  * of another conversation; they are from other agents, other machines, or hand-edited. A wider net
  * would only add false-positive risk, so the narrow one is the one that shipped.
  *
+ * ## Two rules, because the two write paths hand this module different things
+ *
+ * {@link findEcho} was measured on the **fallback** path, where a candidate *is* the person's own
+ * sentence. On the **model** path a candidate is a third-person summary the model wrote plus the
+ * verbatim span it came from, and feeding the summary to `findEcho` is why that screen fired once in
+ * 61 rows: a rewrite is not a contiguous run of the answer it rewrote. {@link findSpanEcho} is the
+ * model path's rule — it compares the *span*, and by token containment rather than by contiguous run,
+ * so re-wrapping and stitching non-adjacent parts both still match.
+ *
  * @module dsh/lib/echo
  */
 
-/** Thresholds for {@link findEcho}. */
+import { tokenize } from './conflict.ts'
+
+/**
+ * Thresholds for {@link findEcho}.
+ *
+ * Not reachable from a config row, deliberately, and the parameter below exists only so a test can
+ * move a boundary and show which side of it a fixture falls on. A threshold that ships as a config
+ * row is a threshold that can ship unmeasured, and this one did: a row that set only `minChars` left
+ * `minCoverage` undefined, the floor computed to `NaN`, the comparison never ran, and the screen
+ * switched itself off without a word in the log. Re-tuning means editing the constant below and
+ * re-running the tests against a labelled batch — which is what a config row would have needed too,
+ * minus the silent failure.
+ */
 export interface EchoSettings {
   /** below this many normalised characters a match is coincidence, not a quote. */
   minChars: number
@@ -94,6 +115,80 @@ export function findEcho(
         if (haystack.text.includes(window)) return { role: haystack.role, coverage: size / needle.length }
       }
     }
+  }
+  return null
+}
+
+/**
+ * Thresholds for {@link findSpanEcho}.
+ *
+ * A test seam, not a config surface — see {@link EchoSettings} for why, and `SPAN_ECHO_DEFAULTS` for
+ * where the numbers came from.
+ */
+export interface SpanEchoSettings {
+  /** Below this many tokens a match is coincidence, not a quote. */
+  minTokens: number
+  /** How much of the span's tokens have to appear in one earlier message. */
+  minCoverage: number
+  /** How many of the newest earlier messages to compare against. */
+  lookback: number
+}
+
+/**
+ * The measured optimum for the model path, in tokens rather than characters.
+ *
+ * Measured over the 113 rows the model path wrote and a person then labelled (52 keep / 61 don't):
+ * catches **18 of the 61**, kills **0 of the 52**. The separation is wide, not fitted: every row it
+ * catches scores ≥0.95, and the wrong rows it misses top out at 0.65 — there is nothing at all in
+ * between, which is why the coverage threshold is insensitive anywhere from 0.85 to 0.97.
+ *
+ * `minTokens` is what buys the zero, not the coverage. The one keep it would otherwise kill is a
+ * 24-character paste — the person quoting a line back in order to cut it — worth 10 tokens. That
+ * margin is thin in both directions and should not be read as comfortable: the same batch contains a
+ * genuine echo worth exactly 15, so the floor sits between 10 and 15 with a true positive on the
+ * boundary. A fresh batch is owed before either number is treated as settled, and {@link
+ * SPAN_ECHO_DEFAULTS} is the kind of constant that should move with the corpus rather than with
+ * intuition.
+ *
+ * `lookback: 2` earns exactly one row over `lookback: 1` (a span quoted from the answer two turns
+ * back, with an unrelated exchange in between); three and beyond change nothing.
+ */
+export const SPAN_ECHO_DEFAULTS: SpanEchoSettings = {
+  minTokens: 15,
+  minCoverage: 0.95,
+  lookback: 2,
+}
+
+/**
+ * Whether a verbatim span is mostly made of words an earlier message already used.
+ *
+ * Coverage is directional and order-free, both on purpose. Directional because the question is
+ * whether the *span* came from the answer, not whether the answer mentions the span. Order-free
+ * because a paste is re-wrapped and because three of the eighteen measured rows stitched together
+ * parts of the answer that were never adjacent — a contiguous-run test misses those by construction.
+ *
+ * The comparison stops at the newest `lookback` messages: the answer a person quotes is the one they
+ * just read, and widening the net adds false-positive risk for rows that do not exist. This is why
+ * the shipped window's 200-character cap does not bind here — the archive holds the whole answer.
+ *
+ * @param span - the verbatim span of the person's message the candidate was extracted from.
+ * @param earlier - messages that came before it, in the same session, oldest first.
+ * @param settings - thresholds.
+ * @returns the newest matching message and the fraction of the span found in it, or null.
+ */
+export function findSpanEcho(
+  span: string,
+  earlier: readonly EchoCandidate[],
+  settings: SpanEchoSettings = SPAN_ECHO_DEFAULTS,
+): { role: string; coverage: number } | null {
+  const words = [...tokenize(span)]
+  if (words.length < settings.minTokens) return null
+  const others = earlier.filter((message) => message.role !== 'user').slice(-settings.lookback)
+  // Newest first, so the reported hit is the message the person most plausibly quoted.
+  for (const message of [...others].reverse()) {
+    const said = tokenize(message.text)
+    const coverage = words.filter((word) => said.has(word)).length / words.length
+    if (coverage >= settings.minCoverage) return { role: message.role, coverage }
   }
   return null
 }

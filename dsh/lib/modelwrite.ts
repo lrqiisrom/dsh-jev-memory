@@ -86,8 +86,8 @@ export const MODEL_WRITE_DEFAULTS: ModelWriteSettings = {
    *
    * A malformed answer comes back in about a second, so retrying it is nearly free and worth it (8 of
    * 120 answers arrived without JSON). A timeout is the opposite: a second ten-second attempt cannot fit
-   * inside the write budget, and abandoning the whole turn is worse than falling back to the
-   * deterministic path, which still writes something. So the retry is skipped when the clock, rather
+   * inside the write budget, and there is no longer a cheaper path to hand the turn to, so a slow
+   * failure is final and the turn learns nothing. The retry is therefore skipped when the clock, rather
    * than the answer, was the problem.
    */
   retry: 1,
@@ -123,7 +123,7 @@ export const MODEL_WRITE_SYSTEM =
 /**
  * The message the model is allowed to extract from: the newest one the person wrote.
  *
- * A window holds five rounds, and only the last of them is new. Reading all five as extraction sources
+ * A window holds several rounds, and only the last of them is new. Reading all of them as extraction sources
  * re-proposed the same sentences on every turn — measured on twenty windows, 6 of 76 source spans
  * appeared in two different windows — and it left the duplicate detection to a paraphrase judgement,
  * which costs a model call and misses whenever the summarised wording changes (5 of those 76 were
@@ -524,8 +524,8 @@ export function createModelWriter({
       const startedAt = Date.now()
       for (let attempt = 0; attempt <= settings.retry; attempt += 1) {
         // A retry only earns its place when the first attempt failed on *content*. Once the clock was
-        // the problem, a second attempt of the same length cannot fit the write budget — and the caller
-        // falling back to the deterministic path is strictly better than the turn writing nothing.
+        // the problem, a second attempt of the same length cannot fit the write budget, and the turn is
+        // simply going to learn nothing — so spending the remaining budget on it buys no memory.
         if (attempt > 0 && Date.now() - startedAt >= settings.timeoutMs / 2) {
           lastReason = `${lastReason}:no-retry-after-slow-failure`
           break
@@ -571,7 +571,7 @@ export function createModelWriter({
           // the ledger line is where this gets diagnosed, so it has to say which.
           lastReason = decided.reason === 'unparsable' ? (answerFailure(answer) ?? decided.reason) : decided.reason
           if (decided.items !== null) return { items: decided.items, model: route.model }
-          log('warn', `model write refused (${lastReason}); falling back`, {
+          log('warn', `model write refused (${lastReason}); this turn learns nothing`, {
             messages: messages.length,
             output: answer.text.slice(0, 80),
             finish: answer.finish,
@@ -579,7 +579,7 @@ export function createModelWriter({
           })
         } catch (error) {
           lastReason = `error:${String(error).slice(0, 40)}`
-          log('warn', 'model write failed; falling back', { error: String(error) })
+          log('warn', 'model write failed; this turn learns nothing', { error: String(error) })
         } finally {
           clearTimeout(timer)
           signal?.removeEventListener('abort', onAbort)

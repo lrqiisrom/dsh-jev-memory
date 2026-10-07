@@ -11,5 +11,14 @@ node_modules/
 
 # 标注数据里是真实会话原文，默认不入库（需要版本化时 git add -f）
 eval/labels/*.csv
-# 读取侧的探针是拿真实记忆生成的问题，同样带项目原文；报告和基线只含汇总结论，入库
+# 读取侧的探针是拿真实记忆生成的问题，同样带项目原文
 eval/labels/*.probes.json
+
+# 调研、设计与测量记录：开发过程留档，不作为发布物
+docs/
+
+# 指标报表与基线：含逐项数字与真实会话片段
+eval/labels/report*.md
+eval/labels/recall-report.md
+eval/labels/*.scores.json
+eval/labels/baseline*.json

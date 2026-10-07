@@ -114,9 +114,17 @@ const model = process.env.LIVE_MODEL?.trim() || 'deepseek-flash'
 const home = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')
 const labelDir = new URL('./labels/', import.meta.url).pathname
 const outFile = new URL('../.scratch/write-arm.md', import.meta.url).pathname
-/** The shipped window: `conversationWindow` in the plugin's defaults. */
-const ROUNDS = 5
+/**
+ * The shipped window: `conversationWindow` in the plugin's defaults.
+ *
+ * Kept in step by hand, which is itself a hazard — the earlier runs in `write-arm.md` were taken at
+ * 5 rounds / 200 characters a round, and results from before that changed are only comparable to
+ * results after it by re-running, not by reading two numbers side by side.
+ */
+const ROUNDS = 3
 const ANSWER_CHARS = 200
+/** The newest answer's own cap; the round the current turn replies to. See `conversationWindow`. */
+const RECENT_ANSWER_CHARS = 1500
 /** Overlap at or above this share of the shorter side counts as "this memory is about that sentence". */
 const MATCH_FLOOR = 0.5
 
@@ -164,7 +172,10 @@ function shippedWindow(session: Session, endSeq: number, rounds: number, answerC
   const at = new Map(session.messages.map((message) => [message.seq, message]))
   const last = session.messages.filter((message) => message.seq <= endSeq).map((message) => message.seq)
   const current = last.length > 0 ? Math.max(...last) + 1 : null
-  return conversationWindowOf(current, (seq) => at.get(seq) ?? null, rounds, answerChars) ?? []
+  // The widening is part of the shipped shape, so every caller gets it; a caller that wants the flat
+  // cap passes `RECENT_ANSWER_CHARS` of 0 in the constants above.
+  const recent = RECENT_ANSWER_CHARS > 0 ? { rounds: 1, chars: RECENT_ANSWER_CHARS } : undefined
+  return conversationWindowOf(current, (seq) => at.get(seq) ?? null, rounds, answerChars, recent) ?? []
 }
 
 /** Character overlap between two strings, by the longest common run — enough here, and symmetric. */
@@ -283,7 +294,7 @@ if (process.env.WRITE_ARM_DRY === 'yes') {
 // ---------------------------------------------------------------------------------------------
 
 const lines: string[] = ['# 发货路径跑一发：产出、对得上、对不上', '']
-lines.push(`模型 \`${model}\`｜窗口 ${ROUNDS} 轮、答案截 ${ANSWER_CHARS} 字｜样本 ${sample.length} 个窗口`)
+lines.push(`模型 \`${model}\`｜窗口 ${ROUNDS} 轮、答案截 ${ANSWER_CHARS} 字、最近一条 ${RECENT_ANSWER_CHARS} 字｜样本 ${sample.length} 个窗口`)
 lines.push('')
 
 let produced = 0
@@ -583,7 +594,7 @@ lines.push(...rowLines)
 lines.push('')
 lines.push('## 方法与局限')
 lines.push('')
-lines.push(`- 请求与发货路径同形：同一 system、同 ${ROUNDS} 轮窗口、答案截 ${ANSWER_CHARS} 字、\`thinking: disabled\`、1500 token、\`temperature: 0\`。`)
+lines.push(`- 请求与发货路径同形：同一 system、同 ${ROUNDS} 轮窗口（最近一条回答 ${RECENT_ANSWER_CHARS} 字，其余 ${ANSWER_CHARS} 字）、\`thinking: disabled\`、1500 token、\`temperature: 0\`。`)
 lines.push('- 窗口按"结束于某条标注行所在的位置"取，所以样本必然含标注；随机窗口的映射率不适用这个口径。')
 lines.push(`- 对上与否用"最长公共片段 ÷ 较短一方 ≥ ${MATCH_FLOOR}"判定，纯机械、可复现；换阈值会改变映射率，所以阈值写在报告里。`)
 lines.push('- 只跑一发，样本小，**这些数不能当结论**；它要回答的是"映射率能不能支撑后面的评测"。')

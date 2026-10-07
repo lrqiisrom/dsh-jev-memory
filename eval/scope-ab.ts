@@ -72,7 +72,8 @@ const bySeq = new Map(sessions.map((s) => [s.id, new Map(s.messages.map((m) => [
 const windowOf = (session: Session, end: number) => {
   const at = bySeq.get(session.id)!
   const last = session.messages.filter((m) => m.seq <= end).map((m) => m.seq)
-  return conversationWindowOf(last.length ? Math.max(...last) + 1 : null, (seq) => at.get(seq) ?? null, 5, 200) ?? []
+  // Mirrors the shipped window: 3 rounds, the newest answer left long. See `eval/write-arm.ts`.
+  return conversationWindowOf(last.length ? Math.max(...last) + 1 : null, (seq) => at.get(seq) ?? null, 3, 200, { rounds: 1, chars: 1500 }) ?? []
 }
 
 // 样本从运行日志里读，保证和评测那次是同一批 20 个窗口

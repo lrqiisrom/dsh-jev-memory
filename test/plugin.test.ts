@@ -21,6 +21,7 @@ import type {
   WriteArgs,
 } from '../dsh/index.ts'
 import { CONFLICT_CHOICES } from '../dsh/lib/conflict.ts'
+import { ECHO_DEFAULTS, SPAN_ECHO_DEFAULTS } from '../dsh/lib/echo.ts'
 
 /**
  * The two layers a search reaches, kept apart in assertions.
@@ -191,7 +192,13 @@ async function mount(
   const { ctx, captured } = fakeContext()
   if (credentialValue !== undefined) captured.credentialValue = credentialValue
   setup?.(captured)
-  apply(ctx, { root, judge: 'heuristic', ...overrides })
+  // `writeMode: 'pipeline'` by default, and stated rather than inherited. These tests exercise the
+  // deterministic extractor, and they used to reach it by accident: the plugin's default is the model
+  // path, no model route is wired, so the write call came back empty-handed and the old fallback handed
+  // the turn to the extractor. That fallback is gone — a failed call now means the turn learns nothing
+  // — so a test that means "the deterministic path" has to say so. The model-path tests each pass
+  // `writeMode: 'model'` explicitly already.
+  apply(ctx, { root, judge: 'heuristic', writeMode: 'pipeline', ...overrides })
   await new Promise((resolve) => setTimeout(resolve, 50))
   return { root, captured }
 }
@@ -251,6 +258,47 @@ test('resolveConfig keeps the narrow default and reports bad values', () => {
   assert.equal(messy.config.minImportance, 0.6)
   assert.equal(messy.config.contextOrder, 130)
   assert.equal(messy.problems.length, 4)
+})
+
+test('the echo screens have no config at all', () => {
+  // Neither a threshold nor a switch. A threshold that can be set from a config row is a threshold
+  // that can ship unmeasured, and this one already did: a row that set only `minChars` left
+  // `minCoverage` undefined, the floor computed to `NaN`, the comparison never ran, and the screen
+  // turned itself off without a word in the log. A switch is the same hazard one step weaker — it lets
+  // the shipped system run as something nobody labelled — so the screen has neither. The constants
+  // live beside their measurement in `lib/echo.ts`, and the code and the measurement move together.
+  const clean = resolveConfig({})
+  assert.equal('echo' in clean.config, false, 'there is no key to set')
+  assert.equal('echoSpan' in clean.config, false)
+  assert.deepEqual(clean.problems, [])
+
+  // A row that sets one anyway is inert. The top-level spread is literal, so the key survives into
+  // the resolved object — but nothing reads it, and no default reintroduces it, which is the part
+  // that matters: there is no path from a config row to the thresholds this screen runs on.
+  const ignored = resolveConfig({ echo: { enabled: false, minChars: 99 }, echoSpan: { minTokens: 1 } } as never)
+  assert.deepEqual(ignored.problems, [], 'and it is not even worth a warning: the schema has no such key')
+  assert.deepEqual(ECHO_DEFAULTS, { minChars: 8, minCoverage: 0.6 })
+  assert.deepEqual(SPAN_ECHO_DEFAULTS, { minTokens: 15, minCoverage: 0.95, lookback: 2 })
+})
+
+test('the shipped window is 3 rounds with the newest answer left long', () => {
+  // Pinned because it is a deliberate shape, not a default somebody can drift: three rounds because
+  // background is what the older rounds give, and a 1,500-character cap on the newest answer because
+  // that is the one a person quotes back. Of 15 verbatim echoes, 14 sat past the 200th character of
+  // the answer they came from; at 1,500 seven of them are visible to the extractor (measured over the
+  // 21 note-says-model rows: 1 visible before, 7 after).
+  //
+  // The cost is what makes the pair affordable rather than a trade: over the 400-window sample, 5
+  // rounds at 200 characters averaged 2,860 characters a window and this averages 2,812 — 0.98×.
+  assert.deepEqual(resolveConfig({}).config.conversationWindow, { rounds: 3, answerChars: 200, recentAnswerChars: 1500 })
+
+  const partial = resolveConfig({ conversationWindow: { recentAnswerChars: 4000 } })
+  assert.equal(partial.config.conversationWindow.recentAnswerChars, 4000, 'the override wins')
+  assert.equal(partial.config.conversationWindow.rounds, 3, 'and the rest of the shape survives')
+
+  const bad = resolveConfig({ conversationWindow: { rounds: 'five', answerChars: -1, recentAnswerChars: Number.NaN } })
+  assert.deepEqual(bad.config.conversationWindow, { rounds: 3, answerChars: 200, recentAnswerChars: 1500 })
+  assert.equal(bad.problems.filter((problem) => problem.startsWith('conversationWindow.')).length, 3)
 })
 
 test('resolveStoreRoot follows config, then DSH_HOME, then ~/.dsh', () => {
@@ -1960,17 +2008,20 @@ test('the model path keeps only what the person said and called worth rememberin
   assert.equal(writePath?.kept, 1, 'and one of those was typed as a memory')
 })
 
-test('a model answer that is not verbatim falls back to the deterministic path, and still writes', async () => {
+test('a model answer that is not verbatim costs the turn, and writes nothing', async () => {
   // The failure the verbatim rule exists for: the model rewrites the sentence while quoting it
   // (measured: 22% of its items, one of them changing 集成 to 继承 — a different claim, stored under
-  // the person's name). A refusal must not cost the turn, so the deterministic path runs instead —
-  // and it must not call the segmenter to do it, because two round trips do not fit the budget.
+  // the person's name). The refusal used to hand the turn to the deterministic path, on the theory
+  // that a refusal must not cost the turn. The live ledger retired that theory: over 64 recorded turns
+  // the net fired once, produced one candidate, and the type whitelist refused it — zero memories were
+  // ever written by the fallback, and in the 38 turns it ran as the *primary* path it failed to parse
+  // its own output every time. So the refusal stands, and the turn learns nothing.
   const sentence = '必须把端口固定成 8000。'
   const { root, captured } = await mount({ writeMode: 'model' }, undefined, (c) => {
     c.llmPort = llmRouting(
       // `source` claims a quotation the message does not contain (固定为 vs 固定成). The summary would
       // have been accepted — summaries may differ in wording — but a summary attached to a quotation
-      // nobody made is refused, and the turn falls back rather than losing the memory.
+      // nobody made is refused.
       JSON.stringify([
         { message: 0, source: '必须把端口固定为 8000。', summary: '用户要求把端口固定为 8000。', who: 'user', worth: true, type: 'constraint' },
       ]),
@@ -1984,12 +2035,12 @@ test('a model answer that is not verbatim falls back to the deterministic path, 
     { query: '端口固定成 8000' },
     { agent: { session } },
   )
-  assert.equal(promoted(found).length, 1, 'the turn is slower, not lost')
-  assert.equal(promoted(found)[0]!.text, sentence, "and what is stored is the person's characters")
-  const writePath = (await ledgerEntries(root)).find((entry) => entry.kind === 'write-path')
-  assert.equal(writePath?.ok, false)
+  assert.equal(promoted(found).length, 0, 'nothing is stored under the person\'s name')
+  const ledger = await ledgerEntries(root)
+  const writePath = ledger.find((entry) => entry.kind === 'write-path')
+  assert.equal(writePath?.ok, false, 'the turn is on the ledger as a failure, so it is observable')
   assert.equal(writePath?.reason, 'all-refused')
-  assert.equal((await ledgerEntries(root)).filter((entry) => entry.kind === 'segment').length, 0, 'no second attempt')
+  assert.equal(ledger.filter((entry) => entry.kind === 'segment').length, 0, 'and no second attempt is made')
 })
 
 test('a message the model marked entirely as pasted writes nothing, though the splitter would have', async () => {
@@ -2000,10 +2051,10 @@ test('a message the model marked entirely as pasted writes nothing, though the s
   // that case, which is why the earlier test (one message mixing own text with a paste) did not catch
   // it. Measured from the other side: note on the labelled rows says 30 of them came from the model.
   const block = '必须把端口固定成 8000。'
-  const segmented = await mount({ judge: 'auto', segment: { enabled: true } }, 'test-key', (c) => {
+  const segmented = await mount({ judge: 'auto', writeMode: 'model', segment: { enabled: true } }, 'test-key', (c) => {
     // A complete answer that marks the whole message as pasted. The summary is what makes it an
-    // *answer* rather than a malformed one: without it the item is refused and the caller falls back,
-    // which would test the opposite thing.
+    // *answer* rather than a malformed one: without it the item is refused and the turn learns
+    // nothing, which would test the opposite thing.
     c.llmPort = fakeLlm(JSON.stringify([{ message: 0, source: block, summary: '用户粘贴了一段端口约定。', who: 'pasted' }]))
     c.defaultModelSelection = { provider: 'p', model: 'test-model' }
   })
@@ -2020,9 +2071,9 @@ test('a message the model marked entirely as pasted writes nothing, though the s
     'the model answered for this message, so its answer stands even when it found nothing of the person in it',
   )
 
-  // The control: with no model on the path, the same sentence is the local rule's to decide — and it
+  // The control: on the deterministic path the same sentence is the local rule's to decide — and it
   // accepts it. Without this half, the test would pass on a plugin that had stopped writing anything.
-  const plain = await mount({ segment: { enabled: false } })
+  const plain = await mount({ writeMode: 'pipeline', segment: { enabled: false } })
   const plainSession = fakeSession({ events: turnWith(block) })
   await listenerFor(plain.captured, 'agent/turn-stopping')({
     agent: { id: 's1', session: plainSession },

@@ -453,7 +453,7 @@ test('an odd number of stray quotes is repaired too, not just an even one', () =
 })
 
 test('only the newest thing the person wrote may be extracted from', () => {
-  // The window holds five rounds and only the last is new. Reading all five as sources re-proposed the
+  // The window holds several rounds and only the last is new. Reading all of them as sources re-proposed the
   // same sentences every turn — 6 of 76 source spans appeared in two different windows on real traffic —
   // and left the deduplication to a paraphrase judgement that costs a model call and misses whenever the
   // wording of the summary changes. The earlier rounds still travel, because they are what tells the

@@ -92,7 +92,7 @@ import {
 import { isNoteworthyVeto, screenSentence, signatureOf } from './lib/signals.ts'
 import { archiveId, createMemoryStore, MEMORY_TYPES, recordIdOf, type L0Entry, type MemoryRecord } from './lib/store.ts'
 import { conversationWindowOf } from './lib/window.ts'
-import { ECHO_DEFAULTS, findEcho, type EchoSettings } from './lib/echo.ts'
+import { findEcho, findSpanEcho } from './lib/echo.ts'
 import { estimateTokens, excerpt, hashText } from './lib/text.ts'
 import type { Candidate, ExtractOptions, TurnEvent } from './lib/extract.ts'
 import type { Judge } from './lib/judge.ts'
@@ -452,9 +452,11 @@ export interface PluginConfig {
    * F1 0.37).
    *
    * It is **not** free: the same call's latency had a median 1233ms and a 3701ms worst case inside a
-   * 2500ms write budget, and 16 of 49 exceeded the 1600ms it would be given. When it times out the
-   * turn falls back to the deterministic splitter and the local gate — a slower decision, never a
-   * lost one, because the fallback deliberately does not then call the segmenter.
+   * 2500ms write budget, and 16 of 49 exceeded the 1600ms it would be given. When it times out or the
+   * answer is refused the turn learns nothing, and says so on the ledger (`write-path`, `ok: false`).
+   * It used to hand that turn to the deterministic extractor instead; the measured record of that net
+   * is one firing in 64 live turns, zero memories written, and 38 failures out of 38 when it was the
+   * primary path — so the turn is simply lost, which is observable rather than silent.
    */
   writeMode: 'pipeline' | 'model'
   /** Settings for the model write path; `window` is read by both paths. */
@@ -477,17 +479,35 @@ export interface PluginConfig {
    * Counter-intuitive but consistent across the runs: the call's latency tracks the length of *its own
    * answer* (it quotes every span it keeps), not the size of the window. Capping each round's answer
    * therefore makes the window smaller *and* more informative at the same time.
-   */
-  conversationWindow: { rounds: number; answerChars: number }
-  /**
-   * Whether a sentence the session already said — by the model — may become a memory.
    *
-   * On by default, and this is the one screen whose cost was measured against the person's own
-   * notes: 15 of the 28 rows whose note says "this is the model's output" are caught, **none of the
-   * positives is killed**, and 20 negatives are blocked. It needs no model and no network — the
-   * archive keeps the assistant's messages, and the check is a substring comparison.
+   * **Three rounds, with the nearest answer left long.** Background is what the older rounds provide,
+   * and a person's newest turn is rarely a continuation of a conversation from four turns ago — the
+   * measured use of the window is attribution, not continuity. Trimming two rounds frees more input
+   * than the wider answer costs: 5 rounds at 200 characters averaged 2,860 characters per window over
+   * the 400-window sample, and 3 rounds with the nearest answer at 1,500 averages 2,812 — 0.98×, so
+   * the wider answer is paid for by the rounds that were dropped.
+   *
+   * That wider answer is the point of the shape. The nearest answer is the one a person quotes back,
+   * and a quote the window cannot show is a quote the extractor cannot mark as one: of 15 verbatim
+   * echoes, **14 sat past the 200th character** of the answer they came from. At 1,500 characters
+   * seven of those fourteen are visible; the rest are caught by the echo screen instead, which reads
+   * the archive rather than the window and so does not care about the cap.
+   *
+   * What is **not** measured is whether dropping two rounds costs extraction quality. That is a
+   * question about the model's judgement rather than about input size, and the numbers above are
+   * sizes. The round count is treated as metric-neutral by decision: the part of this shape expected
+   * to move the numbers is the wider cap on the newest answer, not the two rounds that paid for it.
    */
-  echo: EchoSettings & { enabled: boolean }
+  conversationWindow: {
+    rounds: number
+    /** Cap on the answer of every round except the newest; the person's own words are never cut. */
+    answerChars: number
+    /**
+     * Cap on the **newest** answer — the one the current turn is a reply to. `0` disables the widening
+     * and makes every round use `answerChars`.
+     */
+    recentAnswerChars: number
+  }
   /**
    * Whether a model reads the recent window and decides the sentence boundaries and who said what.
    *
@@ -765,14 +785,13 @@ export const DEFAULT_CONFIG: PluginConfig = {
   // at 400 characters the model started enumerating spans inside the assistant's answers too (10
   // segments, 5074ms), while at 150 it returned exactly the five human spans in 1268ms. 200 sits in
   // that regime with room for a longer reply.
-  conversationWindow: { rounds: 5, answerChars: 200 },
+  conversationWindow: { rounds: 3, answerChars: 200, recentAnswerChars: 1500 },
   searchArchive: true,
   // The library defaults `segment.enabled` to false so consumers opt in deliberately; the shipped
   // plugin turns it on, because the deterministic splitter was measured against the labelled notes
   // and the rows it cannot handle are the ones where a message mixes the person's words with a block
   // they pasted. Every failure path still falls back to the splitter.
   segment: { ...SEGMENT_DEFAULTS, enabled: true },
-  echo: { ...ECHO_DEFAULTS, enabled: true },
   /**
    * Skip delegated child sessions when learning.
    *
@@ -902,6 +921,13 @@ export function resolveConfig(raw: unknown): { config: PluginConfig; problems: s
   }
   config.minImportance = Math.min(1, Math.max(0, config.minImportance))
   config.minRemember = Math.min(1, Math.max(0, config.minRemember))
+  for (const field of ['rounds', 'answerChars', 'recentAnswerChars'] as const) {
+    const value = config.conversationWindow[field]
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      problems.push(`conversationWindow.${field}: not a non-negative finite number; using the default`)
+      config.conversationWindow[field] = DEFAULT_CONFIG.conversationWindow[field]
+    }
+  }
   config.extract = { ...EXTRACT_DEFAULTS, ...((source.extract ?? {}) as Partial<ExtractOptions>) }
   if (config.conflictRanking !== 'lexical' && config.conflictRanking !== 'embedding') {
     problems.push(`conflictRanking: unknown value "${String(config.conflictRanking)}"; using lexical`)
@@ -1191,10 +1217,11 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
   // call took a median of 851ms and at most 1271ms, with 1 of 11 past a 1250ms budget. The judge
   // answers in a median 342ms, so 900ms of headroom covers the rest of the turn and segmentation
   // gets 1600ms — enough for every call in that sample, still inside 2500ms in the normal case.
-  // The segmentation call is the *fallback* whenever the model write call is primary, so its budget has
-  // to fit in what that call leaves behind. Without this the two budgets simply add up — 10s + 8s inside
-  // a 12s deadline — and a failed model call would not fall back at all, it would abandon the turn and
-  // write nothing, which is the one outcome the fallback exists to prevent.
+  // The segmenter only runs on the deterministic path, so in model mode this reservation is now
+  // vestigial: nothing spends it, and a failed model call learns nothing instead of handing the turn
+  // over. It is kept because it is the number that keeps the two budgets from adding up to more than
+  // the deadline (10s + 8s inside 12s), and `writeMode: 'pipeline'` still spends it — but it is dead
+  // arithmetic in model mode and should be removed once the deterministic path is.
   const reservedForModel = config.writeMode === 'model' ? Math.min(config.modelWrite.timeoutMs ?? MODEL_WRITE_DEFAULTS.timeoutMs, Math.max(400, config.writeTimeoutMs - 900)) : 0
   const segmentBudget = Math.min(
     config.segment.timeoutMs ?? SEGMENT_DEFAULTS.timeoutMs,
@@ -1887,6 +1914,12 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         },
         config.conversationWindow.rounds,
         config.conversationWindow.answerChars,
+        // The newest answer is the one a person quotes back, and the window has to be able to show a
+        // quote before the extractor can be expected to recognise one. Older rounds stay at the flat
+        // cap; `0` means "no widening", which is how this stays switchable from a config row.
+        config.conversationWindow.recentAnswerChars > 0
+          ? { rounds: 1, chars: config.conversationWindow.recentAnswerChars }
+          : undefined,
       )
       const window =
         conversation && conversation.length > 0 ? conversation : archiveMessages(events).slice(-writeWindow)
@@ -1996,65 +2029,93 @@ export function apply(ctx: PluginContext, rawConfig: unknown = {}): void {
         }
       }
 
-      // The screens and the extractor are the *fallback* path's way of deciding what is worth keeping.
-      // When the model answered, it decided that itself — re-deciding it locally is the thing this path
-      // exists to stop doing. One exception is kept deliberately: a secret must not reach the store, and
-      // that is a data-safety rule rather than a judgement about worth.
+      // Which extractor runs is a *choice of mode*, not a consequence of whether the model answered.
+      //
+      // It used to be the latter: whenever the model write call came back empty-handed, the
+      // deterministic extractor took over that turn. The live ledger says what that net was worth —
+      // over 64 recorded turns the model path failed once (`all-refused`: the model answered, and the
+      // drift check refused every item), the extractor took that turn, produced one candidate, and the
+      // type whitelist refused it. **Zero memories were ever written by the fallback.** And it was
+      // never a cheap net: the route it fell back to called the segmenter and the judge too, and in the
+      // 38 turns it ran as the primary path it failed to parse its own output every single time.
+      //
+      // So a failed call now means this turn learns nothing. That is a decision with a name, and the
+      // `write-path` ledger line already carries it (`ok: false`, plus the reason), so a failure is
+      // observable rather than silent. `writeMode: 'pipeline'` still selects the deterministic
+      // extractor outright, for reproducing the baseline — as a mode, not as a net.
+      //
+      // One exception survives on the model path: a secret must not reach the store. That is a
+      // data-safety rule rather than a judgement about worth, which is why it is kept.
       const candidates =
-        modelCandidates !== null
-          ? modelCandidates.filter((candidate) => {
+        config.writeMode === 'model'
+          ? (modelCandidates ?? []).filter((candidate) => {
               const screen = screenSentence(`${candidate.text} ${candidate.quote}`)
               if (screen.keep || screen.reason !== 'secret') return true
               void store.ledger({ kind: 'skip', reason: 'veto:secret', id: recordIdOf(candidate.text), quote: excerpt(candidate.quote, 120) })
               return false
             })
           : extractCandidates(events, {
-        ...config.extract,
-        units,
-        // Which messages that answer covers. The extractor walks the whole turn, and in a long turn
-        // the person's message is not in the window at all — reading "the model answered" as "the
-        // model answered about everything" made such a turn produce no candidates, silently.
-        decidedSeqs: units === null ? null : new Set(window.map((message) => message.seq)),
-        // The extractor reports every rejection; the ledger records the reasons that carry
-        // information (see isNoteworthyVeto), because a line per question and per "好的"
-        // would bury the lines that matter.
-        onVeto: (sentence, reason) => {
-          if (!isNoteworthyVeto(reason)) return
-          void store.ledger({ kind: 'skip', reason: `veto:${reason}`, quote: excerpt(sentence, 120) })
-        },
-      })
+              ...config.extract,
+              units,
+              // Which messages that answer covers. The extractor walks the whole turn, and in a long turn
+              // the person's message is not in the window at all — reading "the model answered" as "the
+              // model answered about everything" made such a turn produce no candidates, silently.
+              decidedSeqs: units === null ? null : new Set(window.map((message) => message.seq)),
+              // The extractor reports every rejection; the ledger records the reasons that carry
+              // information (see isNoteworthyVeto), because a line per question and per "好的"
+              // would bury the lines that matter.
+              onVeto: (sentence, reason) => {
+                if (!isNoteworthyVeto(reason)) return
+                void store.ledger({ kind: 'skip', reason: `veto:${reason}`, quote: excerpt(sentence, 120) })
+              },
+            })
       if (candidates.length === 0) return { written: 0, writtenIds: [], candidates: 0 }
 
       // The echo screen. A sentence the *model* already said, pasted into the person's message, is
       // not their requirement — and the envelope cannot tell the difference, so the comparison is
       // against what this session actually said earlier. Measured on the labelled rows: 15 of 28
-      // caught, none of the positives killed.
-      const decided =
-        config.echo.enabled && modelCandidates === null
-        ? candidates.filter((candidate) => {
-            const earlier = store
-              .recentArchive()
-              .filter(
-                (entry) =>
-                  entry.sessionId === (header?.id ?? null) &&
-                  entry.role !== 'user' &&
-                  typeof entry.seq === 'number' &&
-                  typeof candidate.seq === 'number' &&
-                  entry.seq < candidate.seq,
-              )
-            const hit = findEcho(candidate.text, earlier, config.echo)
-            if (!hit) return true
-            void store.ledger({
-              kind: 'skip',
-              reason: 'echoed-model',
-              id: recordIdOf(candidate.text),
-              role: hit.role,
-              coverage: Number(hit.coverage.toFixed(2)),
-              quote: excerpt(candidate.quote, 120),
-            })
-            return false
-          })
-        : candidates
+      // caught, none of the positives killed; on the model path 18 of 61, none of 52 killed.
+      //
+      // It has no switch and no thresholds in the config, deliberately. This is the behaviour that was
+      // measured against the person's own labels, and a config row is a way to run something other than
+      // that — which this screen already demonstrated: a row that set only one of its two thresholds
+      // left the other undefined, the floor computed to `NaN`, the comparison never ran, and the screen
+      // turned itself off without a word in the log. Retuning means editing the constants beside their
+      // measurements in `lib/echo.ts` and re-running the tests against a labelled batch, so the code
+      // and the measurement move together.
+      //
+      // Both paths run it; they need different rules, because they hand it different things. The
+      // fallback path's candidate *is* the person's sentence, and `findEcho` was measured on that.
+      // The model path's candidate is a third-person summary the model wrote plus the verbatim span
+      // it came from — and comparing the summary is why this screen used to fire once in 61 rows: a
+      // rewrite is not a contiguous run of the answer it rewrote. So the model path compares the span,
+      // by token containment; see `findSpanEcho`.
+      const decided = candidates.filter((candidate) => {
+        const earlier = store
+          .recentArchive()
+          .filter(
+            (entry) =>
+              entry.sessionId === (header?.id ?? null) &&
+              entry.role !== 'user' &&
+              typeof entry.seq === 'number' &&
+              typeof candidate.seq === 'number' &&
+              entry.seq < candidate.seq,
+          )
+        const hit =
+          modelCandidates === null
+            ? findEcho(candidate.text, earlier)
+            : findSpanEcho(candidate.quote, earlier)
+        if (!hit) return true
+        void store.ledger({
+          kind: 'skip',
+          reason: 'echoed-model',
+          id: recordIdOf(candidate.text),
+          role: hit.role,
+          coverage: Number(hit.coverage.toFixed(2)),
+          quote: excerpt(candidate.quote, 120),
+        })
+        return false
+      })
 
       if (decided.length === 0) return { written: 0, writtenIds: [], candidates: candidates.length }
 
