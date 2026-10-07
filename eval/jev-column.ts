@@ -80,9 +80,28 @@ function trimQuestion(question: string): string {
   return question.replace(cut, '').replace(emphasis, '').trim()
 }
 
-const VARIANTS: Record<string, { column: string; question: string }> = {
-  shipped: { column: 'jev_noul', question: REMEMBER_QUESTION },
-  trimmed: { column: 'jev_trim', question: trimQuestion(REMEMBER_QUESTION) },
+const VARIANTS: Record<string, { column: string; question: string; withSource: boolean }> = {
+  /** The question as shipped, with the verbatim span attached — more than the plugin sends. */
+  shipped: { column: 'jev_noul', question: REMEMBER_QUESTION, withSource: true },
+  /** The question with the emphasis removed, source still attached. */
+  trimmed: { column: 'jev_trim', question: trimQuestion(REMEMBER_QUESTION), withSource: true },
+  /**
+   * What the plugin actually sends: the shipped question, and **only the summary**.
+   *
+   * The verbatim span is not part of the live request — it is kept as provenance on the record and
+   * never travels to the judge. Attaching it was my addition, and it makes the judge's task easier in
+   * a way the plugin does not: judging a summary asks whether it reads like a fact, while judging the
+   * summary *against the sentence it came from* asks whether the person actually asserted it. The
+   * three reasons for dropping it back out: it costs tokens; the summary is the thing being stored and
+   * the thing that will be recalled, so it is the honest unit to judge; and the raw span is extra
+   * material the judge was not asked about, which is a source of noise.
+   *
+   * What is given up is stated rather than hidden: without the span, the judge cannot notice a summary
+   * that drifted from its source. That check then rests entirely on the code — the summary's
+   * identifiers must appear in a span that appears verbatim in the message — which was measured to
+   * catch long Latin identifiers and little else.
+   */
+  live: { column: 'jev_live', question: REMEMBER_QUESTION, withSource: false },
 }
 const variant = VARIANTS[process.env.JEV_VARIANT?.trim() ?? 'shipped']
 if (variant === undefined) throw new Error(`未知的问句版本：${process.env.JEV_VARIANT}（可选 shipped / trimmed）`)
@@ -148,8 +167,9 @@ for (const cells of records.slice(1)) {
       known: [],
       partners: [],
       project,
-      // The person's own words, for the reason in the header: the question is whether they asserted it.
-      conversation: source === '' ? [] : [source],
+      // The person's own words, when the variant carries them: the question becomes "did they assert
+      // this", not "does this read like a fact". `live` omits them, as the plugin does.
+      conversation: !variant.withSource || source === '' ? [] : [source],
     })
     const probability = result.rows[0]?.remember
     if (typeof probability !== 'number' || !Number.isFinite(probability)) {

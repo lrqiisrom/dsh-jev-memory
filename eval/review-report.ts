@@ -47,6 +47,8 @@ interface Row {
   jev: number | null
   /** Jev's answer to the trimmed question, which drops the emphasis and keeps the definition. */
   jevTrim: number | null
+  /** Jev's answer to the shipped question with **only the summary** — what the plugin actually sends. */
+  jevLive: number | null
 }
 
 // One sheet at a time, and it says which. Summing `review*.csv` would add up two runs over the same
@@ -64,6 +66,7 @@ for (const name of files) {
   for (const record of parseCsvRecords(await readFile(join(labelDir, name), 'utf8'))) {
     const jev = Number((record.jev_noul ?? '').trim())
     const jevTrim = Number((record.jev_trim ?? '').trim())
+    const jevLive = Number((record.jev_live ?? '').trim())
     rows.push({
       file: name,
       row: record.row ?? '',
@@ -73,6 +76,7 @@ for (const name of files) {
       label: (record.label ?? '').trim(),
       jev: (record.jev_noul ?? '').trim() !== '' && Number.isFinite(jev) ? jev : null,
       jevTrim: (record.jev_trim ?? '').trim() !== '' && Number.isFinite(jevTrim) ? jevTrim : null,
+      jevLive: (record.jev_live ?? '').trim() !== '' && Number.isFinite(jevLive) ? jevLive : null,
     })
   }
 }
@@ -132,8 +136,13 @@ lines.push('')
 lines.push(`现在的规则：留下 ${keptTotal} 条、记对 ${keptRight}、误记 ${keptWrong}、漏记 ${droppedWrong}。`)
 lines.push('')
 for (const [name, pick, note] of [
-  ['现成问句', (row: Row): number | null => row.jev, '线上那条，带全部排除条件'],
-  ['删减问句', (row: Row): number | null => row.jevTrim, '删掉"这一次的不算"和"特别注意……"两段，只留定义'],
+  [
+    '现成问句 + 只给总结（= 线上口径）',
+    (row: Row): number | null => row.jevLive,
+    '插件真正发出去的就是这个',
+  ],
+  ['现成问句 + 附上原话', (row: Row): number | null => row.jev, '比线上多给了那句逐字原文'],
+  ['删减问句 + 附上原话', (row: Row): number | null => row.jevTrim, '去掉"这一次的不算"和"特别注意……"，只留定义'],
 ] as const) {
   const arm = decided.filter((row) => pick(row) !== null)
   if (arm.length === 0) continue
