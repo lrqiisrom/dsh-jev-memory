@@ -45,6 +45,8 @@ interface Row {
   label: string
   /** Jev's answer to the shipped question, when `eval/jev-column.ts` has asked it. */
   jev: number | null
+  /** Jev's answer to the trimmed question, which drops the emphasis and keeps the definition. */
+  jevTrim: number | null
 }
 
 // One sheet at a time, and it says which. Summing `review*.csv` would add up two runs over the same
@@ -61,6 +63,7 @@ const rows: Row[] = []
 for (const name of files) {
   for (const record of parseCsvRecords(await readFile(join(labelDir, name), 'utf8'))) {
     const jev = Number((record.jev_noul ?? '').trim())
+    const jevTrim = Number((record.jev_trim ?? '').trim())
     rows.push({
       file: name,
       row: record.row ?? '',
@@ -69,6 +72,7 @@ for (const name of files) {
       text: record.text ?? '',
       label: (record.label ?? '').trim(),
       jev: (record.jev_noul ?? '').trim() !== '' && Number.isFinite(jev) ? jev : null,
+      jevTrim: (record.jev_trim ?? '').trim() !== '' && Number.isFinite(jevTrim) ? jevTrim : null,
     })
   }
 }
@@ -123,27 +127,33 @@ lines.push('')
 // the two are compared on identical material and no new labelling is needed. The threshold is swept
 // rather than fixed because Jev's score distribution depends on what it is shown, and this column
 // shows it something the shipped threshold was not tuned on.
-const withJev = decided.filter((row) => row.jev !== null)
-if (withJev.length > 0) {
-  lines.push('## 换成 Jev 判：同一条目、同一批标注')
+lines.push('## 换成 Jev 判：同一条目、同一批标注')
+lines.push('')
+lines.push(`现在的规则：留下 ${keptTotal} 条、记对 ${keptRight}、误记 ${keptWrong}、漏记 ${droppedWrong}。`)
+lines.push('')
+for (const [name, pick, note] of [
+  ['现成问句', (row: Row): number | null => row.jev, '线上那条，带全部排除条件'],
+  ['删减问句', (row: Row): number | null => row.jevTrim, '删掉"这一次的不算"和"特别注意……"两段，只留定义'],
+] as const) {
+  const arm = decided.filter((row) => pick(row) !== null)
+  if (arm.length === 0) continue
+  lines.push(`### ${name}（${note}）`)
   lines.push('')
-  lines.push('问句用的是线上那条（`REMEMBER_QUESTION`），输入是**总结 + 它引的原话**。只换了判的人。')
-  lines.push('')
-  lines.push('| Jev 门槛 | 它留下几条 | 记对 | 误记 | 漏记 | 写对率 | 该留覆盖率 |')
+  lines.push('| 门槛 | 它留下几条 | 记对 | 误记 | 漏记 | 写对率 | 该留覆盖率 |')
   lines.push('|---|---|---|---|---|---|---|')
-  for (const threshold of [0.12, 0.2, 0.3, 0.5]) {
-    const kept = withJev.filter((row) => row.jev! >= threshold)
+  for (const threshold of [0.12, 0.3, 0.5]) {
+    const kept = arm.filter((row) => pick(row)! >= threshold)
     const tp = kept.filter((row) => row.label === '1').length
     const fp = kept.filter((row) => row.label === '0').length
-    const fn = withJev.filter((row) => row.label === '1' && row.jev! < threshold).length
+    const fn = arm.filter((row) => row.label === '1' && pick(row)! < threshold).length
     lines.push(
-      `| ${threshold} | ${kept.length} / ${withJev.length} | ${tp} | ${fp} | ${fn} | **${pct(tp, tp + fp)}** | ${pct(tp, tp + fn)} |`,
+      `| ${threshold} | ${kept.length} / ${arm.length} | ${tp} | ${fp} | ${fn} | **${pct(tp, tp + fp)}** | ${pct(tp, tp + fn)} |`,
     )
   }
   lines.push('')
-  lines.push(`对照：现在的规则在同一批 ${decided.length} 行上留下 ${keptTotal} 条、记对 ${keptRight}、误记 ${keptWrong}、漏记 ${droppedWrong}。`)
-  lines.push('')
 }
+lines.push('两版问句的差别只在门槛落在哪里，以及同样门槛下谁的分歧是对的——后者要拿标注判。')
+lines.push('')
 
 lines.push('## 判错的那些')
 lines.push('')

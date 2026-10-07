@@ -53,6 +53,40 @@ if (file === undefined || !available.includes(file)) {
 }
 const limit = Number(process.env.JEV_LIMIT ?? '0') || 0
 
+/**
+ * The question, in two versions, so the two can be compared on the same rows and labels.
+ *
+ * The shipped one piles on exclusions — questions, chit-chat, the model's own words, someone else's,
+ * a paste, anything that only applied once. Measured against the extraction stage's own answers, that
+ * pile is doing almost nothing: of the 65 rows the extraction model called "not worth remembering", Jev
+ * disagreed with **one**. And the attribution half (its own words / someone else's / a paste) fires on
+ * 5 rows in 305 — where the *code* is what rejects them, and Jev overrode the clause twice anyway.
+ *
+ * What the pile does do is push the whole scale down: the shipped threshold is 0.12 while the positives
+ * in a labelled batch only reach 0.19-0.46, so the cut sits at the floor of the distribution and a small
+ * shift moves a batch of rows across it.
+ *
+ * So the trimmed version keeps the definition and drops the emphasis. Whether that changes *decisions*
+ * rather than just the scale is the thing to measure — hence two columns, never a replacement. The
+ * guarantee that a model's own words are not stored as the person's does not rest on this question: it
+ * rests on `who === 'user'` being enforced in code.
+ */
+function trimQuestion(question: string): string {
+  const cut = '发生在这一次对话里的事不算：提问、寒暄、状态汇报、临时安排。'
+  const emphasis = '特别注意——即使内容是对的、即使确实和这个项目有关，只要它是**模型的回答**、**别人写的**、或者**粘贴进来的转录**，就不算；只要它**只管这一次**，也不算。'
+  if (!question.includes(cut) || !question.includes(emphasis)) {
+    throw new Error('删减失败：线上问句的措辞变了，先核对再改这一版')
+  }
+  return question.replace(cut, '').replace(emphasis, '').trim()
+}
+
+const VARIANTS: Record<string, { column: string; question: string }> = {
+  shipped: { column: 'jev_noul', question: REMEMBER_QUESTION },
+  trimmed: { column: 'jev_trim', question: trimQuestion(REMEMBER_QUESTION) },
+}
+const variant = VARIANTS[process.env.JEV_VARIANT?.trim() ?? 'shipped']
+if (variant === undefined) throw new Error(`未知的问句版本：${process.env.JEV_VARIANT}（可选 shipped / trimmed）`)
+
 const path = join(labelDir, file)
 const records = parseCsv(await readFile(path, 'utf8'))
 const header = records[0] ?? []
@@ -63,9 +97,9 @@ if (at('text') < 0 || at('window') < 0) throw new Error(`${file} 里找不到 te
 // file therefore received nothing while the tool's own tally, read from that same property, happily
 // reported 305 filled. A tool that reports success while writing nothing is worse than one that fails,
 // so the write is now read back and checked.
-let valueAt = at('jev_noul')
+let valueAt = at(variant.column)
 if (valueAt < 0) {
-  header.push('jev_noul')
+  header.push(variant.column)
   valueAt = header.length - 1
   for (const cells of records.slice(1)) while (cells.length < header.length) cells.push('')
 }
@@ -83,7 +117,7 @@ const credentials = await readFile(join(home, '.credentials.yaml'), 'utf8').catc
 const documentKey = /TYPESAFE_API_KEY:\s*(\S+)/u.exec(credentials)?.[1] ?? ''
 
 const jev = createJevClient({
-  config: { model: JEV_DEFAULTS.model, rememberQuestion: REMEMBER_QUESTION },
+  config: { model: JEV_DEFAULTS.model, rememberQuestion: variant.question },
   env: process.env,
   resolveApiKey: async () => {
     const fromEnv = process.env.TYPESAFE_API_KEY?.trim()
@@ -134,7 +168,7 @@ for (const cells of records.slice(1)) {
 
 console.log('')
 await writeFile(path, `${records.map((cells) => cells.map((value) => csvField(value ?? '')).join(',')).join('\n')}\n`)
-console.log(`已写回 ${path}（新填 ${filled}、跳过 ${skipped}、失败 ${failed}）`)
+console.log(`已写回 ${path}（版本 ${process.env.JEV_VARIANT?.trim() ?? 'shipped'}，列 ${variant.column}）新填 ${filled}、跳过 ${skipped}、失败 ${failed}`)
 
 const values = records
   .slice(1)
